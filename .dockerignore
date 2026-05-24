@@ -15,4 +15,5 @@ __pycache__/
 .git/
 .github/
 *.sh
+tests/*.sh
 *.md

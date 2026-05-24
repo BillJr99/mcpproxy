@@ -27,9 +27,8 @@ __pycache__/
 dist/
 *.egg-info/
 
-# Local tool configs and scripts (not committed — mount into Docker at runtime)
+# Local tool configs (not committed — mount into Docker at runtime)
 tools/
-scripts/
 
 # Cloned external repos (managed by repo_loader)
 repos/

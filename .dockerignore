@@ -3,11 +3,6 @@
 .env.*
 !.env.example
 
-# Runtime-only directories — supplied via volumes, not baked in
-config/
-handlers/
-scripts/
-
 # Python artifacts
 __pycache__/
 *.pyc

@@ -288,7 +288,7 @@ curl -s http://localhost:8888/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-Custom Ollama integration scripts can be placed in a local (gitignored) `scripts/` directory.
+End-to-end Ollama test scripts are in `tests/` — see `tests/test_with_ollama.sh`.
 
 ## Running tests
 

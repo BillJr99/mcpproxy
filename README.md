@@ -69,6 +69,38 @@ The MCP endpoint is always at **`http://localhost:8888/mcp`**.
 
 `config/` and `handlers/` are never baked into the image — they are supplied at runtime via volume mounts. `.env` is loaded by Docker Compose via `env_file` and is never copied into the image either.
 
+### Pull and run the pre-built image from GHCR
+
+Every push to `main` publishes a fresh image to the GitHub Container Registry. You don't need to clone the repo or build anything.
+
+```bash
+docker pull ghcr.io/billjr99/mcpproxy:latest
+```
+
+**Minimum run command** — bind-mount your `config/tools/` and `handlers/` directories and pass your secrets via an env file:
+
+```bash
+docker run --rm \
+  -p 8888:8888 \
+  --env-file .env \
+  -v "$(pwd)/config/tools":/app/config/tools:ro \
+  -v "$(pwd)/handlers":/app/handlers:ro \
+  ghcr.io/billjr99/mcpproxy:latest
+```
+
+The MCP endpoint is available at **`http://localhost:8888/mcp`** once the container starts.
+
+> **Note:** `config/` and `handlers/` are never baked into the image — they must be supplied at runtime via volume mounts. Create `.env` from `.env.example` and fill in your secrets before running.
+
+Available tags:
+
+| Tag | When it's updated |
+|---|---|
+| `latest` | Every push to `main` |
+| `main` | Every push to `main` |
+| `vX.Y.Z` | On a version tag (e.g. `v1.0.0`) |
+| `sha-<short>` | Per-commit SHA |
+
 ### Local development (bind mounts)
 
 `docker-compose.override.yml` is merged automatically when you run `docker compose` without a `-f` flag. It replaces the named volumes in the base file with direct bind mounts of your local `./config/tools` and `./handlers` directories, so edits are reflected without a rebuild.

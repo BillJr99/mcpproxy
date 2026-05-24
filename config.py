@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("MCP_TOOL_CONFIG_DIR", "/app/tools"))
-REPOS_DIR = Path(os.environ.get("MCP_REPOS_DIR", "/app/repos"))
 ENV_FILE = Path(os.environ.get("MCP_ENV_FILE", ".env"))
 SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "local-config-driven-mcp")
 

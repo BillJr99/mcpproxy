@@ -63,9 +63,7 @@ add("MCP_SERVER_NAME",
     "Display name reported by the MCP server")
 add("MCP_TOOL_CONFIG_DIR",
     "/app/tools",
-    "Path to tool YAML directory\n"
-    "# Docker → /app/tools (set by docker-compose.yml)\n"
-    "# Local  → overridden automatically by run_local.sh")
+    "Path to tool YAML directory — Docker: /app/tools, Local: overridden by run_local.sh")
 
 # Secrets discovered from tool YAML files
 if yaml and tools_dir.exists():
@@ -329,6 +327,7 @@ set +a
 export MCP_TOOL_CONFIG_DIR="$ROOT_DIR/tools"   # local path always wins
 export MCP_SERVER_NAME="${MCP_SERVER_NAME:-mcpproxy}"
 export MCP_ENV_FILE="$ENV_FILE"
+unset MCP_REPOS_DIR  # no longer used
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 6 — Virtualenv + dependencies

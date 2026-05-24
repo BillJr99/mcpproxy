@@ -2,22 +2,24 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# git is needed by repo_loader to clone/pull external provider repos
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# Node.js (LTS) is needed to run npx-based MCP providers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py config.py repo_loader.py ./
+COPY server.py config.py npx_runner.py ./
 COPY frontend/ ./frontend/
 COPY handlers/ ./handlers/
 
-# tools/ and repos/ are NOT baked in — supply at runtime via volumes.
+# tools/ is NOT baked in — supply at runtime via a volume mount.
 # See docker-compose.yml and docker-compose.override.yml.
 
 ENV MCP_TOOL_CONFIG_DIR=/app/tools
-ENV MCP_REPOS_DIR=/app/repos
 ENV MCP_ENV_FILE=/app/.env
 
 EXPOSE 8888 8889

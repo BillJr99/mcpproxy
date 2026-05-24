@@ -1,9 +1,9 @@
-# Base compose file — uses named Docker volumes for tools and repos.
+# Base compose file — uses named Docker volumes for tools.
 # Suitable for production / CI / any environment without the repo checked out.
 #
 # handlers/ is baked into the image — no volume needed.
 #
-# Populate volumes before first run:
+# Populate tools volume before first run:
 #   docker run --rm -v mcpproxy-tools:/dst -v "$(pwd)/tools":/src alpine cp -r /src/. /dst/
 #
 # For local development, docker-compose.override.yml is merged automatically.
@@ -18,13 +18,10 @@ services:
       - ./.env
     environment:
       MCP_TOOL_CONFIG_DIR: "/app/tools"
-      MCP_REPOS_DIR: "/app/repos"
       MCP_ENV_FILE: "/app/.env"
     volumes:
       - mcpproxy-tools:/app/tools
-      - mcpproxy-repos:/app/repos
       - ./.env:/app/.env
 
 volumes:
   mcpproxy-tools:
-  mcpproxy-repos:

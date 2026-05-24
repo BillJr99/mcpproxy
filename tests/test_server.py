@@ -1,4 +1,9 @@
-"""Unit tests for server.py pure helper functions."""
+"""Unit tests for server.py pure helper functions.
+
+Note: server.py has module-level side effects (load_provider_specs + register_provider).
+conftest.py sets MCP_TOOL_CONFIG_DIR to an empty temp dir before import so zero tools
+are registered and no npx processes are started.
+"""
 import inspect
 import os
 import textwrap

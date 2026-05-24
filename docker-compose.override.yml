@@ -8,5 +8,4 @@ services:
   mcp-host:
     volumes:
       - ./tools:/app/tools
-      - ./repos:/app/repos
       - ./.env:/app/.env

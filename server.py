@@ -1,22 +1,25 @@
 """
 Config-driven MCP server.
 
-Each YAML file in MCP_TOOL_CONFIG_DIR defines one *provider*.  A provider has:
+Each YAML file in MCP_TOOL_CONFIG_DIR defines one *provider*.  Two kinds:
 
-  code:   (string) — Python source executed once at startup.  Define all
-                     helper functions and async tool functions here.
-  repo:   (dict)   — Optional external git repo to clone/pull before executing
-                     the code block.  See repo_loader.py for the full schema.
-  tools:  (list)   — Each entry declares one MCP tool:
-            name        — unique MCP tool name
-            function    — name of the async function defined in `code`
-            description — shown to the LLM
-            input_schema — JSON Schema object (drives argument generation)
-            secrets.env — maps handler arg names to environment variable names
-            auth        — arbitrary dict forwarded to context["auth"]
+  Code provider   — has a ``code:`` block with async Python functions.
+  npx provider    — has an ``npx:`` block; tool calls are proxied to the
+                    npx process over stdio (no code block needed).
+
+Provider YAML keys:
+  code:        Python source executed once at startup (code providers).
+  npx:
+    command:   npx command string, e.g. "npx @playwright/mcp@latest"
+  tools:       List of tool declarations:
+    name           — unique MCP tool name
+    function       — async function name from code block (code providers only)
+    description    — shown to the LLM
+    input_schema   — JSON Schema object
+    secrets.env    — maps handler arg names to environment variable names
+    auth           — arbitrary dict forwarded to context["auth"]
 
 No changes to this file are needed when adding new tools or providers.
-
 The HTTP frontend (UI) runs on port 8889 alongside the MCP server on 8888.
 """
 
@@ -45,7 +48,6 @@ mcp = FastMCP(SERVER_NAME)
 
 SECRET_KEYS = {"password", "token", "secret", "api_key", "apikey", "authorization"}
 
-# Map JSON Schema types to Python types for signature introspection.
 _JSON_TYPE_MAP: dict[str, type] = {
     "string": str,
     "integer": int,
@@ -57,7 +59,7 @@ _JSON_TYPE_MAP: dict[str, type] = {
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (all tested in tests/test_server.py)
+# Pure helpers
 # ---------------------------------------------------------------------------
 
 def redact_secrets(value: Any) -> Any:
@@ -97,11 +99,7 @@ def load_provider_specs(config_dir: Path) -> list[dict[str, Any]]:
 
 
 def exec_provider_code(spec: dict[str, Any]) -> dict[str, Any]:
-    """Execute the provider's top-level `code` block; return the namespace.
-
-    The code string is compiled with the YAML file path as the source name so
-    that tracebacks point to the right location.
-    """
+    """Execute the provider's ``code`` block; return the resulting namespace."""
     code = spec.get("code", "")
     if not code:
         return {}
@@ -117,7 +115,7 @@ def exec_provider_code(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Inject secrets from environment variables into kwargs before calling the handler."""
+    """Inject secrets from environment variables into kwargs."""
     try:
         resolved = dict(kwargs)
         env_map = (tool_spec.get("secrets") or {}).get("env", {})
@@ -196,23 +194,14 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
             except Exception as exc:
                 print(f"dynamic_tool error in {tool_spec.get('name')}: {exc}")
                 traceback.print_exc()
-                return {
-                    "ok": False,
-                    "error": str(exc),
-                    "tool": tool_spec.get("name"),
-                }
+                return {"ok": False, "error": str(exc), "tool": tool_spec.get("name")}
 
         dynamic_tool.__name__ = tool_spec["name"]
-
         sig, annotations = _build_typed_signature(tool_spec)
-        dynamic_tool.__signature__ = sig  # type: ignore[attr-defined]
+        dynamic_tool.__signature__ = sig          # type: ignore[attr-defined]
         dynamic_tool.__annotations__ = annotations
 
-        mcp.tool(
-            name=tool_spec["name"],
-            description=tool_spec.get("description", ""),
-        )(dynamic_tool)
-
+        mcp.tool(name=tool_spec["name"], description=tool_spec.get("description", ""))(dynamic_tool)
         print(f"Registered tool: {tool_spec['name']}")
     except Exception as exc:
         print(f"register_tool error for '{tool_spec.get('name')}': {exc}")
@@ -220,44 +209,61 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
         raise
 
 
-def register_provider(spec: dict[str, Any]) -> None:
-    """Execute the provider's code block and register all its declared tools.
+def _make_npx_handler(command: str, tool_name: str) -> Callable[..., Any]:
+    """Return an async handler that proxies calls to an npx MCP process."""
+    from npx_runner import get_session
 
-    If the spec contains a ``repo:`` block, the repo is cloned/pulled first
-    and its path is added to sys.path before the code block executes.
-    """
+    async def npx_handler(context: dict[str, Any], **kwargs: Any) -> Any:
+        try:
+            session = get_session(command)
+            return await session.call_tool(tool_name, kwargs)
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "tool": tool_name}
+
+    npx_handler.__name__ = tool_name
+    return npx_handler
+
+
+def register_provider(spec: dict[str, Any]) -> None:
+    """Register all tools declared in one provider spec."""
     source_path = spec.get("_config_path", "<unknown>")
     try:
-        # ── Optional external repo ─────────────────────────────────────────
-        if spec.get("repo"):
-            from repo_loader import setup_repo
-            provider_name = Path(source_path).stem
-            setup_repo(spec, provider_name)
+        npx_spec = spec.get("npx")
 
-        namespace = exec_provider_code(spec)
+        if npx_spec:
+            # ── npx provider ─────────────────────────────────────────────────
+            command = (npx_spec.get("command") or "").strip()
+            if not command:
+                raise ValueError(f"npx provider in {source_path} has no 'command' field")
 
-        tools = spec.get("tools", [])
-        if not tools:
-            print(f"Warning: no tools declared in {source_path}")
-            return
+            for tool_spec in spec.get("tools", []):
+                tool_name = tool_spec.get("name", "<unnamed>")
+                handler = _make_npx_handler(command, tool_name)
+                register_tool(tool_spec, handler)
 
-        for tool_spec in tools:
-            tool_name = tool_spec.get("name", "<unnamed>")
-            function_name = tool_spec.get("function")
+        else:
+            # ── code provider ─────────────────────────────────────────────────
+            namespace = exec_provider_code(spec)
+            tools = spec.get("tools", [])
+            if not tools:
+                print(f"Warning: no tools declared in {source_path}")
+                return
 
-            if not function_name:
-                raise ValueError(
-                    f"Tool '{tool_name}' in {source_path} is missing required 'function' field"
-                )
-
-            handler = namespace.get(function_name)
-            if handler is None:
-                raise RuntimeError(
-                    f"Function '{function_name}' (tool '{tool_name}') not found "
-                    f"in the code block of {source_path}"
-                )
-
-            register_tool(tool_spec, handler)
+            for tool_spec in tools:
+                tool_name = tool_spec.get("name", "<unnamed>")
+                function_name = tool_spec.get("function")
+                if not function_name:
+                    raise ValueError(
+                        f"Tool '{tool_name}' in {source_path} is missing required 'function' field"
+                    )
+                handler = namespace.get(function_name)
+                if handler is None:
+                    raise RuntimeError(
+                        f"Function '{function_name}' (tool '{tool_name}') not found "
+                        f"in the code block of {source_path}"
+                    )
+                register_tool(tool_spec, handler)
 
     except Exception as exc:
         print(f"register_provider error in {source_path}: {exc}")
@@ -278,7 +284,6 @@ for provider_spec in load_provider_specs(CONFIG_DIR):
 # ---------------------------------------------------------------------------
 
 def _run_ui() -> None:
-    """Start the HTTP frontend in a background daemon thread."""
     try:
         from frontend.app import create_app
         ui_app = create_app()
@@ -290,12 +295,9 @@ def _run_ui() -> None:
 
 if __name__ == "__main__":
     try:
-        # Start UI server (non-blocking daemon thread)
         ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
         ui_thread.start()
         print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")
-
-        # Run MCP server (blocking)
         mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
     except Exception as exc:
         print(f"main error: {exc}")

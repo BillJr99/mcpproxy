@@ -1,0 +1,23 @@
+# Secrets — never send to build context
+.env
+.env.*
+!.env.example
+
+# Runtime-only directories — supplied via volumes, not baked in
+config/
+handlers/
+scripts/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+*.egg-info/
+
+# Dev/VCS
+.git/
+.github/
+*.sh
+*.md

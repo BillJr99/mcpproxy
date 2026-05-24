@@ -141,13 +141,18 @@ def add_entry(name, comment, default):
             "skip": name in SKIP_PROMPT,
         }
 
+def _is_decoration(text):
+    """True for pure separator lines like '── MCP server ───────────────'."""
+    stripped = text.replace("─", "").replace("-", "").replace("=", "").strip()
+    return len(stripped) <= 20 and len(text) > 10
+
 if env_example_path.exists():
     pending = []
     for raw in env_example_path.read_text(encoding="utf-8").splitlines():
         line = raw.rstrip()
         if line.startswith("#"):
             text = line[1:].strip()
-            if text:
+            if text and not _is_decoration(text):
                 pending.append(text)
         elif "=" in line:
             k, _, v = line.partition("=")

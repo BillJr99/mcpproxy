@@ -1,9 +1,12 @@
 # Development override — replaces named volumes with local bind mounts.
 # Docker Compose merges this file automatically when you run `docker compose up`.
 # Do NOT commit a .env file; copy .env.example → .env and fill in your secrets.
+#
+# handlers/ is baked into the image and does not need a mount.
 
 services:
   mcp-host:
     volumes:
-      - ./config/tools:/app/config/tools:ro
-      - ./handlers:/app/handlers:ro
+      - ./tools:/app/tools
+      - ./repos:/app/repos
+      - ./.env:/app/.env

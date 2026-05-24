@@ -1,26 +1,30 @@
-# Base compose file — uses named Docker volumes for config and handlers.
+# Base compose file — uses named Docker volumes for tools and repos.
 # Suitable for production / CI / any environment without the repo checked out.
 #
-# Populate the named volumes before first run:
-#   docker run --rm -v mcpproxy-config:/dst -v "$(pwd)/config/tools":/src alpine cp -r /src/. /dst/
-#   docker run --rm -v mcpproxy-handlers:/dst -v "$(pwd)/handlers":/src  alpine cp -r /src/. /dst/
+# handlers/ is baked into the image — no volume needed.
 #
-# For local development, docker-compose.override.yml (created automatically by
-# Docker Compose when present) replaces the named volumes with bind mounts.
+# Populate volumes before first run:
+#   docker run --rm -v mcpproxy-tools:/dst -v "$(pwd)/tools":/src alpine cp -r /src/. /dst/
+#
+# For local development, docker-compose.override.yml is merged automatically.
 
 services:
   mcp-host:
     build: .
     ports:
-      - "8888:8888"
+      - "${MCP_HOST_PORT:-8888}:8888"
+      - "${UI_HOST_PORT:-8889}:8889"
     env_file:
       - ./.env
     environment:
-      MCP_TOOL_CONFIG_DIR: "/app/config/tools"
+      MCP_TOOL_CONFIG_DIR: "/app/tools"
+      MCP_REPOS_DIR: "/app/repos"
+      MCP_ENV_FILE: "/app/.env"
     volumes:
-      - mcpproxy-config:/app/config/tools:ro
-      - mcpproxy-handlers:/app/handlers:ro
+      - mcpproxy-tools:/app/tools
+      - mcpproxy-repos:/app/repos
+      - ./.env:/app/.env
 
 volumes:
-  mcpproxy-config:
-  mcpproxy-handlers:
+  mcpproxy-tools:
+  mcpproxy-repos:

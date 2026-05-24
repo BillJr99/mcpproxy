@@ -5,6 +5,8 @@ Each YAML file in MCP_TOOL_CONFIG_DIR defines one *provider*.  A provider has:
 
   code:   (string) — Python source executed once at startup.  Define all
                      helper functions and async tool functions here.
+  repo:   (dict)   — Optional external git repo to clone/pull before executing
+                     the code block.  See repo_loader.py for the full schema.
   tools:  (list)   — Each entry declares one MCP tool:
             name        — unique MCP tool name
             function    — name of the async function defined in `code`
@@ -14,20 +16,30 @@ Each YAML file in MCP_TOOL_CONFIG_DIR defines one *provider*.  A provider has:
             auth        — arbitrary dict forwarded to context["auth"]
 
 No changes to this file are needed when adding new tools or providers.
+
+The HTTP frontend (UI) runs on port 8889 alongside the MCP server on 8888.
 """
 
 import builtins
 import inspect
 import os
+import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import uvicorn
 import yaml
 from fastmcp import Context, FastMCP
 
-CONFIG_DIR = Path(os.environ.get("MCP_TOOL_CONFIG_DIR", "/app/config/tools"))
-SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "local-config-driven-mcp")
+from config import (
+    CONFIG_DIR,
+    MCP_HOST,
+    MCP_PORT,
+    SERVER_NAME,
+    UI_HOST,
+    UI_PORT,
+)
 
 mcp = FastMCP(SERVER_NAME)
 
@@ -44,13 +56,17 @@ _JSON_TYPE_MAP: dict[str, type] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pure helpers (all tested in tests/test_server.py)
+# ---------------------------------------------------------------------------
+
 def redact_secrets(value: Any) -> Any:
     try:
         if isinstance(value, dict):
             redacted: dict[Any, Any] = {}
             for key, item in value.items():
                 key_text = str(key).lower()
-                if any(secret_key in key_text for secret_key in SECRET_KEYS):
+                if any(s in key_text for s in SECRET_KEYS):
                     redacted[key] = "[REDACTED]"
                 else:
                     redacted[key] = redact_secrets(item)
@@ -58,8 +74,8 @@ def redact_secrets(value: Any) -> Any:
         if isinstance(value, list):
             return [redact_secrets(item) for item in value]
         return value
-    except Exception as e:
-        print(f"redact_secrets error: {e}")
+    except Exception as exc:
+        print(f"redact_secrets error: {exc}")
         traceback.print_exc()
         return "[REDACTION_ERROR]"
 
@@ -70,12 +86,12 @@ def load_provider_specs(config_dir: Path) -> list[dict[str, Any]]:
         specs: list[dict[str, Any]] = []
         for path in sorted(config_dir.glob("*.yaml")):
             with path.open("r", encoding="utf-8") as f:
-                spec = yaml.safe_load(f)
+                spec = yaml.safe_load(f) or {}
                 spec["_config_path"] = str(path)
                 specs.append(spec)
         return specs
-    except Exception as e:
-        print(f"load_provider_specs error: {e}")
+    except Exception as exc:
+        print(f"load_provider_specs error: {exc}")
         traceback.print_exc()
         raise
 
@@ -93,8 +109,8 @@ def exec_provider_code(spec: dict[str, Any]) -> dict[str, Any]:
     namespace: dict[str, Any] = {"__builtins__": builtins}
     try:
         exec(compile(code, source_path, "exec"), namespace)
-    except Exception as e:
-        print(f"exec_provider_code error in {source_path}: {e}")
+    except Exception as exc:
+        print(f"exec_provider_code error in {source_path}: {exc}")
         traceback.print_exc()
         raise
     return namespace
@@ -104,15 +120,15 @@ def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> d
     """Inject secrets from environment variables into kwargs before calling the handler."""
     try:
         resolved = dict(kwargs)
-        env_map = tool_spec.get("secrets", {}).get("env", {})
+        env_map = (tool_spec.get("secrets") or {}).get("env", {})
         for arg_name, env_name in env_map.items():
             secret_value = os.environ.get(env_name)
             if not secret_value:
                 raise RuntimeError(f"Missing required secret environment variable: {env_name}")
             resolved[arg_name] = secret_value
         return resolved
-    except Exception as e:
-        print(f"resolve_env_defaults error: {e}")
+    except Exception as exc:
+        print(f"resolve_env_defaults error: {exc}")
         traceback.print_exc()
         raise
 
@@ -126,8 +142,8 @@ def build_runtime_context(tool_spec: dict[str, Any], ctx: Context | None) -> dic
             "auth": tool_spec.get("auth", {}),
             "mcp_context": ctx,
         }
-    except Exception as e:
-        print(f"build_runtime_context error: {e}")
+    except Exception as exc:
+        print(f"build_runtime_context error: {exc}")
         traceback.print_exc()
         raise
 
@@ -135,16 +151,7 @@ def build_runtime_context(tool_spec: dict[str, Any], ctx: Context | None) -> dic
 def _build_typed_signature(
     tool_spec: dict[str, Any],
 ) -> tuple[inspect.Signature, dict[str, Any]]:
-    """Return (Signature, annotations_dict) derived from the tool's input_schema.
-
-    FastMCP needs two things to generate the MCP JSON schema:
-    • ``inspect.signature(fn)``     — reads ``fn.__signature__``
-    • ``typing.get_type_hints(fn)`` — reads ``fn.__annotations__``
-
-    A bare ``**kwargs`` supplies neither, so the tool never appears in
-    tools/list.  We stamp BOTH onto the dynamic closure so FastMCP and
-    Pydantic see a consistent, fully-typed function.
-    """
+    """Return (Signature, annotations_dict) derived from the tool's input_schema."""
     input_schema = tool_spec.get("input_schema", {})
     properties: dict[str, Any] = input_schema.get("properties", {})
     required_fields: set[str] = set(input_schema.get("required", []))
@@ -186,12 +193,12 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
                 resolved_kwargs = resolve_env_defaults(tool_spec, kwargs)
                 runtime_context = build_runtime_context(tool_spec, ctx)
                 return await handler(context=runtime_context, **resolved_kwargs)
-            except Exception as e:
-                print(f"dynamic_tool error in {tool_spec.get('name')}: {e}")
+            except Exception as exc:
+                print(f"dynamic_tool error in {tool_spec.get('name')}: {exc}")
                 traceback.print_exc()
                 return {
                     "ok": False,
-                    "error": str(e),
+                    "error": str(exc),
                     "tool": tool_spec.get("name"),
                 }
 
@@ -207,16 +214,26 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
         )(dynamic_tool)
 
         print(f"Registered tool: {tool_spec['name']}")
-    except Exception as e:
-        print(f"register_tool error for '{tool_spec.get('name')}': {e}")
+    except Exception as exc:
+        print(f"register_tool error for '{tool_spec.get('name')}': {exc}")
         traceback.print_exc()
         raise
 
 
 def register_provider(spec: dict[str, Any]) -> None:
-    """Execute the provider's code block and register all its declared tools."""
+    """Execute the provider's code block and register all its declared tools.
+
+    If the spec contains a ``repo:`` block, the repo is cloned/pulled first
+    and its path is added to sys.path before the code block executes.
+    """
     source_path = spec.get("_config_path", "<unknown>")
     try:
+        # ── Optional external repo ─────────────────────────────────────────
+        if spec.get("repo"):
+            from repo_loader import setup_repo
+            provider_name = Path(source_path).stem
+            setup_repo(spec, provider_name)
+
         namespace = exec_provider_code(spec)
 
         tools = spec.get("tools", [])
@@ -242,20 +259,45 @@ def register_provider(spec: dict[str, Any]) -> None:
 
             register_tool(tool_spec, handler)
 
-    except Exception as e:
-        print(f"register_provider error in {source_path}: {e}")
+    except Exception as exc:
+        print(f"register_provider error in {source_path}: {exc}")
         traceback.print_exc()
         raise
 
+
+# ---------------------------------------------------------------------------
+# Load all providers at import time
+# ---------------------------------------------------------------------------
 
 for provider_spec in load_provider_specs(CONFIG_DIR):
     register_provider(provider_spec)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _run_ui() -> None:
+    """Start the HTTP frontend in a background daemon thread."""
+    try:
+        from frontend.app import create_app
+        ui_app = create_app()
+        uvicorn.run(ui_app, host=UI_HOST, port=UI_PORT, log_level="warning")
+    except Exception as exc:
+        print(f"UI server error: {exc}")
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     try:
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=8888)
-    except Exception as e:
-        print(f"main error: {e}")
+        # Start UI server (non-blocking daemon thread)
+        ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
+        ui_thread.start()
+        print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")
+
+        # Run MCP server (blocking)
+        mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
+    except Exception as exc:
+        print(f"main error: {exc}")
         traceback.print_exc()
         raise

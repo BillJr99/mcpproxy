@@ -25,11 +25,13 @@ from server import (
     build_runtime_context,
     exec_provider_code,
     load_provider_specs,
+    materialize_repository,
     normalize_provider_name,
     redact_secrets,
     register_builtin_tools,
     register_provider,
     register_tool,
+    repository_workdir,
     resolve_env_defaults,
     run_provider_setup,
     tool_is_enabled,
@@ -746,3 +748,146 @@ class TestToolRegistry:
         tool_registry.clear()
         assert tool_registry.get_all() == {}
         assert tool_registry.get("p__t") is None
+
+
+# ---------------------------------------------------------------------------
+# Repository providers
+# ---------------------------------------------------------------------------
+
+class TestRepositoryWorkdir:
+    def test_none_for_non_repo_spec(self):
+        assert repository_workdir("foo", {}) is None
+        assert repository_workdir("foo", {"package": {"command": "x"}}) is None
+
+    def test_explicit_workdir_wins(self):
+        spec = {"repository": {"url": "x", "workdir": "/custom/path"}}
+        assert repository_workdir("anything", spec) == "/custom/path"
+
+    def test_default_workdir_uses_provider_name(self):
+        spec = {"repository": {"url": "x"}}
+        wd = repository_workdir("linkedin", spec)
+        assert wd is not None
+        assert wd.endswith("linkedin")
+
+
+class TestMaterializeRepository:
+    def _spec(self, tmp_path: Path, **overrides):
+        repo = {
+            "url": "https://example.com/r.git",
+            "workdir": str(tmp_path / "wd"),
+            "build_commands": ["npm install", "npm run build"],
+        }
+        repo.update(overrides)
+        return {
+            "_config_path": str(tmp_path / "linkedin.yaml"),
+            "repository": repo,
+            "package": {"command": "node dist/main.js"},
+            "tools": [],
+        }
+
+    def test_no_repository_is_noop(self):
+        with patch("server.subprocess.run") as mock_run:
+            materialize_repository({"package": {"command": "x"}})
+            mock_run.assert_not_called()
+
+    def test_clone_when_workdir_missing(self, tmp_path: Path):
+        spec = self._spec(tmp_path)
+        with patch("server.subprocess.run") as mock_run:
+            materialize_repository(spec)
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        assert calls[0][:2] == ["git", "clone"]
+        assert calls[0][2] == "https://example.com/r.git"
+        # Build commands run with cwd=<workdir>
+        wd = str(tmp_path / "wd")
+        npm_calls = [c for c in mock_run.call_args_list if c[0][0][0] == "npm"]
+        for c in npm_calls:
+            assert c[1].get("cwd") == wd
+
+    def test_pull_when_workdir_has_dotgit(self, tmp_path: Path):
+        wd = tmp_path / "wd"
+        (wd / ".git").mkdir(parents=True)
+        spec = self._spec(tmp_path)
+        with patch("server.subprocess.run") as mock_run:
+            materialize_repository(spec)
+        first = mock_run.call_args_list[0][0][0]
+        assert first[:3] == ["git", "-C", str(wd)]
+        assert first[3] == "pull"
+        # No clone in any call
+        for c in mock_run.call_args_list:
+            assert "clone" not in c[0][0]
+
+    def test_missing_url_raises(self, tmp_path: Path):
+        spec = self._spec(tmp_path, url="")
+        with pytest.raises(ValueError, match="repository.url"):
+            with patch("server.subprocess.run"):
+                materialize_repository(spec)
+
+    def test_ref_triggers_checkout(self, tmp_path: Path):
+        spec = self._spec(tmp_path, ref="v1.0", build_commands=[])
+        with patch("server.subprocess.run") as mock_run:
+            materialize_repository(spec)
+        cmds = [c[0][0] for c in mock_run.call_args_list]
+        assert any("checkout" in c for c in cmds)
+
+
+class TestRunProviderSetupRepository:
+    def test_materialize_called_before_requirements(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "r.yaml"),
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": str(tmp_path / "wd"),
+                "build_commands": [],
+            },
+            "requirements": ["httpx"],
+        }
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        # First call should be the git clone (from materialize_repository)
+        first = mock_run.call_args_list[0][0][0]
+        assert first[:2] == ["git", "clone"]
+        # And pip install for httpx is also called
+        assert any("pip" in c[0][0] for c in mock_run.call_args_list)
+
+
+class TestRegisterProviderRepositoryCwd:
+    def test_session_created_with_repo_workdir(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "linkedin.yaml"),
+            "package": {"command": "node dist/main.js"},
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": "/app/repos/linkedin",
+                "build_commands": [],
+            },
+            "tools": [{
+                "name": "search_jobs",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+
+        captured = {}
+
+        def fake_decorator(**kwargs):
+            return lambda fn: fn
+
+        def fake_get_session(command, cwd=None):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            class _Sess:
+                async def call_tool(self, *a, **kw): return {"ok": True}
+            return _Sess()
+
+        with patch("server.mcp") as mock_mcp, \
+             patch("process_runner.get_session", side_effect=fake_get_session):
+            mock_mcp.tool.side_effect = fake_decorator
+            register_provider(spec)
+            # Pull the handler out of tool_registry and invoke it
+            entry = tool_registry.get("linkedin__search_jobs")
+            assert entry is not None
+            import asyncio
+            asyncio.run(entry["handler"](None))
+
+        assert captured["cwd"] == "/app/repos/linkedin"
+        assert captured["command"] == "node dist/main.js"

@@ -12,6 +12,11 @@ SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "local-config-driven-mcp")
 # immediately accessible.  Override with MCPPROXY_FILES_DIR.
 FILES_DIR = Path(os.environ.get("MCPPROXY_FILES_DIR", ".playwright-mcp"))
 
+# Base directory where repository providers clone their git repos.  Each
+# provider gets a subdirectory named after the provider (e.g. /app/repos/linkedin).
+# Override with MCPPROXY_REPOS_DIR.
+REPOS_DIR = Path(os.environ.get("MCPPROXY_REPOS_DIR", "/app/repos"))
+
 UI_HOST = os.environ.get("MCP_UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("MCP_UI_PORT", "8889"))
 

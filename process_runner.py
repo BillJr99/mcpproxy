@@ -25,8 +25,9 @@ from typing import Any
 class ProcessSession:
     """A long-lived connection to a single stdio MCP server process."""
 
-    def __init__(self, command: str) -> None:
+    def __init__(self, command: str, cwd: str | None = None) -> None:
         self.command = command
+        self.cwd = cwd
         self._parts: list[str] = shlex.split(command)
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -57,6 +58,7 @@ class ProcessSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=self.cwd,
         )
         # initialize handshake
         rid = self._new_id()
@@ -134,25 +136,32 @@ NpxSession = ProcessSession
 
 
 # ---------------------------------------------------------------------------
-# Module-level session registry  (one session per command string)
+# Module-level session registry  (one session per (command, cwd) pair)
 # ---------------------------------------------------------------------------
 
-_sessions: dict[str, ProcessSession] = {}
+_sessions: dict[tuple[str, str | None], ProcessSession] = {}
 
 
-def get_session(command: str) -> ProcessSession:
-    """Return (creating if needed) the persistent session for *command*."""
-    if command not in _sessions:
-        _sessions[command] = ProcessSession(command)
-    return _sessions[command]
+def get_session(command: str, cwd: str | None = None) -> ProcessSession:
+    """Return (creating if needed) the persistent session for *command*.
+
+    Sessions are keyed on the (command, cwd) pair so that two providers that
+    happen to share a spawn command but live in different working directories
+    (e.g. two repository providers built from the same template) get distinct
+    subprocesses.
+    """
+    key = (command, cwd)
+    if key not in _sessions:
+        _sessions[key] = ProcessSession(command, cwd=cwd)
+    return _sessions[key]
 
 
-async def introspect(command: str) -> list[dict[str, Any]]:
+async def introspect(command: str, cwd: str | None = None) -> list[dict[str, Any]]:
     """
     Spawn a *fresh* process, fetch its tools/list, then shut it down.
     Used by the frontend wizard — does not affect the persistent session registry.
     """
-    session = ProcessSession(command)
+    session = ProcessSession(command, cwd=cwd)
     try:
         await session._start()
         return await session.list_tools()

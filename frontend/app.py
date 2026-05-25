@@ -15,10 +15,12 @@ POST /api/extract-functions     — parse Python code for async functions
 GET  /api/env                   — list .env vars (values masked)
 POST /api/env                   — upsert vars into .env  {vars: {KEY: VALUE}}
 POST /api/restart               — send SIGTERM to restart server
+POST /api/run-command           — stream a shell command's output as SSE
 """
 
 import ast
 import asyncio
+import json
 import os
 import re
 import signal
@@ -30,7 +32,7 @@ from typing import Any
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from config import CONFIG_DIR, ENV_FILE
 
@@ -401,6 +403,50 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         threading.Thread(target=_send, daemon=True).start()
         return {"ok": True}
 
+    # ── Command runner (SSE streaming) ────────────────────────────────────────
+
+    @app.post("/api/run-command")
+    async def run_command(request: Request) -> StreamingResponse:
+        body = await request.json()
+        command = (body.get("command") or "").strip()
+        if not command:
+            raise HTTPException(400, "command is required")
+
+        async def _generate():
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                assert proc.stdout is not None
+                while True:
+                    try:
+                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=300.0)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'error': 'Timed out after 5 min', 'done': True, 'returncode': -1})}\n\n"
+                        proc.kill()
+                        return
+                    if not line:
+                        break
+                    yield f"data: {json.dumps({'line': line.decode(errors='replace').rstrip()})}\n\n"
+                await proc.wait()
+                yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode})}\n\n"
+            except Exception as exc:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                yield f"data: {json.dumps({'error': str(exc), 'done': True, 'returncode': -1})}\n\n"
+
+        return StreamingResponse(
+            _generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     # ── HTML UI ───────────────────────────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -534,6 +580,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <h6 id="editor-title" class="mb-0 fw-semibold" style="color:#cdd6f4"></h6>
           <div class="d-flex gap-2">
             <button class="btn btn-sm btn-outline-info" onclick="openSecretsModal()">🔑 Secrets</button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="openCmdModal()">🛠 Run Command</button>
             <button class="btn btn-sm btn-primary" onclick="saveProvider()">Save</button>
             <button class="btn btn-sm btn-outline-danger" onclick="deleteProvider()">Delete</button>
           </div>
@@ -699,6 +746,35 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Command runner modal -->
+<div class="modal fade" id="cmd-modal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">🛠 Run Command</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted" style="font-size:.85em">Runs in the server process environment (inside Docker if you're using the container). Output streams live.</p>
+        <div class="d-flex gap-2 mb-2">
+          <input class="form-control font-monospace" id="cmd-input"
+            placeholder="npx playwright install chrome"
+            onkeydown="if(event.key==='Enter'&&!cmdRunning)runCommand()">
+          <button class="btn btn-primary" id="cmd-run-btn" onclick="runCommand()" style="white-space:nowrap">▶ Run</button>
+        </div>
+        <div id="cmd-suggestions" class="d-flex gap-1 flex-wrap mb-2"></div>
+        <div id="cmd-output"
+          style="background:#0d0d0d;border:1px solid var(--border);border-radius:6px;padding:10px;min-height:180px;max-height:380px;overflow-y:auto;font-family:'JetBrains Mono',Consolas,monospace;font-size:.8em;white-space:pre-wrap;word-break:break-all;color:#a6e3a1"></div>
+        <div id="cmd-status" class="mt-1" style="font-size:.8em;color:var(--muted)"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-sm btn-outline-secondary" onclick="clearCmdOutput()">Clear</button>
+        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -709,11 +785,13 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
-let secretsModal = null, wizModal = null;
+let secretsModal = null, wizModal = null, cmdModal = null;
 let wzType = null;            // 'code' | 'npx'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect-npx
 let providersMeta = {};       // name → {missing_secrets, validation_errors}
+let cmdRunning = false;
+let cmdAbortController = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Boot
@@ -725,6 +803,7 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   secretsModal = new bootstrap.Modal('#secrets-modal');
   wizModal     = new bootstrap.Modal('#wizard-modal');
+  cmdModal     = new bootstrap.Modal('#cmd-modal');
   loadList();
 });
 
@@ -1317,6 +1396,133 @@ function _schemaToParams(schema) {
     required: required.has(name),
     default: def.default ?? null,
   }));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command runner
+// ─────────────────────────────────────────────────────────────────────────────
+function openCmdModal() {
+  // Build context-aware suggestions
+  const suggestions = [];
+  if (currentProvider) {
+    const npxCmd = (currentProvider.npx_command || '').toLowerCase();
+    if (npxCmd.includes('playwright')) {
+      suggestions.push('npx playwright install chrome');
+      suggestions.push('npx playwright install --with-deps chromium');
+      suggestions.push('npx playwright install');
+    }
+    // Generic: show current npx command with --help
+    if (currentProvider.type === 'npx' && currentProvider.npx_command) {
+      const base = currentProvider.npx_command.trim();
+      suggestions.push(base + ' --help');
+    }
+  }
+  suggestions.push('node --version');
+  suggestions.push('npx --version');
+  suggestions.push('which npx');
+
+  const suggestEl = document.getElementById('cmd-suggestions');
+  suggestEl.innerHTML = suggestions.map(s =>
+    `<button class="btn btn-sm btn-outline-secondary py-0 px-2 font-monospace"
+      style="font-size:.75em" onclick="document.getElementById('cmd-input').value=${JSON.stringify(s)}">${esc(s)}</button>`
+  ).join('');
+
+  clearCmdOutput();
+  cmdModal.show();
+  setTimeout(() => document.getElementById('cmd-input').focus(), 300);
+}
+
+function clearCmdOutput() {
+  document.getElementById('cmd-output').textContent = '';
+  document.getElementById('cmd-status').textContent = '';
+  document.getElementById('cmd-status').style.color = 'var(--muted)';
+}
+
+async function runCommand() {
+  // If already running, cancel it
+  if (cmdRunning) {
+    if (cmdAbortController) cmdAbortController.abort();
+    return;
+  }
+
+  const command = document.getElementById('cmd-input').value.trim();
+  if (!command) return;
+
+  const outEl    = document.getElementById('cmd-output');
+  const statusEl = document.getElementById('cmd-status');
+  const btn      = document.getElementById('cmd-run-btn');
+
+  outEl.textContent = `$ ${command}\n`;
+  statusEl.textContent = 'Running…';
+  statusEl.style.color = 'var(--muted)';
+  btn.textContent = '⏹ Stop';
+  btn.classList.replace('btn-primary', 'btn-danger');
+  cmdRunning = true;
+  cmdAbortController = new AbortController();
+
+  try {
+    const response = await fetch('/api/run-command', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command}),
+      signal: cmdAbortController.signal,
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      outEl.textContent += `Error: ${data.detail || response.statusText}\n`;
+      return;
+    }
+
+    const reader  = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const parts = buffer.split('\n');
+      buffer = parts.pop(); // keep any incomplete line
+
+      for (const part of parts) {
+        if (!part.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(part.slice(6)); } catch { continue; }
+
+        if (data.line !== undefined) {
+          outEl.textContent += data.line + '\n';
+          outEl.scrollTop = outEl.scrollHeight;
+        }
+        if (data.error && data.line === undefined) {
+          outEl.textContent += `Error: ${data.error}\n`;
+        }
+        if (data.done) {
+          const ok = data.returncode === 0;
+          statusEl.textContent = ok
+            ? `✓ Exited 0`
+            : `✗ Exited ${data.returncode}`;
+          statusEl.style.color = ok ? 'var(--green)' : 'var(--red)';
+          outEl.scrollTop = outEl.scrollHeight;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      outEl.textContent += '\n[Cancelled]\n';
+      statusEl.textContent = 'Cancelled';
+      statusEl.style.color = 'var(--yellow)';
+    } else {
+      outEl.textContent += `\n[Connection error: ${e.message}]\n`;
+      statusEl.textContent = 'Error';
+      statusEl.style.color = 'var(--red)';
+    }
+  } finally {
+    cmdRunning = false;
+    cmdAbortController = null;
+    btn.textContent = '▶ Run';
+    btn.classList.replace('btn-danger', 'btn-primary');
+  }
 }
 </script>
 </body>

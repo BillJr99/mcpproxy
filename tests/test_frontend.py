@@ -390,3 +390,37 @@ class TestExtractFunctionsPure:
     def test_syntax_error(self):
         r = _extract_functions("def broken(: pass")
         assert not r["ok"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/run-command
+# ---------------------------------------------------------------------------
+
+class TestRunCommand:
+    def test_missing_command_400(self, client):
+        r = client.post("/api/run-command", json={})
+        assert r.status_code == 400
+
+    def test_simple_command_streams_sse(self, client):
+        """A fast echo command should return SSE with a 'done' event."""
+        with client.stream("POST", "/api/run-command", json={"command": "echo hello"}) as r:
+            assert r.status_code == 200
+            assert "text/event-stream" in r.headers["content-type"]
+            text = r.read().decode()
+        # Should have at least one data line and a done event
+        assert "hello" in text
+        assert '"done": true' in text or '"done":true' in text
+
+    def test_exit_code_nonzero(self, client):
+        """A failing command should report a non-zero returncode."""
+        with client.stream("POST", "/api/run-command", json={"command": "exit 42"}) as r:
+            text = r.read().decode()
+        import json as _json
+        events = [
+            _json.loads(line[6:])
+            for line in text.splitlines()
+            if line.startswith("data: ")
+        ]
+        done_events = [e for e in events if e.get("done")]
+        assert done_events, "Expected a done event"
+        assert done_events[-1]["returncode"] != 0

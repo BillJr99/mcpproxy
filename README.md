@@ -82,6 +82,40 @@ The **🔑 Secrets** button (also available in the wizard's final step) reads al
 entries from the selected provider, shows which variables are already set in `.env`, and lets
 you fill in or update missing values — all without leaving the browser.
 
+### Run Command
+
+The **🛠 Run Command** button (in the editor toolbar when a provider is open) lets you run
+any shell command inside the server environment — whether that's the local process or inside
+the Docker container — and streams the output live in a terminal panel.
+
+This is particularly useful for npx-based providers that need browser binaries or other
+one-time setup steps. For example, after adding a Playwright provider, install the Chrome
+browser with:
+
+```
+npx playwright install chrome
+```
+
+Or install Chromium together with its system dependencies (recommended inside Docker):
+
+```
+npx playwright install --with-deps chromium
+```
+
+The modal auto-suggests relevant commands based on the open provider's npx command (e.g. it
+pre-fills the playwright install variants when a Playwright provider is selected). Press
+**Enter** or click **▶ Run** to stream output; click **⏹ Stop** to kill the process.
+
+> **How npx providers start:** the npx process is launched *lazily* — on the first tool call
+> after server startup, not at startup itself. This means a `playwright install` run in **Run
+> Command** installs the binaries into the server environment; the actual browser process only
+> starts when a tool like `browser_navigate` is first called.
+>
+> When you edit an npx command in the UI and save, the YAML on disk is updated but the running
+> process keeps the old command. Click **Restart MCP Server** (the yellow bar that appears
+> after saving) to apply the new command — the updated process is then started on the next
+> tool call.
+
 ## Secrets
 
 Each tool provider YAML declares its required environment variables under `secrets.env`:
@@ -622,7 +656,15 @@ tools:
 ```
 
 The server spawns the `npx` process, performs the MCP handshake once, then forwards
-every tool call to it. The process is reused across calls.
+every tool call to it. The process is reused across calls (and started lazily on the
+first tool call, not at server startup).
+
+If the provider requires browser binaries (e.g. Playwright), install them via the
+**🛠 Run Command** panel in the web UI before making the first tool call:
+
+```
+npx playwright install chrome
+```
 
 ---
 

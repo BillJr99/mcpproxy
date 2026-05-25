@@ -906,12 +906,15 @@ files_fetched = []
 for entry in entries:
     if entry.get('type') != 'file':
         continue
-    fname       = entry['name']
+    # 'path' is relative to base_dir and includes any parent subdirectories,
+    # so it's the value to pass back to mcpproxy__getfile. Fall back to 'name'
+    # for older servers that don't populate 'path'.
+    fpath       = entry.get('path') or entry['name']
     file_result = _extract(
-        _call_tool('mcpproxy__getfile', {'path': fname})
+        _call_tool('mcpproxy__getfile', {'path': fpath})
     )
     files_fetched.append({
-        'name':     fname,
+        'name':     fpath,
         'size':     entry.get('size'),
         'ok':       file_result.get('ok', True),
         'encoding': file_result.get('encoding', 'text'),
@@ -948,7 +951,8 @@ try:
         for e in entries:
             icon = '📁' if e.get('type') == 'directory' else '📄'
             size = f\" ({e['size']} bytes)\" if e.get('size') is not None else ''
-            print(f\"  {icon}  {e['name']}{size}\")
+            label = e.get('path') or e.get('name', '')
+            print(f\"  {icon}  {label}{size}\")
         print()
         for f in files:
             if f.get('error'):

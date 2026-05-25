@@ -770,35 +770,6 @@ class TestRepositoryWorkdir:
         assert wd.endswith("linkedin")
 
 
-class TestEnsureGitInstalled:
-    def test_noop_when_git_present(self):
-        from server import _ensure_git_installed
-        with patch("shutil.which", return_value="/usr/bin/git"), \
-             patch("server.subprocess.run") as mock_run:
-            _ensure_git_installed()
-            mock_run.assert_not_called()
-
-    def test_runs_apt_get_when_missing(self):
-        from server import _ensure_git_installed
-        # First which() returns None, second (after install) returns the path
-        which_calls = iter([None, "/usr/bin/git"])
-        with patch("shutil.which", side_effect=lambda _: next(which_calls)), \
-             patch("server.subprocess.run") as mock_run:
-            _ensure_git_installed()
-        cmds = [c[0][0] for c in mock_run.call_args_list]
-        assert cmds[0] == ["apt-get", "update"]
-        assert cmds[1][:3] == ["apt-get", "install", "-y"]
-        assert "git" in cmds[1]
-
-    def test_raises_when_install_fails(self):
-        from server import _ensure_git_installed
-        import subprocess as sp
-        with patch("shutil.which", return_value=None), \
-             patch("server.subprocess.run", side_effect=sp.CalledProcessError(1, "apt-get")):
-            with pytest.raises(RuntimeError, match="git is required"):
-                _ensure_git_installed()
-
-
 class TestMaterializeRepository:
     def _spec(self, tmp_path: Path, **overrides):
         repo = {

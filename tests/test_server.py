@@ -25,6 +25,7 @@ from server import (
     exec_provider_code,
     load_provider_specs,
     redact_secrets,
+    register_builtin_tools,
     register_tool,
     resolve_env_defaults,
     run_provider_setup,
@@ -433,3 +434,59 @@ class TestRunProviderSetup:
             run_provider_setup(spec)
         _, kwargs = mock_run.call_args
         assert kwargs.get("check") is True
+
+
+# ---------------------------------------------------------------------------
+# register_builtin_tools
+# ---------------------------------------------------------------------------
+
+class TestRegisterBuiltinTools:
+    def test_register_builtin_tools_is_callable(self):
+        """register_builtin_tools is exported from server and callable."""
+        assert callable(register_builtin_tools)
+
+    def test_builtin_tool_handlers_importable(self):
+        """builtin_tools module exports the required handler functions."""
+        from builtin_tools import get_file, list_files
+        assert callable(list_files)
+        assert callable(get_file)
+
+    def test_register_builtin_tools_calls_mcp_tool_twice(self):
+        """register_builtin_tools registers exactly two tools via mcp.tool."""
+        tool_calls = []
+
+        def fake_decorator(**kwargs):
+            tool_calls.append(kwargs.get("name"))
+            return lambda fn: fn
+
+        with patch("server.mcp") as mock_mcp:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_builtin_tools()
+
+        assert len(tool_calls) == 2
+        assert "mcpproxy-listfiles" in tool_calls
+        assert "mcpproxy-getfile" in tool_calls
+
+    def test_listfiles_tool_spec_has_no_required_fields(self):
+        """mcpproxy-listfiles 'path' parameter should be optional."""
+        captured_specs = []
+
+        def fake_decorator(**kwargs):
+            captured_specs.append(kwargs)
+            return lambda fn: fn
+
+        with patch("server.mcp") as mock_mcp:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_builtin_tools()
+
+        # Find the listfiles call — it was the first one registered
+        names = [s["name"] for s in captured_specs]
+        assert "mcpproxy-listfiles" in names
+
+    def test_getfile_tool_spec_requires_path(self):
+        """mcpproxy-getfile should declare 'path' as a required parameter."""
+        from builtin_tools import get_file
+        import inspect
+        sig = inspect.signature(get_file)
+        # path has no default → required
+        assert sig.parameters["path"].default is inspect.Parameter.empty

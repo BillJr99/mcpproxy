@@ -318,8 +318,95 @@ def run_provider_setup(spec: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Built-in tools (always available, no YAML config required)
+# ---------------------------------------------------------------------------
+
+def register_builtin_tools() -> None:
+    """Register the mcpproxy-listfiles and mcpproxy-getfile utility tools.
+
+    These tools expose read-only access to the files directory (default:
+    ``.playwright-mcp``, override with ``MCPPROXY_FILES_DIR``).  They are
+    always registered regardless of what YAML providers are loaded, giving
+    LLMs a way to retrieve screenshots, JSON snapshots, and other files
+    produced by package providers such as the Playwright MCP server.
+    """
+    try:
+        from builtin_tools import get_file, list_files
+
+        register_tool(
+            {
+                "name": "mcpproxy-listfiles",
+                "description": (
+                    "List files and directories inside the mcpproxy files directory "
+                    "(default: .playwright-mcp, override with MCPPROXY_FILES_DIR). "
+                    "Use this to discover screenshots, JSON snapshots, and other files "
+                    "produced by package providers such as the Playwright MCP server. "
+                    "Pass a subdirectory path to drill down."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Subdirectory to list, relative to the base files directory. "
+                                "Omit or pass an empty string to list the root."
+                            ),
+                            "default": "",
+                        }
+                    },
+                    "required": [],
+                },
+            },
+            list_files,
+        )
+
+        register_tool(
+            {
+                "name": "mcpproxy-getfile",
+                "description": (
+                    "Read the contents of a file from the mcpproxy files directory "
+                    "(default: .playwright-mcp). "
+                    "Returns UTF-8 text for text files (JSON, HTML, Markdown, …) or "
+                    "base64-encoded bytes for binary files (PNG screenshots, …). "
+                    "Use mcpproxy-listfiles first to discover available file paths."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, relative to the base files directory.",
+                        },
+                        "encoding": {
+                            "type": "string",
+                            "description": (
+                                "How to encode the returned content. "
+                                "'auto' (default) tries UTF-8 and falls back to base64. "
+                                "'text' forces UTF-8 (error on binary). "
+                                "'base64' always returns base64 (safe for images)."
+                            ),
+                            "default": "auto",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+            get_file,
+        )
+
+        print("Registered built-in tools: mcpproxy-listfiles, mcpproxy-getfile")
+    except Exception as exc:
+        print(f"register_builtin_tools error: {exc}")
+        traceback.print_exc()
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Load all providers at import time
 # ---------------------------------------------------------------------------
+
+register_builtin_tools()
 
 for provider_spec in load_provider_specs(CONFIG_DIR):
     register_provider(provider_spec)

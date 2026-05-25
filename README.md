@@ -18,6 +18,11 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 runs `setup_commands`, then registers each tool automatically — no Python files to
 maintain separately, no changes to `server.py` needed when adding new tools.
 
+Two **built-in tools** (`mcpproxy-listfiles` and `mcpproxy-getfile`) are always registered
+without any YAML config.  They give LLMs read-only access to a configurable directory
+(default: `.playwright-mcp`) — useful for retrieving screenshots and snapshots produced
+by package providers such as Playwright MCP.
+
 ## Ports
 
 | Port | Service |
@@ -38,6 +43,7 @@ maintain separately, no changes to `server.py` needed when adding new tools.
 ├── server.py
 ├── config.py                       ← shared env-var config (imported by all modules)
 ├── process_runner.py               ← spawns & proxies any stdio MCP subprocess
+├── builtin_tools.py                ← built-in mcpproxy-listfiles / mcpproxy-getfile tools
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -531,7 +537,8 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Tests cover `server.py` (pure helpers) and `frontend/app.py` (all API endpoints).
+Tests cover `server.py` (pure helpers), `frontend/app.py` (all API endpoints), and
+`builtin_tools.py` (file listing and retrieval).
 CI runs on every push via `.github/workflows/tests.yml`.
 
 ---
@@ -745,6 +752,68 @@ sms_result = await request_text_input_with_fallback(
 ### Part 8 — persisting state between calls
 
 Write state to a well-known file path and read it on the next call.
+
+---
+
+### Part 9 — reading files produced by package providers
+
+Package providers (e.g. Playwright MCP) often write files to disk — screenshots (PNG),
+accessibility snapshots (JSON), downloaded pages (HTML) — that the LLM would otherwise
+have no way to retrieve.
+
+mcpproxy ships two **built-in utility tools** that are always registered, with no YAML
+config file required:
+
+| Tool | Description |
+|---|---|
+| `mcpproxy-listfiles` | List files and subdirectories inside the files base directory |
+| `mcpproxy-getfile` | Read a file from the files base directory (UTF-8 text or base64) |
+
+**Default base directory:** `.playwright-mcp` relative to the server's working directory
+(i.e. `/app/.playwright-mcp` inside Docker). Override with the `MCPPROXY_FILES_DIR`
+environment variable.
+
+Only files **inside** the base directory are accessible — path-traversal attempts
+(`../`) are rejected.
+
+#### Example workflow with Playwright
+
+1. Ask the LLM to navigate to a page and take a screenshot via the Playwright MCP provider.
+2. Playwright writes `screenshot.png` to `.playwright-mcp/`.
+3. Ask the LLM to call `mcpproxy-listfiles` — it returns the file list.
+4. Ask the LLM to call `mcpproxy-getfile` with `path="screenshot.png"` — it returns the
+   PNG as a base64 string that the LLM can describe or pass to a vision model.
+
+#### `mcpproxy-listfiles` parameters
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | No | `""` | Subdirectory to list, relative to the base dir. Omit to list the root. |
+
+Returns an object with `ok`, `base_dir`, `path`, and `entries` (list of `{name, type, size}`).
+
+#### `mcpproxy-getfile` parameters
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | **Yes** | — | File path, relative to the base dir. |
+| `encoding` | string | No | `"auto"` | `"auto"` tries UTF-8, falls back to base64. `"text"` forces UTF-8. `"base64"` always base64. |
+
+Returns an object with `ok`, `path`, `size`, `content`, and `encoding`.
+
+#### Changing the base directory
+
+```bash
+# In docker-compose.override.yml or as -e flag
+MCPPROXY_FILES_DIR=/app/data
+```
+
+Or mount a volume at the target path so files persist across container restarts:
+
+```yaml
+volumes:
+  - ./playwright-output:/app/.playwright-mcp
+```
 
 ---
 

@@ -277,14 +277,17 @@ def _get_package_command(spec: dict[str, Any]) -> str | None:
 
 
 def _make_process_handler(
-    command: str, tool_name: str, cwd: str | None = None
+    command: str,
+    tool_name: str,
+    cwd: str | None = None,
+    env_keys: list[str] | None = None,
 ) -> Callable[..., Any]:
     """Return an async handler that proxies calls to a subprocess MCP process."""
     from process_runner import get_session
 
     async def process_handler(context: dict[str, Any], **kwargs: Any) -> Any:
         try:
-            session = get_session(command, cwd=cwd)
+            session = get_session(command, cwd=cwd, env_keys=env_keys)
             return await session.call_tool(tool_name, kwargs)
         except Exception as exc:
             traceback.print_exc()
@@ -330,6 +333,7 @@ def materialize_repository(spec: dict[str, Any]) -> None:
     workdir = repository_workdir(provider_name, spec)
     assert workdir is not None
     build_commands = list(repo.get("build_commands") or [])
+    env_keys = list(repo.get("env_keys") or [])
 
     try:
         wd_path = Path(workdir)
@@ -346,6 +350,14 @@ def materialize_repository(spec: dict[str, Any]) -> None:
             print(f"Checking out ref {ref} in {workdir}")
             subprocess.run(["git", "-C", workdir, "checkout", ref], check=True)
 
+        # Materialise <workdir>/.env from os.environ BEFORE running build
+        # commands.  Some servers (e.g. those using `tsx --env-file=.env`)
+        # require the file to exist when the build script runs.  Missing
+        # values are skipped — the build may still fail but on subsequent
+        # restarts (after the user fills secrets in the UI) it will succeed.
+        if env_keys:
+            write_workdir_env_file(workdir, env_keys)
+
         for cmd in build_commands:
             if not cmd:
                 continue
@@ -355,6 +367,24 @@ def materialize_repository(spec: dict[str, Any]) -> None:
         print(f"materialize_repository error in {source_path}: {exc}")
         traceback.print_exc()
         raise
+
+
+def write_workdir_env_file(workdir: str, env_keys: list[str]) -> Path:
+    """Write a ``.env`` inside ``workdir`` populated from ``os.environ``.
+
+    Only keys with a non-empty value are written.  Used by
+    ``materialize_repository`` so dotenv-style loaders inside the cloned
+    repo pick up secrets supplied via the proxy's Secrets UI.
+    """
+    target = Path(workdir) / ".env"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            lines.append(f"{key}={val}")
+    target.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return target
 
 
 def register_provider(spec: dict[str, Any]) -> None:
@@ -371,8 +401,10 @@ def register_provider(spec: dict[str, Any]) -> None:
     try:
         command = _get_package_command(spec)
         # Repository providers piggy-back on the package code path; the only
-        # difference is that their subprocess is spawned with cwd=<workdir>.
+        # difference is that their subprocess is spawned with cwd=<workdir>
+        # and env enriched with the repository.env_keys declared in YAML.
         cwd = repository_workdir(provider_name, spec)
+        env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
 
         if command is not None:
             # ── package provider (npx / uvx / python -m / any binary) ──────────
@@ -381,7 +413,7 @@ def register_provider(spec: dict[str, Any]) -> None:
                 if not tool_is_enabled(tool_spec):
                     print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
                     continue
-                handler = _make_process_handler(command, tool_name, cwd=cwd)
+                handler = _make_process_handler(command, tool_name, cwd=cwd, env_keys=env_keys)
                 register_tool(
                     tool_spec,
                     handler,

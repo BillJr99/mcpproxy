@@ -17,6 +17,7 @@ Two use-cases
 
 import asyncio
 import json
+import os
 import shlex
 import traceback
 from typing import Any
@@ -25,9 +26,15 @@ from typing import Any
 class ProcessSession:
     """A long-lived connection to a single stdio MCP server process."""
 
-    def __init__(self, command: str, cwd: str | None = None) -> None:
+    def __init__(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env_keys: list[str] | None = None,
+    ) -> None:
         self.command = command
         self.cwd = cwd
+        self.env_keys = list(env_keys or [])
         self._parts: list[str] = shlex.split(command)
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
@@ -53,12 +60,14 @@ class ProcessSession:
         return json.loads(line)
 
     async def _start(self) -> None:
+        env = self._build_env()
         self._proc = await asyncio.create_subprocess_exec(
             *self._parts,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd,
+            env=env,
         )
         # initialize handshake
         rid = self._new_id()
@@ -73,6 +82,35 @@ class ProcessSession:
         await self._recv(timeout=60)   # initialize response
         # notifications/initialized (no response expected)
         await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _build_env(self) -> dict[str, str]:
+        """Return the env dict for the subprocess.
+
+        Starts from the current process env, then re-reads the proxy's
+        ``MCP_ENV_FILE`` (if any) so that secret values added via the UI
+        after server start are picked up on the next spawn without
+        requiring a full restart.  Only ``env_keys`` are refreshed from
+        the file — everything else is inherited unchanged.
+        """
+        env = os.environ.copy()
+        if not self.env_keys:
+            return env
+        env_file = os.environ.get("MCP_ENV_FILE", ".env")
+        try:
+            from pathlib import Path
+            p = Path(env_file)
+            if p.exists():
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    if k in self.env_keys:
+                        env[k] = v.strip().strip('"').strip("'")
+        except Exception:
+            traceback.print_exc()
+        return env
 
     def _alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
@@ -139,29 +177,36 @@ NpxSession = ProcessSession
 # Module-level session registry  (one session per (command, cwd) pair)
 # ---------------------------------------------------------------------------
 
-_sessions: dict[tuple[str, str | None], ProcessSession] = {}
+_sessions: dict[tuple[str, str | None, tuple[str, ...]], ProcessSession] = {}
 
 
-def get_session(command: str, cwd: str | None = None) -> ProcessSession:
+def get_session(
+    command: str,
+    cwd: str | None = None,
+    env_keys: list[str] | None = None,
+) -> ProcessSession:
     """Return (creating if needed) the persistent session for *command*.
 
-    Sessions are keyed on the (command, cwd) pair so that two providers that
-    happen to share a spawn command but live in different working directories
-    (e.g. two repository providers built from the same template) get distinct
-    subprocesses.
+    Sessions are keyed on (command, cwd, env_keys) so that two providers
+    that share a spawn command but live in different workdirs or use
+    different env-key sets get distinct subprocesses.
     """
-    key = (command, cwd)
+    key = (command, cwd, tuple(env_keys or ()))
     if key not in _sessions:
-        _sessions[key] = ProcessSession(command, cwd=cwd)
+        _sessions[key] = ProcessSession(command, cwd=cwd, env_keys=env_keys)
     return _sessions[key]
 
 
-async def introspect(command: str, cwd: str | None = None) -> list[dict[str, Any]]:
+async def introspect(
+    command: str,
+    cwd: str | None = None,
+    env_keys: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Spawn a *fresh* process, fetch its tools/list, then shut it down.
     Used by the frontend wizard — does not affect the persistent session registry.
     """
-    session = ProcessSession(command, cwd=cwd)
+    session = ProcessSession(command, cwd=cwd, env_keys=env_keys)
     try:
         await session._start()
         return await session.list_tools()

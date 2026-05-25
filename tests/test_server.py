@@ -35,6 +35,7 @@ from server import (
     resolve_env_defaults,
     run_provider_setup,
     tool_is_enabled,
+    write_workdir_env_file,
 )
 import tool_registry
 
@@ -872,9 +873,10 @@ class TestRegisterProviderRepositoryCwd:
         def fake_decorator(**kwargs):
             return lambda fn: fn
 
-        def fake_get_session(command, cwd=None):
+        def fake_get_session(command, cwd=None, env_keys=None):
             captured["command"] = command
             captured["cwd"] = cwd
+            captured["env_keys"] = env_keys
             class _Sess:
                 async def call_tool(self, *a, **kw): return {"ok": True}
             return _Sess()
@@ -891,3 +893,100 @@ class TestRegisterProviderRepositoryCwd:
 
         assert captured["cwd"] == "/app/repos/linkedin"
         assert captured["command"] == "node dist/main.js"
+
+
+class TestWriteWorkdirEnvFile:
+    def test_writes_only_set_keys(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("LINKEDIN_EMAIL", "user@example.com")
+        monkeypatch.delenv("LINKEDIN_PASSWORD", raising=False)
+        target = write_workdir_env_file(str(tmp_path), ["LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"])
+        assert target == tmp_path / ".env"
+        text = target.read_text()
+        assert "LINKEDIN_EMAIL=user@example.com" in text
+        assert "LINKEDIN_PASSWORD" not in text
+
+    def test_empty_keys_list_writes_empty_file(self, tmp_path: Path):
+        target = write_workdir_env_file(str(tmp_path), [])
+        assert target.exists()
+        assert target.read_text() == ""
+
+
+class TestMaterializeRepositoryEnvFile:
+    def test_env_file_written_before_build(self, tmp_path: Path, monkeypatch):
+        wd = str(tmp_path / "wd")
+        spec = {
+            "_config_path": str(tmp_path / "r.yaml"),
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": wd,
+                "build_commands": ["npm install"],
+                "env_keys": ["MY_SECRET"],
+            },
+        }
+        monkeypatch.setenv("MY_SECRET", "value123")
+
+        observed_env_at_build = {}
+
+        def fake_run(args, **kwargs):
+            if "npm" in args:
+                # When the build command runs, the .env file should exist
+                env_file = Path(wd) / ".env"
+                observed_env_at_build["exists"] = env_file.exists()
+                observed_env_at_build["content"] = env_file.read_text() if env_file.exists() else ""
+            class _R: returncode = 0
+            return _R()
+
+        with patch("server.subprocess.run", side_effect=fake_run):
+            materialize_repository(spec)
+
+        assert observed_env_at_build["exists"] is True
+        assert "MY_SECRET=value123" in observed_env_at_build["content"]
+
+    def test_no_env_keys_no_dot_env(self, tmp_path: Path):
+        wd = str(tmp_path / "wd")
+        spec = {
+            "_config_path": str(tmp_path / "r.yaml"),
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": wd,
+                "build_commands": [],
+            },
+        }
+        with patch("server.subprocess.run"):
+            materialize_repository(spec)
+        assert not (Path(wd) / ".env").exists()
+
+
+class TestRegisterProviderEnvKeys:
+    def test_env_keys_passed_to_get_session(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "linkedin.yaml"),
+            "package": {"command": "node dist/main.js"},
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": "/app/repos/linkedin",
+                "build_commands": [],
+                "env_keys": ["A", "B"],
+            },
+            "tools": [{
+                "name": "do_thing",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        captured = {}
+
+        def fake_get_session(command, cwd=None, env_keys=None):
+            captured["env_keys"] = env_keys
+            class _S:
+                async def call_tool(self, *a, **kw): return {"ok": True}
+            return _S()
+
+        with patch("server.mcp") as mock_mcp, \
+             patch("process_runner.get_session", side_effect=fake_get_session):
+            mock_mcp.tool.side_effect = lambda **k: lambda fn: fn
+            register_provider(spec)
+            entry = tool_registry.get("linkedin__do_thing")
+            import asyncio
+            asyncio.run(entry["handler"](None))
+        assert captured["env_keys"] == ["A", "B"]

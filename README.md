@@ -41,7 +41,7 @@ is added automatically when the tool is registered.
 | Port | Service |
 |---|---|
 | **8888** | MCP endpoint — `http://localhost:8888/mcp` |
-| **8889** | Web UI — `http://localhost:8889` |
+| **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
 
 ## Layout
 
@@ -180,7 +180,7 @@ The script will:
 3. Override `MCP_TOOL_CONFIG_DIR` to the correct local path.
 4. Create `.venv`, install dependencies, and start the server.
 
-The UI is available at `http://localhost:8889` and the MCP endpoint at `http://localhost:8888/mcp`.
+The Web UI and OpenAI-compatible tools endpoint are available at `http://localhost:8889`; the MCP endpoint is at `http://localhost:8888/mcp`.
 
 ## Run with Docker
 
@@ -206,7 +206,7 @@ docker run -d --rm \
 ```
 
 MCP endpoint: **`http://localhost:8888/mcp`**  
-Web UI: **`http://localhost:8889`**
+Web UI & OpenAI-compatible tools endpoint: **`http://localhost:8889`**
 
 The `-d` flag runs the container as a daemon and returns you to the shell immediately.
 Follow logs with `docker logs -f mcpproxy`; stop the container with `docker stop mcpproxy`.

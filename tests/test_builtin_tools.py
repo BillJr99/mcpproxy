@@ -200,6 +200,25 @@ class TestListFiles:
         assert paths == {"sub", "sub/a.txt", "sub/deep"}
 
     @pytest.mark.asyncio
+    async def test_entry_path_is_relative_to_base_not_listed_dir(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Entry 'path' must be passable directly to get_file, regardless of
+        which subdirectory was listed."""
+        base = tmp_path / "files"
+        sub = base / "playwright"
+        sub.mkdir(parents=True)
+        (sub / "snap.yml").write_text("y")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files, get_file
+        result = await list_files(_ctx(), path="playwright")
+        entry = next(e for e in result["entries"] if e["name"] == "snap.yml")
+        assert entry["path"] == "playwright/snap.yml"
+        fetched = await get_file(_ctx(), path=entry["path"])
+        assert fetched["ok"] is True
+        assert fetched["content"] == "y"
+
+    @pytest.mark.asyncio
     async def test_recursive_does_not_follow_dir_symlinks(self, tmp_path: Path, monkeypatch):
         base = tmp_path / "files"
         base.mkdir()

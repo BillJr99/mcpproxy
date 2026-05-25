@@ -1,30 +1,33 @@
 """Unit tests for server.py pure helper functions.
 
-Note: server.py has module-level side effects (load_provider_specs + register_provider).
-conftest.py sets MCP_TOOL_CONFIG_DIR to an empty temp dir before import so zero tools
-are registered and no npx processes are started.
+Note: server.py has module-level side effects (load_provider_specs + register_provider +
+run_provider_setup).  conftest.py sets MCP_TOOL_CONFIG_DIR to an empty temp dir before
+import so zero tools are registered and no processes are started.
 """
 import inspect
 import os
 import textwrap
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import yaml
 
-# server.py has module-level side effects (load_provider_specs + register_provider).
-# conftest.py has already set MCP_TOOL_CONFIG_DIR to an empty temp dir, so the
-# import is safe and results in zero tools being registered.
+# server.py has module-level side effects (load_provider_specs + register_provider +
+# run_provider_setup).  conftest.py has already set MCP_TOOL_CONFIG_DIR to an empty
+# temp dir, so the import is safe and results in zero tools being registered.
 from server import (
+    SUBPROCESS_KEYS,
     _build_typed_signature,
+    _get_package_command,
     build_runtime_context,
     exec_provider_code,
     load_provider_specs,
     redact_secrets,
     register_tool,
     resolve_env_defaults,
+    run_provider_setup,
 )
 
 
@@ -257,7 +260,6 @@ class TestRegisterTool:
                 "required": ["msg"],
             },
         }
-        # We patch mcp.tool to avoid touching the real FastMCP registry
         with patch("server.mcp") as mock_mcp:
             mock_mcp.tool.return_value = lambda fn: fn
             register_tool(tool_spec, handler)
@@ -328,3 +330,106 @@ class TestRegisterTool:
         assert result["ok"] is False
         assert "something broke" in result["error"]
         assert result["tool"] == "bad_tool"
+
+
+# ---------------------------------------------------------------------------
+# _get_package_command
+# ---------------------------------------------------------------------------
+
+class TestGetPackageCommand:
+    def test_package_key_returns_command(self):
+        spec = {"package": {"command": "npx @playwright/mcp@latest --isolated"}}
+        assert _get_package_command(spec) == "npx @playwright/mcp@latest --isolated"
+
+    def test_uvx_command(self):
+        spec = {"package": {"command": "uvx mcp-server-fetch"}}
+        assert _get_package_command(spec) == "uvx mcp-server-fetch"
+
+    def test_python_module_command(self):
+        spec = {"package": {"command": "python -m mcp_server_github"}}
+        assert _get_package_command(spec) == "python -m mcp_server_github"
+
+    def test_installed_binary_command(self):
+        spec = {"package": {"command": "mcp-server-github"}}
+        assert _get_package_command(spec) == "mcp-server-github"
+
+    def test_code_provider_returns_none(self):
+        spec = {"code": "async def f(ctx): pass", "tools": []}
+        assert _get_package_command(spec) is None
+
+    def test_empty_spec_returns_none(self):
+        assert _get_package_command({}) is None
+
+    def test_missing_command_field_returns_none(self):
+        spec = {"package": {}}
+        assert _get_package_command(spec) is None
+
+    def test_empty_command_field_returns_none(self):
+        spec = {"package": {"command": "   "}}
+        assert _get_package_command(spec) is None
+
+    def test_subprocess_keys_constant(self):
+        assert SUBPROCESS_KEYS == ("package",)
+
+
+# ---------------------------------------------------------------------------
+# run_provider_setup
+# ---------------------------------------------------------------------------
+
+class TestRunProviderSetup:
+    def test_empty_spec_no_subprocess_calls(self):
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup({})
+            mock_run.assert_not_called()
+
+    def test_installs_requirements(self):
+        spec = {"requirements": ["httpx", "requests"]}
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        calls = mock_run.call_args_list
+        assert len(calls) == 2
+        # Both calls should be pip install
+        for c in calls:
+            args = c[0][0]
+            assert "-m" in args
+            assert "pip" in args
+            assert "install" in args
+
+    def test_installs_correct_package_names(self):
+        spec = {"requirements": ["httpx==0.27.0", "requests"]}
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        calls = mock_run.call_args_list
+        assert calls[0][0][0][-1] == "httpx==0.27.0"
+        assert calls[1][0][0][-1] == "requests"
+
+    def test_runs_setup_commands(self):
+        spec = {"setup_commands": ["npx playwright install chrome"]}
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        calls = mock_run.call_args_list
+        assert len(calls) == 1
+        args = calls[0][0][0]
+        assert args == ["npx", "playwright", "install", "chrome"]
+
+    def test_runs_both_requirements_and_setup_commands(self):
+        spec = {
+            "requirements": ["httpx"],
+            "setup_commands": ["echo hello"],
+        }
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        assert mock_run.call_count == 2
+
+    def test_skips_empty_strings(self):
+        spec = {"requirements": ["", "httpx", ""], "setup_commands": ["", "echo hi"]}
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        assert mock_run.call_count == 2  # only "httpx" + "echo hi"
+
+    def test_check_true_passed_to_subprocess(self):
+        spec = {"requirements": ["httpx"]}
+        with patch("server.subprocess.run") as mock_run:
+            run_provider_setup(spec)
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("check") is True

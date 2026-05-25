@@ -310,6 +310,33 @@ def repository_workdir(provider_name: str, spec: dict[str, Any]) -> str | None:
     return str(REPOS_DIR / safe)
 
 
+def _ensure_git_installed() -> None:
+    """Verify ``git`` is on PATH; attempt apt-get install if missing.
+
+    Repository providers need ``git``.  The Dockerfile installs it during the
+    image build, but older images (or non-Docker environments) may not have
+    it — try a best-effort apt-get install before bailing out.  Runs at most
+    once per process.
+    """
+    import shutil
+    if shutil.which("git"):
+        return
+    print("git not found on PATH — attempting apt-get install...")
+    try:
+        subprocess.run(["apt-get", "update"], check=True)
+        subprocess.run(
+            ["apt-get", "install", "-y", "--no-install-recommends", "git"],
+            check=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "git is required for repository providers but is not installed, "
+            f"and automatic apt-get install failed: {exc}"
+        ) from exc
+    if not shutil.which("git"):
+        raise RuntimeError("apt-get install succeeded but git is still not on PATH")
+
+
 def materialize_repository(spec: dict[str, Any]) -> None:
     """Clone the repo (if absent) and run build_commands.  Idempotent.
 
@@ -332,6 +359,7 @@ def materialize_repository(spec: dict[str, Any]) -> None:
     build_commands = list(repo.get("build_commands") or [])
 
     try:
+        _ensure_git_installed()
         wd_path = Path(workdir)
         wd_path.parent.mkdir(parents=True, exist_ok=True)
 

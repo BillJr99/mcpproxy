@@ -182,15 +182,19 @@ docker pull ghcr.io/billjr99/mcpproxy:latest
 `handlers/` is baked into the image; no mount needed.
 
 ```bash
-docker run --rm \
+docker run -d --rm \
   -p 8888:8888 -p 8889:8889 \
   --env-file .env \
   -v "$(pwd)/tools":/app/tools \
+  --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
 
 MCP endpoint: **`http://localhost:8888/mcp`**  
 Web UI: **`http://localhost:8889`**
+
+The `-d` flag runs the container as a daemon and returns you to the shell immediately.
+Follow logs with `docker logs -f mcpproxy`; stop the container with `docker stop mcpproxy`.
 
 > **Note:** `tools/` is never baked into the image and must be supplied at runtime via a volume mount.
 > `handlers/` is part of the image — no mount required.
@@ -203,12 +207,13 @@ you can run the image from any working directory and the web UI can read and wri
 mkdir -p ~/.mcpproxy/tools
 touch ~/.mcpproxy/.env
 
-docker run --rm \
+docker run -d \
   -p 8888:8888 -p 8889:8889 \
   --env-file "$HOME/.mcpproxy/.env" \
   -e MCP_ENV_FILE=/app/.env \
   -v "$HOME/.mcpproxy/tools:/app/tools" \
   -v "$HOME/.mcpproxy/.env:/app/.env" \
+  --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
 

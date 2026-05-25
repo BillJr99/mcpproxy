@@ -29,6 +29,3 @@ dist/
 
 # Local tool configs (not committed — mount into Docker at runtime)
 tools/
-
-# Live test scripts (personal, not for CI)
-tests/*.sh

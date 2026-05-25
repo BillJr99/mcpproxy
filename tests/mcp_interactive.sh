@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+# tests/mcp_interactive.sh — Generic interactive MCP tool tester + Ollama summary
+#
+# Flow
+# ────
+# 1. Pick an Ollama model (menu or $OLLAMA_MODEL).
+# 2. Initialize an MCP session with mcpproxy.
+# 3. Show every registered tool; let you pick one.
+# 4. Check that required secrets are present in .env (never prints values).
+# 5. Prompt for each non-secret parameter (type-aware, required vs optional).
+# 6. Call the tool — secrets are injected server-side, never by this script.
+# 7. Display the result and ask Ollama to summarise it.
+#
+# Environment overrides:
+#   MCP_URL       [http://localhost:8888/mcp]
+#   UI_URL        [http://localhost:8889]      used to look up secret metadata
+#   OLLAMA_URL    [http://localhost:11434]
+#   OLLAMA_MODEL  skip model menu
+#   ENV_FILE      [.env]                       checked for secret presence only
+set -euo pipefail
+
+MCP_URL="${MCP_URL:-http://localhost:8888/mcp}"
+UI_URL="${UI_URL:-http://localhost:8889}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+ENV_FILE="${ENV_FILE:-.env}"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+_RPC_ID=0
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+die()  { printf '\n✗  %s\n' "$*" >&2; exit 1; }
+info() { printf '\n▸  %s\n' "$*"; }
+ok()   { printf '✓  %s\n' "$*"; }
+sep()  { printf '\n%s\n' "────────────────────────────────────────────────────"; }
+bold() { printf '\033[1m%s\033[0m' "$*"; }
+
+next_id() { _RPC_ID=$(( _RPC_ID + 1 )); printf '%d' "$_RPC_ID"; }
+
+mcp_post() {
+  # mcp_post <request_file> <response_file>
+  curl -fsS --max-time 120 \
+    "${SESSION_HEADER_ARGS[@]}" \
+    --data "@${1}" \
+    "${MCP_URL}" > "${2}"
+}
+
+# Unwrap SSE or plain JSON-RPC, extract tool result payload
+extract_tool_result() {
+  local raw="$1" out="$2"
+  python3 - "$raw" "$out" <<'PY'
+import sys, json
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+out = Path(sys.argv[2])
+
+def write(obj):
+    out.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding='utf-8')
+
+# Unwrap SSE envelope if present
+if raw.startswith('event:') or (raw.startswith('data:') and '\n' in raw):
+    for line in raw.splitlines():
+        if line.startswith('data: '):
+            raw = line[6:].strip()
+            break
+    else:
+        write({'ok': False, 'error': 'No data: line in SSE response'}); sys.exit(0)
+
+try:
+    rpc = json.loads(raw)
+except json.JSONDecodeError as e:
+    write({'ok': False, 'error': f'JSON parse error: {e}', 'raw': raw[:300]}); sys.exit(0)
+
+if 'error' in rpc:
+    e = rpc['error']
+    write({'ok': False, 'rpc_error': e.get('message', str(e))}); sys.exit(0)
+
+result  = rpc.get('result', {})
+content = result.get('content', [])
+
+if not content:
+    write({'ok': True, **result} if isinstance(result, dict) else {'ok': True, 'result': result})
+    sys.exit(0)
+
+first = content[0] if isinstance(content, list) else content
+if isinstance(first, dict) and first.get('type') == 'text':
+    try:
+        write(json.loads(first['text']))
+    except json.JSONDecodeError:
+        write({'ok': True, 'text': first['text']})
+else:
+    write({'ok': True, 'content': content})
+PY
+}
+
+# ── Step 1: Read .env key names — never values ────────────────────────────────
+
+ENV_KEYS_FILE="${TMP_DIR}/env_keys.txt"
+python3 - "${ENV_FILE}" "${ENV_KEYS_FILE}" <<'PY'
+import sys
+from pathlib import Path
+env_file = Path(sys.argv[1])
+keys = []
+if env_file.exists():
+    for line in env_file.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            key = line.split('=', 1)[0].strip()
+            if key:
+                keys.append(key)
+Path(sys.argv[2]).write_text('\n'.join(keys), encoding='utf-8')
+PY
+
+# ── Step 2: Ollama model selection ────────────────────────────────────────────
+
+sep
+printf 'MCP Interactive Tool Tester\n'
+sep
+printf '  MCP    : %s\n' "${MCP_URL}"
+printf '  UI     : %s\n' "${UI_URL}"
+printf '  Ollama : %s\n' "${OLLAMA_URL}"
+
+printf '\n  Checking Ollama… '
+TAGS_JSON="$(curl -fsS --max-time 5 "${OLLAMA_URL}/api/tags")" \
+  || die "Ollama not reachable at ${OLLAMA_URL}.  Is it running?"
+printf 'OK\n'
+
+mapfile -t MODELS < <(printf '%s' "${TAGS_JSON}" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin).get('models', []):
+    print(m['name'])
+")
+[[ ${#MODELS[@]} -gt 0 ]] || die "No models found.  Pull one:  ollama pull qwen3:14b"
+
+if [[ -n "${OLLAMA_MODEL:-}" ]]; then
+  FOUND=0
+  for m in "${MODELS[@]}"; do [[ "$m" == "${OLLAMA_MODEL}" ]] && FOUND=1 && break; done
+  if [[ "${FOUND}" == "1" ]]; then
+    printf '\n  Model (env): %s\n' "${OLLAMA_MODEL}"
+  else
+    printf '\n  ⚠  OLLAMA_MODEL="%s" not found — showing menu.\n' "${OLLAMA_MODEL}"
+    unset OLLAMA_MODEL
+  fi
+fi
+
+if [[ -z "${OLLAMA_MODEL:-}" ]]; then
+  printf '\n  Available models:\n'
+  for i in "${!MODELS[@]}"; do
+    printf '    %2d)  %s\n' "$((i+1))" "${MODELS[$i]}"
+  done
+  if [[ ${#MODELS[@]} -eq 1 ]]; then
+    OLLAMA_MODEL="${MODELS[0]}"
+    printf '\n  Auto-selected: %s\n' "${OLLAMA_MODEL}"
+  else
+    while true; do
+      printf '\n  Select model [1-%d]: ' "${#MODELS[@]}"
+      read -r SEL
+      if [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#MODELS[@]} )); then
+        OLLAMA_MODEL="${MODELS[$((SEL-1))]}"
+        break
+      fi
+      printf '  Invalid choice.\n'
+    done
+  fi
+fi
+
+# ── Step 3: MCP initialize ────────────────────────────────────────────────────
+
+sep
+printf '  Checking MCP server… '
+
+INIT_REQ="${TMP_DIR}/init_req.json"
+INIT_RESP="${TMP_DIR}/init_resp.json"
+HEADERS_FILE="${TMP_DIR}/headers.txt"
+
+cat > "${INIT_REQ}" <<'JSON'
+{
+  "jsonrpc": "2.0", "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": "mcp-interactive", "version": "0.1"}
+  }
+}
+JSON
+
+curl -fsS --max-time 10 \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  --data "@${INIT_REQ}" \
+  -D "${HEADERS_FILE}" \
+  "${MCP_URL}" > "${INIT_RESP}" \
+  || die "MCP server not reachable at ${MCP_URL}\n  Start it:  ./run_local.sh"
+printf 'OK\n'
+
+_RPC_ID=1
+SESSION_ID="$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r","", $2); print $2}' \
+  "${HEADERS_FILE}" | tail -n 1)"
+
+SESSION_HEADER_ARGS=(
+  -H 'Content-Type: application/json'
+  -H 'Accept: application/json, text/event-stream'
+)
+[[ -n "${SESSION_ID}" ]] && SESSION_HEADER_ARGS+=(-H "Mcp-Session-Id: ${SESSION_ID}")
+printf '  Session: %s\n' "${SESSION_ID:-(stateless)}"
+
+# ── Step 4: tools/list + tool selection ──────────────────────────────────────
+
+sep
+TOOLS_REQ="${TMP_DIR}/tools_req.json"
+TOOLS_RESP="${TMP_DIR}/tools_resp.json"
+
+printf '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}\n' "$(next_id)" \
+  > "${TOOLS_REQ}"
+mcp_post "${TOOLS_REQ}" "${TOOLS_RESP}"
+
+# Write tool names + descriptions to a TSV
+TOOLS_TSV="${TMP_DIR}/tools.tsv"
+python3 - "${TOOLS_RESP}" "${TOOLS_TSV}" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+tools = r.get('result', {}).get('tools', [])
+if not tools:
+    print("no_tools", flush=True)
+    sys.exit(0)
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
+    for t in tools:
+        name = t.get('name', '')
+        desc = t.get('description', '').replace('\n', ' ').replace('\t', ' ')[:72]
+        f.write(f"{name}\t{desc}\n")
+PY
+
+[[ -s "${TOOLS_TSV}" ]] || die "No tools registered in mcpproxy."
+
+mapfile -t TOOL_NAMES < <(cut -f1 "${TOOLS_TSV}")
+mapfile -t TOOL_DESCS < <(cut -f2 "${TOOLS_TSV}")
+
+printf '\n  Registered tools:\n\n'
+for i in "${!TOOL_NAMES[@]}"; do
+  printf '  %3d)  ' "$((i+1))"
+  bold "${TOOL_NAMES[$i]}"
+  printf '\n        %s\n' "${TOOL_DESCS[$i]}"
+done
+
+while true; do
+  printf '\n  Select tool [1-%d]: ' "${#TOOL_NAMES[@]}"
+  read -r SEL
+  if [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#TOOL_NAMES[@]} )); then
+    SELECTED_TOOL="${TOOL_NAMES[$((SEL-1))]}"
+    break
+  fi
+  printf '  Invalid choice.\n'
+done
+
+sep
+printf '  Selected: '; bold "${SELECTED_TOOL}"; printf '\n'
+
+# ── Step 5: Secret status check ───────────────────────────────────────────────
+# Looks up the provider that owns this tool via the UI API, then checks
+# which declared secrets ARE and ARE NOT present in .env.
+# Only key names are compared — values are never read or printed.
+
+python3 - "${SELECTED_TOOL}" "${UI_URL}" "${ENV_KEYS_FILE}" <<'PY'
+import json, sys, urllib.request
+from pathlib import Path
+
+tool_name  = sys.argv[1]
+ui_url     = sys.argv[2]
+env_keys   = set(Path(sys.argv[3]).read_text(encoding='utf-8').split())
+
+try:
+    with urllib.request.urlopen(f"{ui_url}/api/tools", timeout=5) as r:
+        providers = json.load(r)
+except Exception:
+    providers = []
+
+for p in providers:
+    if tool_name in (p.get('tool_names') or []):
+        sk = p.get('secret_keys') or []
+        if sk:
+            print(f"\n  Secrets for provider '{p['name']}' (injected server-side):")
+            all_ok = True
+            for k in sk:
+                if k in env_keys:
+                    print(f"    ✓  {k}  — set in .env")
+                else:
+                    print(f"    ✗  {k}  — NOT SET (tool call may fail)")
+                    all_ok = False
+            if not all_ok:
+                print(f"\n  Add missing values to .env or use the Secrets manager at {ui_url}")
+        break
+PY
+
+# ── Step 6: Parameter prompting ───────────────────────────────────────────────
+
+sep
+info "Parameters for '${SELECTED_TOOL}'"
+printf '\n  (* = required)\n'
+
+PARAMS_FILE="${TMP_DIR}/params.json"
+python3 - "${SELECTED_TOOL}" "${TOOLS_RESP}" "${PARAMS_FILE}" <<'PY'
+import json, sys
+
+tool_name = sys.argv[1]
+r         = json.load(open(sys.argv[2]))
+tools     = r.get('result', {}).get('tools', [])
+tool      = next((t for t in tools if t['name'] == tool_name), None)
+
+if not tool:
+    json.dump([], open(sys.argv[3], 'w')); sys.exit(0)
+
+schema = tool.get('inputSchema') or tool.get('input_schema') or {}
+props  = schema.get('properties', {})
+req    = set(schema.get('required', []))
+params = []
+for name, defn in props.items():
+    params.append({
+        'name':        name,
+        'type':        defn.get('type', 'string'),
+        'description': defn.get('description', ''),
+        'required':    name in req,
+        'default':     defn.get('default'),
+    })
+json.dump(params, open(sys.argv[3], 'w'), indent=2)
+PY
+
+mapfile -t PNAMES < <(python3 -c "
+import json; [print(p['name']) for p in json.load(open('${PARAMS_FILE}'))]
+")
+mapfile -t PTYPES < <(python3 -c "
+import json; [print(p.get('type','string')) for p in json.load(open('${PARAMS_FILE}'))]
+")
+mapfile -t PDESCS < <(python3 -c "
+import json; [print(p.get('description','')) for p in json.load(open('${PARAMS_FILE}'))]
+")
+mapfile -t PREQS  < <(python3 -c "
+import json; [print('1' if p.get('required') else '0') for p in json.load(open('${PARAMS_FILE}'))]
+")
+mapfile -t PDEFS  < <(python3 -c "
+import json
+for p in json.load(open('${PARAMS_FILE}')):
+    d = p.get('default'); print('' if d is None else str(d))
+")
+
+if [[ ${#PNAMES[@]} -eq 0 ]]; then
+  printf '\n  No parameters — secrets will be injected server-side.\n'
+fi
+
+# Collect values into a TSV written to disk (no env-var leakage)
+VALS_TSV="${TMP_DIR}/values.tsv"
+> "${VALS_TSV}"
+
+for i in "${!PNAMES[@]}"; do
+  pname="${PNAMES[$i]}"
+  ptype="${PTYPES[$i]}"
+  pdesc="${PDESCS[$i]}"
+  preq="${PREQS[$i]}"
+  pdef="${PDEFS[$i]}"
+
+  printf '\n  '
+  bold "${pname}"
+  printf '  \033[2m(%s)\033[0m' "${ptype}"
+  [[ "${preq}" == "1" ]] && printf '  \033[31m*\033[0m'
+  printf '\n'
+  [[ -n "${pdesc}" ]] && printf '  %s\n' "${pdesc}"
+
+  if [[ "${ptype}" == "boolean" ]]; then
+    [[ -n "${pdef}" ]] && PROMPT="  [y/n, default ${pdef}]: " \
+                       || PROMPT="  [y/n]: "
+    while true; do
+      printf '%s' "${PROMPT}"
+      read -r VAL
+      [[ -z "${VAL}" ]] && VAL="${pdef}"
+      case "${VAL,,}" in
+        y|yes|true|1)
+          printf '%s\ttrue\n'  "${pname}" >> "${VALS_TSV}"; break ;;
+        n|no|false|0)
+          printf '%s\tfalse\n' "${pname}" >> "${VALS_TSV}"; break ;;
+        '')
+          [[ "${preq}" == "0" ]] && break || printf '  Required — enter y or n: ' ;;
+        *)
+          printf '  Enter y or n: ' ;;
+      esac
+    done
+  else
+    if [[ -n "${pdef}" ]]; then
+      printf '  Value [%s]: ' "${pdef}"
+    elif [[ "${preq}" == "0" ]]; then
+      printf '  Value (optional — press Enter to skip): '
+    else
+      printf '  Value: '
+    fi
+
+    VALUE=""
+    while true; do
+      read -r VALUE
+      [[ -z "${VALUE}" ]] && VALUE="${pdef}"
+      if [[ -z "${VALUE}" && "${preq}" == "1" ]]; then
+        printf '  Required — enter a value: '
+      else
+        break
+      fi
+    done
+    [[ -n "${VALUE}" ]] && printf '%s\t%s\n' "${pname}" "${VALUE}" >> "${VALS_TSV}"
+  fi
+done
+
+# ── Step 7: Build typed JSON arguments ────────────────────────────────────────
+
+ARGS_FILE="${TMP_DIR}/call_args.json"
+python3 - "${PARAMS_FILE}" "${VALS_TSV}" "${ARGS_FILE}" <<'PY'
+import json, sys
+from pathlib import Path
+
+params  = json.load(open(sys.argv[1]))
+tsv_raw = Path(sys.argv[2]).read_text(encoding='utf-8') if Path(sys.argv[2]).exists() else ''
+
+# Map name → raw string value
+raw_vals = {}
+for line in tsv_raw.strip().splitlines():
+    if '\t' in line:
+        name, _, val = line.partition('\t')
+        raw_vals[name.strip()] = val.strip()
+
+# Apply defaults for optional params the user skipped
+param_map = {p['name']: p for p in params}
+for name, p in param_map.items():
+    if name not in raw_vals and not p.get('required') and p.get('default') is not None:
+        raw_vals[name] = str(p['default'])
+
+# Type-coerce each value
+args = {}
+for name, raw in raw_vals.items():
+    p     = param_map.get(name)
+    ptype = p.get('type', 'string') if p else 'string'
+    if ptype == 'integer':
+        try: args[name] = int(raw)
+        except ValueError: args[name] = raw
+    elif ptype == 'number':
+        try: args[name] = float(raw)
+        except ValueError: args[name] = raw
+    elif ptype == 'boolean':
+        args[name] = raw.lower() in ('true', '1', 'yes', 'y')
+    else:
+        args[name] = raw
+
+json.dump(args, open(sys.argv[3], 'w'), indent=2)
+PY
+
+# ── Step 8: Call the tool ─────────────────────────────────────────────────────
+
+sep
+printf '  Calling '; bold "${SELECTED_TOOL}"; printf '…\n'
+python3 -c "
+import json
+args = json.load(open('${ARGS_FILE}'))
+if args:
+    print(f'  Arguments: {json.dumps(args, indent=2)}')
+else:
+    print('  (no arguments — secrets injected server-side)')
+"
+
+CALL_REQ="${TMP_DIR}/call_req.json"
+CALL_RAW="${TMP_DIR}/call_raw.json"
+CALL_RESULT="${TMP_DIR}/call_result.json"
+
+python3 - "${SELECTED_TOOL}" "${ARGS_FILE}" "${CALL_REQ}" "$(next_id)" <<'PY'
+import json, sys
+from pathlib import Path
+tool  = sys.argv[1]
+args  = json.load(open(sys.argv[2]))
+rid   = int(sys.argv[4])
+req   = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+         "params": {"name": tool, "arguments": args}}
+Path(sys.argv[3]).write_text(json.dumps(req, indent=2), encoding='utf-8')
+PY
+
+mcp_post "${CALL_REQ}" "${CALL_RAW}"
+extract_tool_result "${CALL_RAW}" "${CALL_RESULT}"
+
+sep
+printf '  Result:\n\n'
+python3 -c "
+import json
+r = json.load(open('${CALL_RESULT}'))
+print(json.dumps(r, indent=2, ensure_ascii=False))
+"
+
+# ── Step 9: Ollama summary ────────────────────────────────────────────────────
+
+sep
+info "Asking $(bold "${OLLAMA_MODEL}") to summarise the result"
+
+OLLAMA_PAYLOAD="${TMP_DIR}/ollama_payload.json"
+OLLAMA_RESP="${TMP_DIR}/ollama_resp.json"
+
+python3 - "${SELECTED_TOOL}" "${CALL_RESULT}" "${OLLAMA_PAYLOAD}" "${OLLAMA_MODEL}" <<'PY'
+import json, sys
+from pathlib import Path
+
+tool   = sys.argv[1]
+result = Path(sys.argv[2]).read_text(encoding='utf-8')
+out    = Path(sys.argv[3])
+model  = sys.argv[4]
+
+prompt = (
+    f"You are reviewing the output of an MCP tool call.\n\n"
+    f"Tool: {tool}\n\n"
+    f"Result:\n{result}\n\n"
+    "Summarise what was returned in plain language. "
+    "If it indicates an error, explain what went wrong and suggest a fix. "
+    "Be concise."
+)
+out.write_text(
+    json.dumps({"model": model, "prompt": prompt, "stream": False}),
+    encoding='utf-8'
+)
+PY
+
+curl -fsS --max-time 300 \
+  -H 'Content-Type: application/json' \
+  --data "@${OLLAMA_PAYLOAD}" \
+  "${OLLAMA_URL}/api/generate" > "${OLLAMA_RESP}"
+
+printf '\n'
+python3 -c "
+import json, sys
+r = json.load(open('${OLLAMA_RESP}', encoding='utf-8'))
+print(r.get('response', r))
+"
+
+sep
+ok "Done."
+printf '\n'

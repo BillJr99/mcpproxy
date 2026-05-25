@@ -1,16 +1,16 @@
 # mcpproxy: Config-Driven MCP Host
 
-This project is a Dockerized, config-driven MCP server with a built-in web UI.
+A Dockerized, config-driven MCP server with a built-in web UI.  
 Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 
 - The Python code for all tool functions (embedded directly in the file)
 - One or more tool declarations that reference those functions
 - Per-tool input schemas, secrets, and auth metadata
-- An optional `repo:` block to pull an external Git repo at startup
+- Or an `npx:` block to delegate to an existing MCP npm package
 
-`server.py` loads every YAML at startup, executes its `code` block, and registers each
-declared tool automatically — no Python files to maintain separately, no changes to
-`server.py` needed when adding new tools.
+`server.py` loads every YAML at startup, executes its `code` block (or spawns the
+declared `npx` process), and registers each declared tool automatically — no Python
+files to maintain separately, no changes to `server.py` needed when adding new tools.
 
 ## Ports
 
@@ -31,7 +31,7 @@ declared tool automatically — no Python files to maintain separately, no chang
 ├── requirements-dev.txt            ← test dependencies
 ├── server.py
 ├── config.py                       ← shared env-var config (imported by all modules)
-├── repo_loader.py                  ← git clone/pull for repo: YAML blocks
+├── npx_runner.py                   ← spawns & proxies npx-based MCP providers
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -41,13 +41,14 @@ declared tool automatically — no Python files to maintain separately, no chang
 │   ├── conftest.py
 │   ├── test_server.py
 │   ├── test_frontend.py
-│   └── test_repo_loader.py
+│   ├── test_with_ollama.sh         ← quick end-to-end MCP + Ollama sanity check
+│   ├── mcp_interactive.sh          ← interactive tool picker & tester
+│   └── ollama_agent.py             ← agentic tool-calling loop (Python)
 └── tools/                          ← gitignored; mount at runtime
     └── <your-provider>.yaml        ← provider: code + tool declarations
 ```
 
-`tools/` and `repos/` are gitignored — they are never committed and are mounted into
-the container at runtime.
+`tools/` is gitignored — it is never committed and is mounted into the container at runtime.
 
 ## Web UI
 
@@ -56,31 +57,24 @@ Open **`http://localhost:8889`** in your browser after starting the server.
 ### Tools tab
 
 - Browse all loaded providers (left panel)
-- Click any provider to open its YAML in a CodeMirror editor
-- **Validate** — check YAML structure before saving
+- Click any provider to open its fields in a form editor
+- Edit documentation, code, and per-tool fields (name, description, parameters)
+- Add or remove tools with the **+ Add Tool** / **✕** buttons
 - **Save** — write the file; restart MCP server to reload
 - **🔑 Secrets** — manage `.env` values for secrets declared in this provider
 - **Delete** — remove the provider YAML
 
 ### New Provider wizard
 
-Click **+ New Provider** to open a three-step wizard:
+Click **+ New Provider** and choose a provider type:
 
-| Step | Description |
+| Type | Description |
 |---|---|
-| **Blank template** | Starts with a documented skeleton |
-| **From Python code** | Paste existing `async def` functions; YAML is generated automatically from their signatures |
-| **From Git repo** | Enter a repository URL; a `repo:` YAML block is generated and the server clones the repo at startup |
+| **Python code** | Write `async def` functions; declare tools that reference them |
+| **npx package** | Enter an `npx` command (e.g. `npx @playwright/mcp@latest`); the UI auto-introspects the MCP server and populates tool definitions — no code needed |
 
-After the YAML step, the wizard shows a **Secrets** step: any `secrets.env` entries in the
-provider are listed, and you can fill in their values to save them directly to `.env`.
-
-### Discover tab
-
-Browse a curated list of importable MCP servers (Filesystem, GitHub, Brave Search, Fetch, SQLite,
-Postgres, and more). Click **Import** to pre-fill the repo wizard, or **Browse** to open the
-server's source on GitHub. Links to `awesome-mcp-servers`, `mcpservers.org`, and
-`modelcontextprotocol/servers` are also included.
+After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
+in the provider are listed, and you can fill in their values to save them directly to `.env`.
 
 ### Secrets manager
 
@@ -229,77 +223,267 @@ Or use the web UI's Secrets manager at `http://localhost:8889`.
 
 Docker Compose reads `.env` via `env_file:`. The file is never copied into the image. Do not commit `.env`.
 
-### Port
+### Custom ports
 
 ```bash
 MCP_HOST_PORT=9000 UI_HOST_PORT=9001 docker compose up
 ```
 
-## External repo support (`repo:` block)
+---
 
-A provider YAML can include a `repo:` block to reference an external Git repository.
-At startup the server clones the repo (or pulls if already cloned) and adds its root
-(or a specified subfolder) to `sys.path`, making it importable from the `code:` block.
+## Connecting AI clients to this MCP server
 
-```yaml
-repo:
-  url: https://github.com/user/some-mcp-server   # required
-  branch: main                                    # optional (default: main)
-  subfolder: src                                  # optional sub-path added to sys.path
-  path: repos/my-override                         # optional clone destination override
-  requirements: requirements.txt                  # optional pip requirements file
-  install_packages:                               # optional explicit pip packages
-    - requests
-    - some-library
+The MCP endpoint is `http://localhost:8888/mcp` (or replace `localhost` with your
+Docker host IP / domain for remote access).
 
-code: |
-  # The repo root (or subfolder) is on sys.path — import directly.
-  from your_module import some_function
-  from typing import Any
+### Claude Code (Anthropic CLI)
 
-  async def my_tool(context: dict[str, Any], query: str) -> dict[str, Any]:
-      return {"ok": True, "result": some_function(query)}
-
-tools:
-  - name: my_tool
-    function: my_tool
-    description: Calls a function from the external repo.
-    input_schema:
-      type: object
-      properties:
-        query:
-          type: string
-          description: Query string.
-      required:
-        - query
-```
-
-Cloned repos are stored under `repos/` (gitignored). The web UI's **Import from Repo** wizard
-generates this YAML structure for you. The **Discover** tab lists curated servers with one-click
-import.
-
-## Test with local Ollama
-
-Query the running MCP server with a local Ollama model:
+Add the server as a named MCP entry using the HTTP transport:
 
 ```bash
-curl -s http://localhost:8888/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+claude mcp add --transport http mcpproxy http://localhost:8888/mcp
 ```
 
-End-to-end Ollama test scripts are in `tests/` — see `tests/test_with_ollama.sh`.
+Or add it project-locally (stored in `.mcp.json` in the project root):
 
-## Running tests
+```bash
+claude mcp add --transport http --scope project mcpproxy http://localhost:8888/mcp
+```
+
+Verify it is registered:
+
+```bash
+claude mcp list
+```
+
+Claude Code will now list and call your tools automatically during any chat session.
+
+### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "mcpproxy": {
+      "url": "http://localhost:8888/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+Restart Claude Desktop — your tools appear in the tools panel.
+
+### Cursor
+
+Open **Cursor Settings → Features → MCP** and add a server entry:
+
+```json
+{
+  "mcpServers": {
+    "mcpproxy": {
+      "url": "http://localhost:8888/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+### Cline (VS Code extension)
+
+In VS Code, open the Cline sidebar → **MCP Servers** tab → **Add MCP Server**:
+
+- **Transport**: `HTTP / SSE`
+- **URL**: `http://localhost:8888/mcp`
+- **Name**: `mcpproxy`
+
+### Continue (VS Code / JetBrains extension)
+
+Add to `.continue/config.json`:
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "mcpproxy",
+      "transport": {
+        "type": "http",
+        "url": "http://localhost:8888/mcp"
+      }
+    }
+  ]
+}
+```
+
+### OpenCode
+
+Add to your `opencode.json` (or `~/.config/opencode/config.json`):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "mcpproxy": {
+        "url": "http://localhost:8888/mcp",
+        "type": "remote"
+      }
+    }
+  }
+}
+```
+
+### Windsurf
+
+Open **Windsurf Settings → Cascade → MCP** and add:
+
+```json
+{
+  "mcpServers": {
+    "mcpproxy": {
+      "serverUrl": "http://localhost:8888/mcp"
+    }
+  }
+}
+```
+
+### Zed
+
+In `~/.config/zed/settings.json`:
+
+```json
+{
+  "context_servers": {
+    "mcpproxy": {
+      "command": {
+        "path": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-fetch"],
+        "env": {}
+      }
+    }
+  }
+}
+```
+
+> **Note:** Zed currently supports stdio-based MCP servers natively. For HTTP-transport
+> servers, use an MCP-to-stdio bridge such as `mcp-remote`:
+> ```bash
+> npx -y mcp-remote http://localhost:8888/mcp
+> ```
+> Then point Zed at that bridge command.
+
+### Ollama (tool-calling models)
+
+Ollama itself does not speak MCP — use the included `tests/ollama_agent.py` script,
+which bridges MCP → Ollama tool-calling automatically:
+
+```bash
+python3 tests/ollama_agent.py "List the tools you have available"
+```
+
+The script queries `http://localhost:11434/api/tags` for available models, shows a
+numbered selection menu, then drives a full agentic tool-calling loop.
+
+Override defaults with environment variables:
+
+```bash
+OLLAMA_BASE=http://mymachine:11434 \
+OLLAMA_MODEL=qwen3:14b \
+MCP_BASE=http://localhost:8888/mcp \
+python3 tests/ollama_agent.py "Do something useful"
+```
+
+### Models without native MCP support (Pi, Hermes, GPT-4o, etc.)
+
+For any model that does not support MCP natively, you can describe the available tools
+in the system prompt or at the start of a conversation. List the MCP endpoint and paste
+in the JSON schema from `tools/list`:
+
+```bash
+# Fetch the tool schemas
+curl -s http://localhost:8888/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  | python3 -m json.tool
+```
+
+Example system prompt snippet:
+
+```
+You have access to the following tools via an MCP server at http://localhost:8888/mcp.
+To call a tool, output a JSON block with the tool name and arguments; I will execute
+the call and paste the result back.
+
+Tools:
+<paste tools/list output here>
+```
+
+Then manually relay tool calls and results between the model and the MCP server during
+the conversation.
+
+---
+
+## Test scripts
+
+### `tests/test_with_ollama.sh` — quick sanity check
+
+Runs MCP initialize → tools/list (and optionally tools/call) and asks Ollama to
+summarise the results.
+
+```bash
+bash tests/test_with_ollama.sh
+
+# Override defaults
+MCP_URL=http://localhost:8888/mcp \
+OLLAMA_MODEL=qwen3:14b \
+RUN_REAL_TOOL=1 \
+bash tests/test_with_ollama.sh
+```
+
+### `tests/mcp_interactive.sh` — interactive tool tester
+
+Pick any registered tool, get prompted for parameters, call the tool, and get an Ollama
+summary of the result. Secrets are checked for presence only — values are never printed.
+
+```bash
+bash tests/mcp_interactive.sh
+
+# Override defaults
+MCP_URL=http://localhost:8888/mcp \
+UI_URL=http://localhost:8889 \
+OLLAMA_URL=http://localhost:11434 \
+bash tests/mcp_interactive.sh
+```
+
+### `tests/ollama_agent.py` — agentic loop
+
+Drives a full agentic tool-calling loop: MCP initialize → tools/list → Ollama chat with
+tool schemas → execute tool_calls → feed results back → repeat until a final text answer.
+
+```bash
+python3 tests/ollama_agent.py "Go to https://example.com and summarise the page"
+
+# Override defaults
+OLLAMA_BASE=http://localhost:11434 \
+OLLAMA_MODEL=llama3.2 \
+MCP_BASE=http://localhost:8888/mcp \
+python3 tests/ollama_agent.py "What tools do you have?"
+```
+
+---
+
+## Running unit tests
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Tests cover `server.py` (pure helpers), `frontend/app.py` (all API endpoints), and
-`repo_loader.py` (git/pip operations, all subprocess calls are mocked). CI runs on every push
-via `.github/workflows/tests.yml`.
+Tests cover `server.py` (pure helpers) and `frontend/app.py` (all API endpoints).
+CI runs on every push via `.github/workflows/tests.yml`.
+
+---
 
 ## Security notes
 
@@ -311,7 +495,7 @@ via `.github/workflows/tests.yml`.
 
 ## Tutorial: adding a new tool
 
-Every provider is a single YAML file under `tools/`. See the detailed tutorial sections below.
+Every provider is a single YAML file under `tools/`.
 
 ### Part 1 — a simple tool with no secrets
 
@@ -395,19 +579,45 @@ Add `WEATHER_API_KEY=replace-me` to `.env.example` and `.env` (or use the Secret
 
 ---
 
-### Part 3 — multiple tools in one provider
+### Part 3 — an npx-based provider (no code required)
+
+Use the **+ New Provider → npx package** wizard in the web UI, or create the YAML manually:
+
+```yaml
+npx:
+  command: npx @playwright/mcp@latest --isolated
+
+tools:
+  # Populated automatically by the UI's Introspect button — or fill manually
+  - name: browser_navigate
+    description: Navigate to a URL in a browser.
+    input_schema:
+      type: object
+      properties:
+        url:
+          type: string
+          description: The URL to navigate to.
+      required: [url]
+```
+
+The server spawns the `npx` process, performs the MCP handshake once, then forwards
+every tool call to it. The process is reused across calls.
+
+---
+
+### Part 4 — multiple tools in one provider
 
 A single YAML file can declare any number of tools sharing the same `code` block.
 
 ---
 
-### Part 4 — error handling
+### Part 5 — error handling
 
 Return `{"ok": True, ...}` on success, `{"ok": False, "error": "..."}` on failure. Never let an exception propagate — wrap the entire function body in `try/except`.
 
 ---
 
-### Part 5 — calling blocking libraries with `asyncio.to_thread`
+### Part 6 — calling blocking libraries with `asyncio.to_thread`
 
 Handler functions are `async`, but many Python libraries block the event loop. Use `asyncio.to_thread()` to run them safely in a thread pool.
 
@@ -417,7 +627,7 @@ result = await asyncio.to_thread(_fetch_sync, arg1, arg2)
 
 ---
 
-### Part 6 — prompting the user mid-call (elicitation)
+### Part 7 — prompting the user mid-call (elicitation)
 
 ```python
 from handlers.elicitation import request_text_input_with_fallback
@@ -432,9 +642,9 @@ sms_result = await request_text_input_with_fallback(
 
 ---
 
-### Part 7 — persisting state between calls
+### Part 8 — persisting state between calls
 
-Write state to a well-known file path and read it on the next call. See the Personal Capital provider for a full example using `~/.config/personalcapital2/session.json`.
+Write state to a well-known file path and read it on the next call.
 
 ---
 
@@ -444,20 +654,21 @@ Write state to a well-known file path and read it on the next call. See the Pers
 documentation: |                   # optional — shown in the web UI; markdown friendly
   Describe what this provider does, its tools, secrets, and any usage notes.
 
-repo:                              # optional — omit if code is self-contained
-  url: string                      # git clone URL (required if repo block present)
-  branch: main                     # optional
-  subfolder: src                   # optional sub-path added to sys.path
-  path: repos/override             # optional clone destination override
-  requirements: requirements.txt   # optional pip file to install
-  install_packages: [pkg, ...]     # optional explicit pip packages
+# ── Python code provider ──────────────────────────────────────────────────────
 
 code: |                            # Python source — executed once at startup
   # Import anything, define helpers and async tool functions.
 
+# ── npx provider (mutually exclusive with code) ───────────────────────────────
+
+npx:
+  command: string                  # e.g. "npx @playwright/mcp@latest --isolated"
+
+# ── Tool declarations (required) ──────────────────────────────────────────────
+
 tools:
   - name: string                   # unique MCP tool name
-    function: string               # async function name from code block
+    function: string               # async function name from code block (code providers only)
     description: string            # shown to the LLM
     documentation: string          # optional per-tool notes shown in the web UI
     input_schema:                  # JSON Schema

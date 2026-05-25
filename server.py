@@ -258,6 +258,8 @@ def register_tool(
         dynamic_tool.__annotations__ = annotations
 
         mcp.tool(name=exposed_name, description=tool_spec.get("description", ""))(dynamic_tool)
+        from tool_registry import register as _tool_registry_register
+        _tool_registry_register(exposed_name, tool_spec, dynamic_tool)
         print(f"Registered tool: {exposed_name}")
     except Exception as exc:
         print(f"register_tool error for '{tool_spec.get('name')}': {exc}")

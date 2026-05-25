@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# tests/test_mcp_client.sh — Generic interactive MCP tool tester + Ollama summary
+# tests/test_mcp_client.sh — Interactive MCP / OpenAI-compatible tool tester + Ollama summary
 #
 # Flow
 # ────
 # 1. Pick an Ollama model (menu or $OLLAMA_MODEL).
-# 2. Initialize an MCP session with mcpproxy.
-# 3. Show every registered tool; let you pick one.
-# 4. Check that required secrets are present in .env (never prints values).
-# 5. Prompt for each non-secret parameter (type-aware, required vs optional).
-# 6. Call the tool — secrets are injected server-side, never by this script.
-# 7. Display the result and ask Ollama to summarise it.
+# 2. Choose protocol mode:
+#      MCP    — JSON-RPC via /mcp on port 8888 (default, existing behaviour)
+#      OpenAI — REST via /v1/tools on port 8889 (new OpenAI-compatible endpoints)
+# 3. [MCP]    Initialize an MCP session with mcpproxy.
+#    [OpenAI] GET /v1/tools to retrieve the tool list.
+# 4. Show every registered tool; let you pick one.
+# 5. Check that required secrets are present in .env (never prints values).
+# 6. Prompt for each non-secret parameter (type-aware, required vs optional).
+# 7. Call the tool:
+#      MCP    — tools/call JSON-RPC request to port 8888
+#      OpenAI — POST /v1/tools/{name}/invoke to port 8889
+# 8. Display the result and ask Ollama to summarise it.
 #
 # Environment overrides:
 #   MCP_URL       [http://localhost:8888/mcp]
-#   UI_URL        [http://localhost:8889]      used to look up secret metadata
+#   UI_URL        [http://localhost:8889]      OpenAI endpoints + secret metadata
 #   OLLAMA_URL    [http://localhost:11434]
 #   OLLAMA_MODEL  skip model menu
-#   ENV_FILE      [.env]                       checked for secret presence only
+#   MODE          1=MCP  2=OpenAI  (skip mode menu)
+#   ENV_FILE      [.env]           checked for secret presence only
 set -euo pipefail
 
 MCP_URL="${MCP_URL:-http://localhost:8888/mcp}"
@@ -190,16 +197,46 @@ if [[ -z "${OLLAMA_MODEL:-}" ]]; then
   fi
 fi
 
-# ── Step 3: MCP initialize ────────────────────────────────────────────────────
+# ── Step 3: Mode selection ────────────────────────────────────────────────────
 
 sep
-printf '  Checking MCP server… '
+printf '  Protocol mode:\n'
+printf '    1)  MCP    — JSON-RPC via /mcp on port 8888  (full MCP protocol)\n'
+printf '    2)  OpenAI — REST via /v1/tools on port 8889  (OpenAI-compatible)\n'
 
-INIT_REQ="${TMP_DIR}/init_req.json"
-INIT_RESP="${TMP_DIR}/init_resp.json"
-HEADERS_FILE="${TMP_DIR}/headers.txt"
+if [[ -n "${MODE:-}" ]]; then
+  if [[ "${MODE}" == "1" || "${MODE}" == "2" ]]; then
+    printf '\n  Mode (env): %s\n' "$( [[ "${MODE}" == "1" ]] && echo 'MCP' || echo 'OpenAI' )"
+  else
+    printf '\n  ⚠  MODE="%s" not recognised — showing menu.\n' "${MODE}"
+    unset MODE
+  fi
+fi
 
-cat > "${INIT_REQ}" <<'JSON'
+if [[ -z "${MODE:-}" ]]; then
+  while true; do
+    printf '\n  Select mode [1-2]: '
+    read -r MODE
+    [[ "${MODE}" == "1" || "${MODE}" == "2" ]] && break
+    printf '  Invalid choice — enter 1 (MCP) or 2 (OpenAI).\n'
+  done
+fi
+
+# ── Step 4: Connect to server + list tools ───────────────────────────────────
+
+TOOLS_TSV="${TMP_DIR}/tools.tsv"
+# Will be populated differently depending on MODE.
+
+if [[ "${MODE}" == "1" ]]; then
+  # ────────────────────────────────── MCP mode ──────────────────────────────
+  sep
+  printf '  Checking MCP server… '
+
+  INIT_REQ="${TMP_DIR}/init_req.json"
+  INIT_RESP="${TMP_DIR}/init_resp.json"
+  HEADERS_FILE="${TMP_DIR}/headers.txt"
+
+  cat > "${INIT_REQ}" <<'JSON'
 {
   "jsonrpc": "2.0", "id": 1,
   "method": "initialize",
@@ -211,39 +248,37 @@ cat > "${INIT_REQ}" <<'JSON'
 }
 JSON
 
-curl -fsS --max-time 10 \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  --data "@${INIT_REQ}" \
-  -D "${HEADERS_FILE}" \
-  "${MCP_URL}" > "${INIT_RESP}" \
-  || die "MCP server not reachable at ${MCP_URL}\n  Start it:  ./run_local.sh"
-printf 'OK\n'
+  curl -fsS --max-time 10 \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    --data "@${INIT_REQ}" \
+    -D "${HEADERS_FILE}" \
+    "${MCP_URL}" > "${INIT_RESP}" \
+    || die "MCP server not reachable at ${MCP_URL}\n  Start it:  ./run_local.sh"
+  printf 'OK\n'
 
-_RPC_ID=1
-SESSION_ID="$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r","", $2); print $2}' \
-  "${HEADERS_FILE}" | tail -n 1)"
+  _RPC_ID=1
+  SESSION_ID="$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r","", $2); print $2}' \
+    "${HEADERS_FILE}" | tail -n 1)"
 
-SESSION_HEADER_ARGS=(
-  -H 'Content-Type: application/json'
-  -H 'Accept: application/json, text/event-stream'
-)
-[[ -n "${SESSION_ID}" ]] && SESSION_HEADER_ARGS+=(-H "Mcp-Session-Id: ${SESSION_ID}")
-printf '  Session: %s\n' "${SESSION_ID:-(stateless)}"
+  SESSION_HEADER_ARGS=(
+    -H 'Content-Type: application/json'
+    -H 'Accept: application/json, text/event-stream'
+  )
+  [[ -n "${SESSION_ID}" ]] && SESSION_HEADER_ARGS+=(-H "Mcp-Session-Id: ${SESSION_ID}")
+  printf '  Session: %s\n' "${SESSION_ID:-(stateless)}"
 
-# ── Step 4: tools/list + tool selection ──────────────────────────────────────
+  # tools/list
+  sep
+  TOOLS_REQ="${TMP_DIR}/tools_req.json"
+  TOOLS_RESP="${TMP_DIR}/tools_resp.json"
 
-sep
-TOOLS_REQ="${TMP_DIR}/tools_req.json"
-TOOLS_RESP="${TMP_DIR}/tools_resp.json"
+  printf '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}\n' "$(next_id)" \
+    > "${TOOLS_REQ}"
+  mcp_post "${TOOLS_REQ}" "${TOOLS_RESP}"
 
-printf '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}\n' "$(next_id)" \
-  > "${TOOLS_REQ}"
-mcp_post "${TOOLS_REQ}" "${TOOLS_RESP}"
-
-# Write tool names + descriptions to a TSV; handles SSE or plain JSON.
-TOOLS_TSV="${TMP_DIR}/tools.tsv"
-python3 - "${TOOLS_RESP}" "${TOOLS_TSV}" <<'PY'
+  # Write tool names + descriptions to a TSV; handles SSE or plain JSON.
+  python3 - "${TOOLS_RESP}" "${TOOLS_TSV}" <<'PY'
 import json, sys, os
 from pathlib import Path
 
@@ -260,6 +295,58 @@ with open(sys.argv[2], 'w', encoding='utf-8') as f:
         desc = t.get('description', '').replace('\n', ' ').replace('\t', ' ')[:72]
         f.write(f"{name}\t{desc}\n")
 PY
+
+else
+  # ────────────────────────────── OpenAI mode ───────────────────────────────
+  sep
+  printf '  Checking OpenAI-compatible endpoints at %s… ' "${UI_URL}"
+
+  OPENAI_TOOLS_RESP="${TMP_DIR}/openai_tools_resp.json"
+  curl -fsS --max-time 10 \
+    -H 'Accept: application/json' \
+    "${UI_URL}/v1/tools" > "${OPENAI_TOOLS_RESP}" \
+    || die "UI server not reachable at ${UI_URL}\n  Start it:  ./run_local.sh"
+  printf 'OK\n'
+
+  # Parse the OpenAI tools list into the same TSV format used by MCP mode.
+  # Also write a full JSON copy for use during parameter prompting.
+  TOOLS_RESP="${TMP_DIR}/tools_resp.json"    # reused by param-prompting step
+  python3 - "${OPENAI_TOOLS_RESP}" "${TOOLS_TSV}" "${TOOLS_RESP}" <<'PY'
+import json, sys
+from pathlib import Path
+
+data   = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+tools  = data.get('tools', [])
+tsv    = Path(sys.argv[2])
+resp   = Path(sys.argv[3])
+
+if not tools:
+    print('no_tools', flush=True)
+    sys.exit(0)
+
+with tsv.open('w', encoding='utf-8') as f:
+    for t in tools:
+        fn   = t.get('function') or {}
+        name = fn.get('name', '')
+        desc = fn.get('description', '').replace('\n', ' ').replace('\t', ' ')[:72]
+        f.write(f"{name}\t{desc}\n")
+
+# Produce a tools/list-shaped response so the param-prompting step (which
+# already parses this format) works without modification.
+mcp_tools = []
+for t in tools:
+    fn = t.get('function') or {}
+    mcp_tools.append({
+        'name':        fn.get('name', ''),
+        'description': fn.get('description', ''),
+        'inputSchema': fn.get('parameters') or {},
+    })
+resp.write_text(
+    json.dumps({'result': {'tools': mcp_tools}}, indent=2),
+    encoding='utf-8',
+)
+PY
+fi  # end MODE branch
 
 [[ -s "${TOOLS_TSV}" ]] || die "No tools registered in mcpproxy."
 
@@ -538,11 +625,14 @@ except Exception as e:
     print(f'  (could not read args: {e})', file=sys.stderr)
 "
 
-CALL_REQ="${TMP_DIR}/call_req.json"
 CALL_RAW="${TMP_DIR}/call_raw.json"
 CALL_RESULT="${TMP_DIR}/call_result.json"
 
-python3 - "${SELECTED_TOOL}" "${ARGS_FILE}" "${CALL_REQ}" "$(next_id)" <<'PY'
+if [[ "${MODE}" == "1" ]]; then
+  # ──────────────────────────────── MCP call ──────────────────────────────
+  CALL_REQ="${TMP_DIR}/call_req.json"
+
+  python3 - "${SELECTED_TOOL}" "${ARGS_FILE}" "${CALL_REQ}" "$(next_id)" <<'PY'
 import json, sys
 from pathlib import Path
 tool = sys.argv[1]
@@ -556,8 +646,81 @@ req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
 Path(sys.argv[3]).write_text(json.dumps(req, indent=2), encoding='utf-8')
 PY
 
-mcp_post "${CALL_REQ}" "${CALL_RAW}"
-extract_tool_result "${CALL_RAW}" "${CALL_RESULT}"
+  mcp_post "${CALL_REQ}" "${CALL_RAW}"
+  extract_tool_result "${CALL_RAW}" "${CALL_RESULT}"
+
+else
+  # ─────────────────────────────── OpenAI call ────────────────────────────
+  python3 - "${SELECTED_TOOL}" "${ARGS_FILE}" "${CALL_RAW}" "${UI_URL}" <<'PY'
+import json, sys, urllib.request, urllib.error
+from pathlib import Path
+
+tool     = sys.argv[1]
+args     = json.load(open(sys.argv[2])) if Path(sys.argv[2]).exists() else {}
+out_raw  = Path(sys.argv[3])
+ui_url   = sys.argv[4]
+
+url     = f"{ui_url}/v1/tools/{tool}/invoke"
+payload = json.dumps({"arguments": args}).encode('utf-8')
+req     = urllib.request.Request(
+    url, data=payload,
+    headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+    method='POST',
+)
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        out_raw.write_bytes(resp.read())
+except urllib.error.HTTPError as exc:
+    out_raw.write_text(
+        json.dumps({'ok': False, 'error': f'HTTP {exc.code}: {exc.reason}'}),
+        encoding='utf-8',
+    )
+PY
+
+  # Normalise the OpenAI /v1/tools/{name}/invoke response to the same shape
+  # as an MCP tools/call result so the display block below is mode-agnostic.
+  python3 - "${CALL_RAW}" "${CALL_RESULT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+raw  = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+out  = Path(sys.argv[2])
+
+def write(obj):
+    out.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding='utf-8')
+
+if not raw:
+    write({'ok': False, 'error': 'Empty response from OpenAI endpoint'})
+    sys.exit(0)
+
+try:
+    body = json.loads(raw)
+except Exception as exc:
+    write({'ok': False, 'error': f'Could not parse response: {exc}', 'raw': raw[:200]})
+    sys.exit(0)
+
+if body.get('is_error'):
+    content = body.get('content', [])
+    msg = content[0].get('text', str(content)) if content else str(body)
+    write({'ok': False, 'error': msg})
+    sys.exit(0)
+
+# Success — extract text content or pass through the full content array.
+content = body.get('content', [])
+if not content:
+    write({'ok': True, **{k: v for k, v in body.items() if k not in ('type', 'content', 'is_error')}})
+    sys.exit(0)
+
+first = content[0] if isinstance(content, list) else content
+if isinstance(first, dict) and first.get('type') == 'text':
+    try:
+        write(json.loads(first['text']))
+    except (json.JSONDecodeError, TypeError):
+        write({'ok': True, 'text': first['text']})
+else:
+    write({'ok': True, 'content': content})
+PY
+fi  # end MODE branch
 
 sep
 printf '  Result:\n\n'
@@ -624,16 +787,34 @@ info "Listing files produced in the mcpproxy files directory"
 
 FILES_DATA="${TMP_DIR}/files_data.json"
 
-# One Python block handles all MCP calls (listfiles + one getfile per entry)
-# so we avoid bash escaping issues with arbitrary file names.
-python3 - "${MCP_URL}" "${SESSION_ID:-}" "$(( _RPC_ID + 1 ))" "${FILES_DATA}" <<'PY'
+# Call mcpproxy__listfiles + mcpproxy__getfile using whichever protocol was
+# selected.  The MCP path uses the existing JSON-RPC session; the OpenAI path
+# uses the /v1/tools/{name}/invoke REST endpoint.
+if [[ "${MODE}" == "1" ]]; then
+  _FILES_MODE="mcp"
+  _FILES_MCP_URL="${MCP_URL}"
+  _FILES_SESSION="${SESSION_ID:-}"
+  _FILES_RPC_START="$(( _RPC_ID + 1 ))"
+  _FILES_UI_URL=""
+else
+  _FILES_MODE="openai"
+  _FILES_MCP_URL=""
+  _FILES_SESSION=""
+  _FILES_RPC_START="0"
+  _FILES_UI_URL="${UI_URL}"
+fi
+
+python3 - "${_FILES_MODE}" "${_FILES_MCP_URL}" "${_FILES_SESSION}" \
+          "${_FILES_RPC_START}" "${FILES_DATA}" "${_FILES_UI_URL}" <<'PY'
 import json, sys, urllib.request, urllib.error
 from pathlib import Path
 
-mcp_url    = sys.argv[1]
-session_id = sys.argv[2]
-rpc_id     = int(sys.argv[3])
-out_path   = Path(sys.argv[4])
+mode       = sys.argv[1]          # 'mcp' or 'openai'
+mcp_url    = sys.argv[2]
+session_id = sys.argv[3]
+rpc_id     = int(sys.argv[4])
+out_path   = Path(sys.argv[5])
+ui_url     = sys.argv[6]
 
 
 def _mcp_call(method, params):
@@ -667,6 +848,35 @@ def _mcp_call(method, params):
         return {}
 
 
+def _openai_call(tool_name, arguments):
+    """Call a tool via the OpenAI-compatible /v1/tools/{name}/invoke endpoint."""
+    url     = f"{ui_url}/v1/tools/{tool_name}/invoke"
+    payload = json.dumps({'arguments': arguments}).encode('utf-8')
+    req     = urllib.request.Request(
+        url, data=payload,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode('utf-8'))
+        # Translate to an MCP-shaped result so _extract() works for both paths.
+        if body.get('is_error'):
+            content = body.get('content', [])
+            msg = content[0].get('text', str(content)) if content else str(body)
+            return {'error': {'message': msg}}
+        return {'result': {'content': body.get('content', [])}}
+    except urllib.error.HTTPError as exc:
+        return {'error': {'code': exc.code, 'message': str(exc)}}
+
+
+def _call_tool(tool_name, arguments):
+    if mode == 'mcp':
+        return _mcp_call('tools/call', {'name': tool_name, 'arguments': arguments})
+    else:
+        return _openai_call(tool_name, arguments)
+
+
 def _extract(rpc):
     """Unwrap a tools/call JSON-RPC response to its payload dict."""
     if 'error' in rpc:
@@ -687,7 +897,7 @@ def _extract(rpc):
 
 
 # 1. Call mcpproxy__listfiles (root directory)
-listing = _extract(_mcp_call('tools/call', {'name': 'mcpproxy__listfiles', 'arguments': {}}))
+listing = _extract(_call_tool('mcpproxy__listfiles', {}))
 entries  = listing.get('entries', [])
 base_dir = listing.get('base_dir', '.playwright-mcp')
 
@@ -698,7 +908,7 @@ for entry in entries:
         continue
     fname       = entry['name']
     file_result = _extract(
-        _mcp_call('tools/call', {'name': 'mcpproxy__getfile', 'arguments': {'path': fname}})
+        _call_tool('mcpproxy__getfile', {'path': fname})
     )
     files_fetched.append({
         'name':     fname,

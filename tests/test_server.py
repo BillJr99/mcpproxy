@@ -34,6 +34,7 @@ from server import (
     run_provider_setup,
     tool_is_enabled,
 )
+import tool_registry
 
 
 # ---------------------------------------------------------------------------
@@ -681,3 +682,67 @@ class TestRegisterProviderPrefixing:
         }
         names = self._capture_registered(spec)
         assert names == ["p__alive"]
+
+
+# ---------------------------------------------------------------------------
+# tool_registry module
+# ---------------------------------------------------------------------------
+
+class TestToolRegistry:
+    """Tests for tool_registry.py — the shared in-process tool store."""
+
+    def setup_method(self):
+        """Start each test with a clean registry."""
+        tool_registry.clear()
+
+    def teardown_method(self):
+        """Leave registry clean after each test."""
+        tool_registry.clear()
+
+    def test_get_empty_registry_returns_none(self):
+        assert tool_registry.get("nonexistent") is None
+
+    def test_get_all_empty_registry_returns_empty_dict(self):
+        assert tool_registry.get_all() == {}
+
+    def test_register_and_get(self):
+        spec = {"name": "t", "description": "desc", "input_schema": {}}
+        handler = lambda: None
+        tool_registry.register("myprov__t", spec, handler)
+        entry = tool_registry.get("myprov__t")
+        assert entry is not None
+        assert entry["spec"] is spec
+        assert entry["handler"] is handler
+
+    def test_register_and_get_all(self):
+        spec1 = {"name": "a"}
+        spec2 = {"name": "b"}
+        h1 = lambda: "a"
+        h2 = lambda: "b"
+        tool_registry.register("p__a", spec1, h1)
+        tool_registry.register("p__b", spec2, h2)
+        all_tools = tool_registry.get_all()
+        assert set(all_tools.keys()) == {"p__a", "p__b"}
+        assert all_tools["p__a"]["spec"] is spec1
+        assert all_tools["p__b"]["spec"] is spec2
+
+    def test_register_overwrites_existing_name(self):
+        spec_old = {"name": "t", "description": "old"}
+        spec_new = {"name": "t", "description": "new"}
+        tool_registry.register("p__t", spec_old, lambda: None)
+        tool_registry.register("p__t", spec_new, lambda: None)
+        entry = tool_registry.get("p__t")
+        assert entry["spec"]["description"] == "new"
+
+    def test_get_all_returns_copy_not_reference(self):
+        tool_registry.register("p__t", {"name": "t"}, lambda: None)
+        snapshot = tool_registry.get_all()
+        tool_registry.clear()
+        # The snapshot must still contain the entry even after clearing the registry
+        assert "p__t" in snapshot
+
+    def test_clear_empties_registry(self):
+        tool_registry.register("p__t", {}, lambda: None)
+        tool_registry.clear()
+        assert tool_registry.get_all() == {}
+        assert tool_registry.get("p__t") is None

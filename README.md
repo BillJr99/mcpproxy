@@ -156,6 +156,27 @@ Web UI: **`http://localhost:8889`**
 > **Note:** `tools/` is never baked into the image and must be supplied at runtime via a volume mount.
 > `handlers/` is part of the image — no mount required.
 
+**Run from a persistent home directory** — store tools and secrets in `~/.mcpproxy` so
+you can run the image from any working directory and the web UI can read and write `.env`:
+
+```bash
+# First time only — create the directory and an empty .env
+mkdir -p ~/.mcpproxy/tools
+touch ~/.mcpproxy/.env
+
+docker run --rm \
+  -p 8888:8888 -p 8889:8889 \
+  --env-file "$HOME/.mcpproxy/.env" \
+  -e MCP_ENV_FILE=/app/.env \
+  -v "$HOME/.mcpproxy/tools:/app/tools" \
+  -v "$HOME/.mcpproxy/.env:/app/.env" \
+  ghcr.io/billjr99/mcpproxy:latest
+```
+
+Two things differ from the minimal command:
+- `--env-file` injects secrets as environment variables at startup; Docker does **not** expand `~` inside double quotes, so `$HOME` is used instead.
+- `-v "$HOME/.mcpproxy/.env:/app/.env"` + `-e MCP_ENV_FILE=/app/.env` also mount the file itself into the container so the web UI's **🔑 Secrets** panel can read and write values without leaving the browser.
+
 Available tags:
 
 | Tag | When updated |

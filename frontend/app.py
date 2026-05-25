@@ -263,17 +263,24 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         out: list[dict] = []
         if not _config_dir.exists():
             return out
+        env_vars = _read_env_file(_env_file)
         for path in sorted(_config_dir.glob("*.yaml")):
             try:
                 spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
                 tool_entries = spec.get("tools") or []
+                secret_keys = _extract_secret_env_keys(spec)
+                missing_secrets = [k for k in secret_keys if not env_vars.get(k)]
+                structured = _provider_to_structured(path.stem, spec)
+                validation = _validate_provider(structured)
                 out.append({
                     "name": path.stem,
                     "file": path.name,
                     "tool_count": len(tool_entries),
                     "tool_names": [t.get("name") for t in tool_entries],
                     "is_npx": bool(spec.get("npx")),
-                    "secret_keys": _extract_secret_env_keys(spec),
+                    "secret_keys": secret_keys,
+                    "missing_secrets": missing_secrets,
+                    "validation_errors": validation["errors"],
                     "documentation": spec.get("documentation") or "",
                 })
             except Exception as exc:
@@ -475,6 +482,8 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 .req-badge{font-size:.65em;padding:1px 5px;border-radius:3px;font-weight:700}
 .req-yes{background:#f38ba8;color:#1e1e2e}
 .req-no{background:#45475a;color:#cdd6f4}
+.badge-warn{background:var(--yellow);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-err{background:var(--red);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
 </style>
 </head>
 <body>
@@ -535,6 +544,19 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <span class="warn-icon">⚠️</span>
           <span style="color:#cdd6f4">Changes take effect after restarting the MCP server.</span>
           <button class="btn btn-sm btn-outline-warning ms-auto" onclick="restartServer()">Restart MCP Server</button>
+        </div>
+
+        <!-- Missing secrets bar -->
+        <div class="restart-bar mb-2" id="secrets-bar" style="display:none;background:#2a2518;border-color:#f9e2af60">
+          <span style="color:var(--yellow)">⚠</span>
+          <span id="secrets-bar-msg" style="color:#cdd6f4;font-size:.875em"></span>
+          <button class="btn btn-sm btn-outline-warning ms-auto py-0 px-2" style="font-size:.8em" onclick="openSecretsModal()">🔑 Fix Secrets</button>
+        </div>
+
+        <!-- Validation error bar -->
+        <div class="restart-bar mb-2" id="validation-bar" style="display:none;background:#2a1f1f;border-color:#f38ba860">
+          <span style="color:var(--red)">✗</span>
+          <span id="validation-bar-msg" style="color:#cdd6f4;font-size:.875em"></span>
         </div>
 
         <!-- Documentation box -->
@@ -691,6 +713,7 @@ let secretsModal = null, wizModal = null;
 let wzType = null;            // 'code' | 'npx'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect-npx
+let providersMeta = {};       // name → {missing_secrets, validation_errors}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Boot
@@ -740,19 +763,40 @@ async function loadList() {
       el.innerHTML = '<div class="p-3 text-muted" style="font-size:.85em">No providers yet — click <b>+ New Provider</b>.</div>';
       return;
     }
-    el.innerHTML = providers.map(p => `
+    providersMeta = {};
+    providers.forEach(p => {
+      providersMeta[p.name] = {
+        missing_secrets: p.missing_secrets || [],
+        validation_errors: p.validation_errors || [],
+      };
+    });
+    el.innerHTML = providers.map(p => {
+      const missing = p.missing_secrets || [];
+      const errs = p.validation_errors || [];
+      const warnBadge = missing.length
+        ? `<span class="badge-warn" title="Missing: ${esc(missing.join(', '))}">⚠ ${missing.length} secret${missing.length > 1 ? 's' : ''} missing</span>`
+        : '';
+      const errBadge = errs.length
+        ? `<span class="badge-err" title="${esc(errs.join(' · '))}">✗ ${errs.length} config error${errs.length > 1 ? 's' : ''}</span>`
+        : '';
+      const alertRow = (warnBadge || errBadge)
+        ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}</div>`
+        : '';
+      return `
       <div class="provider-item ${p.name === currentName ? 'active' : ''}" onclick="openProvider('${p.name}')">
         <div style="min-width:0">
           <div class="fw-semibold">${p.name}</div>
           <small class="text-muted d-block" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
             ${(p.tool_names || []).join(', ') || 'no tools'}
           </small>
+          ${alertRow}
         </div>
         <div class="d-flex flex-column gap-1 align-items-end ms-1 flex-shrink-0">
           <span class="${p.is_npx ? 'badge-npx' : 'badge-code'}">${p.is_npx ? 'npx' : 'code'}</span>
           <span class="badge-count">${p.tool_count}</span>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   } catch(e) {
     document.getElementById('provider-list').innerHTML = `<div class="p-3 text-danger" style="font-size:.85em">${e.message}</div>`;
   }
@@ -770,11 +814,36 @@ async function openProvider(name) {
     document.getElementById('empty-panel').style.display = 'none';
     document.getElementById('editor-panel').style.display = 'block';
     document.getElementById('restart-bar').style.display = 'none';
+    _refreshEditorBars(name);
     // highlight active in list
     document.querySelectorAll('.provider-item').forEach(el => {
       el.classList.toggle('active', el.querySelector('.fw-semibold')?.textContent === name);
     });
   } catch(e) { toast(e.message, false); }
+}
+
+function _refreshEditorBars(name) {
+  const meta = providersMeta[name] || {};
+  const missing = meta.missing_secrets || [];
+  const errs = meta.validation_errors || [];
+
+  const sBar = document.getElementById('secrets-bar');
+  const sMsg = document.getElementById('secrets-bar-msg');
+  if (missing.length) {
+    sMsg.textContent = `${missing.length} secret${missing.length > 1 ? 's' : ''} not set in .env: ${missing.join(', ')}`;
+    sBar.style.display = '';
+  } else {
+    sBar.style.display = 'none';
+  }
+
+  const vBar = document.getElementById('validation-bar');
+  const vMsg = document.getElementById('validation-bar-msg');
+  if (errs.length) {
+    vMsg.textContent = errs.join(' · ');
+    vBar.style.display = '';
+  } else {
+    vBar.style.display = 'none';
+  }
 }
 
 function renderProvider(p) {
@@ -974,7 +1043,8 @@ async function saveProvider() {
     toast('Saved ✓');
     currentProvider = provider;
     document.getElementById('restart-bar').style.display = '';
-    loadList();
+    await loadList();
+    _refreshEditorBars(currentName);
   } catch(e) { toast(e.message, false); }
 }
 
@@ -1042,6 +1112,8 @@ async function saveSecrets() {
     await api('POST', '/api/env', {vars});
     toast(`Saved ${Object.keys(vars).length} secret(s) ✓`);
     secretsModal.hide();
+    await loadList();
+    if (currentName) _refreshEditorBars(currentName);
   } catch(e) { toast(e.message, false); }
 }
 
@@ -1224,6 +1296,7 @@ async function wzSaveSecretsAndFinish() {
     catch(e) { toast(e.message, false); }
   }
   wizModal.hide();
+  await loadList();  // refresh providersMeta before openProvider reads it
   await openProvider(currentName);
 }
 

@@ -13,6 +13,8 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 - Per-tool input schemas, secrets, and auth metadata
 - Or a `package:` block to delegate to any existing MCP subprocess server — launched
   via `npx`, `uvx`, `python -m`, or any installed binary
+- Or a `package:` + `repository:` pair to clone a git repo, run build commands, and
+  spawn the resulting stdio MCP server — useful for servers distributed only as source
 
 `server.py` loads every YAML at startup, installs declared `requirements` (pip packages),
 runs `setup_commands`, then registers each tool automatically — no Python files to
@@ -107,6 +109,7 @@ Click **+ New Provider** and choose a provider type:
 |---|---|
 | **Python code** | Write `async def` functions; the UI lists the ones it finds as you type. Each becomes a tool entry. |
 | **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary). When you click **Next**, mcpproxy auto-introspects the command and pre-populates the tool list; if introspection fails you can still proceed and add tools by hand. |
+| **Repository** | Provide a git URL and a list of build commands. mcpproxy clones the repo, runs the build commands, then introspects the resulting stdio MCP server. The URL and build commands are persisted in YAML so the repo can be re-cloned and re-built automatically on every container restart. |
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
@@ -725,6 +728,107 @@ tools: []
 The server spawns the process, performs the MCP handshake once, then forwards every tool
 call to it. The process is reused across calls (started lazily on the first tool call).
 
+---
+
+### Part 3.5 — a repository provider (clone + build + introspect)
+
+For MCP servers that are published only as source code (no `npx` / `uvx` / pip distribution),
+use a **repository provider**. mcpproxy will:
+
+1. `git clone` the repo into a workdir under `MCPPROXY_REPOS_DIR` (default `/app/repos/<provider>`).
+2. Run each entry of `build_commands` inside that workdir (e.g. `npm install`, `npm run build`).
+3. Spawn the `package.command` from inside the workdir and introspect tools the same way as a
+   package provider.
+4. Re-run steps 1–3 on every server start so ephemeral containers always have a fresh build.
+
+#### Adding one via the wizard
+
+1. Click **+ New Provider** → choose **📂 Repository**.
+2. Fill in:
+   - **Provider name** — e.g. `linkedin`.
+   - **Git URL** — `https://github.com/felipfr/linkedin-mcpserver` (https or ssh).
+   - **Ref** *(optional)* — branch, tag, or commit SHA. Defaults to the repo's default branch.
+   - **Build commands** — one per row, e.g. `npm install`, then `npm run build`.
+   - **Spawn command** — the stdio MCP launch command, e.g. `node dist/main.js`. Runs inside the workdir.
+3. Click **Next** — mcpproxy clones, builds, and introspects. The tool list is auto-populated.
+
+#### YAML produced
+
+```yaml
+package:
+  command: node dist/main.js          # spawn command, run inside the workdir
+repository:
+  url: https://github.com/felipfr/linkedin-mcpserver
+  ref: main                           # optional
+  workdir: /app/repos/linkedin        # optional — defaults to <REPOS_DIR>/<provider>
+  build_commands:
+    - npm install
+    - npm run build
+tools:
+  - name: search_jobs                 # advertised as linkedin__search_jobs
+    description: Search LinkedIn job postings.
+    input_schema:
+      type: object
+      properties:
+        query: {type: string, description: "Search query"}
+      required: [query]
+```
+
+The `package.command` is what spawns the MCP server (just like a regular package provider).
+The new `repository:` block tells the server **how to materialize the workdir on startup**.
+
+#### Editing a repository provider
+
+The editor shows a **📂 Repository** box with the git URL, ref, and build commands.
+- **↻ Re-clone & build** — re-runs `git pull` (or `git clone` on a fresh container)
+  and the build commands, then re-introspects the spawn command.
+- After saving, click **Restart MCP Server** to apply changes — on startup the server
+  walks every repository provider and re-runs clone/build before registering tools.
+
+#### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCPPROXY_REPOS_DIR` | `/app/repos` | Base directory for cloned repos. |
+
+For persistent build caches across container restarts, mount this directory as a
+volume:
+
+```yaml
+volumes:
+  - mcpproxy-repos:/app/repos
+```
+
+Without a mount, every container start re-clones and re-builds — exactly what's wanted
+for an ephemeral / disposable container.
+
+#### Lifecycle on container restart
+
+On every server start, `server.py` walks each YAML provider and:
+- If the spec has a `repository:` block, runs `git clone` (or `git pull` if the workdir
+  already contains `.git`), then re-runs every entry in `build_commands` with
+  `cwd=<workdir>`.
+- Then runs the standard `requirements:` (pip) and `setup_commands:` lists.
+- Then registers the tools and spawns the MCP subprocess (lazily, on first tool call).
+
+#### Security notes
+
+- Build commands run as the server user with full shell-style splitting via `shlex.split`.
+  Do **not** paste untrusted commands.
+- The git URL is passed directly to `git clone`. Private repos require SSH keys or a
+  credential helper to be configured inside the container.
+
+#### Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| Clone hangs or fails | The container must have outbound HTTPS / SSH to the git host. For SSH, mount your `~/.ssh` and configure `known_hosts`. |
+| `npm install` / build fails | View container stdout: `docker compose logs -f`. All build output is streamed unbuffered. |
+| Spawn / introspect fails | The repo must produce a working stdio MCP server. Check the spawn command resolves inside the workdir (e.g. `dist/main.js` only exists after a successful build). |
+| Tools not appearing after edit | Click **Restart MCP Server** so the YAML is re-loaded and the workdir re-materialized. |
+
+---
+
 ### pip Requirements vs setup_commands
 
 | Feature | Use for |
@@ -861,7 +965,19 @@ package:
                                    #      "python -m mcp_server_github"
                                    #      "mcp-server-github"
 
-# ── Shared optional fields (both provider types) ──────────────────────────────
+# ── Repository provider (clone + build, spawned from inside the workdir) ──────
+# When `repository:` is present, the `package.command` above is run with cwd
+# set to the cloned workdir.  Clone + build re-runs on every server start.
+
+repository:
+  url: string                      # e.g. "https://github.com/owner/repo"
+  ref: string                      # optional — branch, tag, or commit SHA
+  workdir: string                  # optional — defaults to <MCPPROXY_REPOS_DIR>/<provider>
+  build_commands:                  # shell commands run in <workdir> before spawn
+    - npm install
+    - npm run build
+
+# ── Shared optional fields (all provider types) ───────────────────────────────
 
 requirements:                      # pip packages installed before the server starts
   - package-name

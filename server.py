@@ -58,6 +58,7 @@ from config import (
     CONFIG_DIR,
     MCP_HOST,
     MCP_PORT,
+    REPOS_DIR,
     SERVER_NAME,
     UI_HOST,
     UI_PORT,
@@ -275,13 +276,15 @@ def _get_package_command(spec: dict[str, Any]) -> str | None:
     return None
 
 
-def _make_process_handler(command: str, tool_name: str) -> Callable[..., Any]:
+def _make_process_handler(
+    command: str, tool_name: str, cwd: str | None = None
+) -> Callable[..., Any]:
     """Return an async handler that proxies calls to a subprocess MCP process."""
     from process_runner import get_session
 
     async def process_handler(context: dict[str, Any], **kwargs: Any) -> Any:
         try:
-            session = get_session(command)
+            session = get_session(command, cwd=cwd)
             return await session.call_tool(tool_name, kwargs)
         except Exception as exc:
             traceback.print_exc()
@@ -289,6 +292,69 @@ def _make_process_handler(command: str, tool_name: str) -> Callable[..., Any]:
 
     process_handler.__name__ = tool_name
     return process_handler
+
+
+def repository_workdir(provider_name: str, spec: dict[str, Any]) -> str | None:
+    """Return the workdir path for a repository provider, or None for non-repo specs.
+
+    If the YAML explicitly sets ``repository.workdir`` it wins; otherwise the
+    path is derived from ``REPOS_DIR / normalize_provider_name(provider_name)``.
+    """
+    repo = spec.get("repository") or {}
+    if not repo:
+        return None
+    explicit = (repo.get("workdir") or "").strip()
+    if explicit:
+        return explicit
+    safe = normalize_provider_name(provider_name) or "repo"
+    return str(REPOS_DIR / safe)
+
+
+def materialize_repository(spec: dict[str, Any]) -> None:
+    """Clone the repo (if absent) and run build_commands.  Idempotent.
+
+    Called on every server start so that ephemeral containers (Docker) end up
+    with a freshly-built workdir.  If ``<workdir>/.git`` already exists the
+    clone is replaced with ``git -C <workdir> pull`` so persistent volumes
+    pick up upstream changes without losing build artefacts.
+    """
+    repo = spec.get("repository") or {}
+    if not repo:
+        return
+    source_path = spec.get("_config_path", "<unknown>")
+    provider_name = Path(source_path).stem if source_path != "<unknown>" else "repo"
+    url = (repo.get("url") or "").strip()
+    if not url:
+        raise ValueError(f"repository.url is required in {source_path}")
+    ref = (repo.get("ref") or "").strip()
+    workdir = repository_workdir(provider_name, spec)
+    assert workdir is not None
+    build_commands = list(repo.get("build_commands") or [])
+
+    try:
+        wd_path = Path(workdir)
+        wd_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if (wd_path / ".git").exists():
+            print(f"Updating repository in {workdir} (git pull)")
+            subprocess.run(["git", "-C", workdir, "pull", "--ff-only"], check=True)
+        else:
+            print(f"Cloning {url} into {workdir}")
+            subprocess.run(["git", "clone", url, workdir], check=True)
+
+        if ref:
+            print(f"Checking out ref {ref} in {workdir}")
+            subprocess.run(["git", "-C", workdir, "checkout", ref], check=True)
+
+        for cmd in build_commands:
+            if not cmd:
+                continue
+            print(f"Running build command in {workdir}: {cmd}")
+            subprocess.run(shlex.split(cmd), cwd=workdir, check=True)
+    except Exception as exc:
+        print(f"materialize_repository error in {source_path}: {exc}")
+        traceback.print_exc()
+        raise
 
 
 def register_provider(spec: dict[str, Any]) -> None:
@@ -304,6 +370,9 @@ def register_provider(spec: dict[str, Any]) -> None:
     provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
     try:
         command = _get_package_command(spec)
+        # Repository providers piggy-back on the package code path; the only
+        # difference is that their subprocess is spawned with cwd=<workdir>.
+        cwd = repository_workdir(provider_name, spec)
 
         if command is not None:
             # ── package provider (npx / uvx / python -m / any binary) ──────────
@@ -312,7 +381,7 @@ def register_provider(spec: dict[str, Any]) -> None:
                 if not tool_is_enabled(tool_spec):
                     print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
                     continue
-                handler = _make_process_handler(command, tool_name)
+                handler = _make_process_handler(command, tool_name, cwd=cwd)
                 register_tool(
                     tool_spec,
                     handler,
@@ -363,6 +432,9 @@ def run_provider_setup(spec: dict[str, Any]) -> None:
     """
     source_path = spec.get("_config_path", "<unknown>")
     try:
+        # Repository providers clone + build before requirements / setup_commands
+        # so that build artefacts are present when the MCP subprocess is spawned.
+        materialize_repository(spec)
         for req in spec.get("requirements", []):
             if not req:
                 continue

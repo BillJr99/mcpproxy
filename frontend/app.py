@@ -36,7 +36,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from config import CONFIG_DIR, ENV_FILE
+from config import CONFIG_DIR, ENV_FILE, REPOS_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +116,25 @@ def _get_package_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
     return spec.get("package") or None
 
 
+def _get_repository_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the repository sub-dict (repository:), or None when absent."""
+    return spec.get("repository") or None
+
+
+def _safe_provider_dirname(name: str) -> str:
+    """Normalize a provider name into a safe single-segment directory name."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", name or "").strip("-")
+    return safe or "repo"
+
+
+def _repository_workdir(name: str, explicit: str | None = None) -> str:
+    """Resolve the on-disk workdir path for a repository provider."""
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit
+    return str(REPOS_DIR / _safe_provider_dirname(name))
+
+
 def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     """Convert a loaded YAML spec into the structured JSON the UI works with."""
     tools_out = []
@@ -146,12 +165,29 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         })
 
     pkg_sub = _get_package_spec(spec)
-    if pkg_sub is not None:
+    repo_sub = _get_repository_spec(spec)
+    if repo_sub is not None:
+        ptype = "repository"
+        command = (pkg_sub.get("command") if pkg_sub else "") or ""
+        command = command.strip()
+        repo_url = (repo_sub.get("url") or "").strip()
+        repo_ref = (repo_sub.get("ref") or "").strip()
+        build_commands = list(repo_sub.get("build_commands") or [])
+        workdir = _repository_workdir(name, repo_sub.get("workdir"))
+    elif pkg_sub is not None:
         ptype = "package"
         command = (pkg_sub.get("command") or "").strip()
+        repo_url = ""
+        repo_ref = ""
+        build_commands = []
+        workdir = ""
     else:
         ptype = "code"
         command = ""
+        repo_url = ""
+        repo_ref = ""
+        build_commands = []
+        workdir = ""
 
     return {
         "name": name,
@@ -161,6 +197,10 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "code": spec.get("code", ""),
         "requirements": list(spec.get("requirements") or []),
         "setup_commands": list(spec.get("setup_commands") or []),
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "build_commands": build_commands,
+        "workdir": workdir,
         "tools": tools_out,
     }
 
@@ -177,6 +217,21 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
 
     if ptype == "package":
         spec["package"] = {"command": (provider.get("command") or "").strip()}
+    elif ptype == "repository":
+        spec["package"] = {"command": (provider.get("command") or "").strip()}
+        repo_block: dict[str, Any] = {
+            "url": (provider.get("repo_url") or "").strip(),
+        }
+        ref = (provider.get("repo_ref") or "").strip()
+        if ref:
+            repo_block["ref"] = ref
+        workdir = (provider.get("workdir") or "").strip()
+        if workdir:
+            repo_block["workdir"] = workdir
+        build_commands = [c for c in (provider.get("build_commands") or []) if c]
+        if build_commands:
+            repo_block["build_commands"] = build_commands
+        spec["repository"] = repo_block
     else:
         code = (provider.get("code") or "").strip()
         if code:
@@ -236,6 +291,14 @@ def _validate_provider(provider: dict[str, Any]) -> dict[str, Any]:
     if ptype == "package":
         if not (provider.get("command") or "").strip():
             errors.append("command is required for package providers")
+    elif ptype == "repository":
+        if not (provider.get("repo_url") or "").strip():
+            errors.append("repo_url is required for repository providers")
+        if not (provider.get("command") or "").strip():
+            errors.append("command is required for repository providers")
+        build_commands = provider.get("build_commands")
+        if build_commands is not None and not isinstance(build_commands, list):
+            errors.append("build_commands must be a list")
     else:
         if not (provider.get("code") or "").strip():
             errors.append("code is required for code providers")
@@ -328,6 +391,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                 structured = _provider_to_structured(path.stem, spec)
                 validation = _validate_provider(structured)
                 is_package = bool(_get_package_spec(spec))
+                is_repository = bool(_get_repository_spec(spec))
                 out.append({
                     "name": path.stem,
                     "file": path.name,
@@ -335,6 +399,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                     "tool_names": [t.get("name") for t in tool_entries],
                     "provider_type": structured["type"],
                     "is_package": is_package,
+                    "is_repository": is_repository,
                     "secret_keys": secret_keys,
                     "missing_secrets": missing_secrets,
                     "validation_errors": validation["errors"],
@@ -418,6 +483,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         command = (body.get("command") or "").strip()
         requirements: list[str] = body.get("requirements") or []
         setup_commands: list[str] = body.get("setup_commands") or []
+        cwd = (body.get("cwd") or "").strip() or None
         if not command:
             raise HTTPException(400, "command is required")
 
@@ -433,19 +499,69 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                     check=True,
                 )
 
-            # 2. Run setup commands
+            # 2. Run setup commands (in cwd when one is supplied — e.g. a repo workdir)
             for cmd in setup_commands:
                 if not cmd:
                     continue
-                subprocess.run(shlex.split(cmd), check=True)
+                subprocess.run(shlex.split(cmd), check=True, cwd=cwd)
 
             # 3. Introspect the MCP server
             from process_runner import introspect
-            tools = await introspect(command)
+            tools = await introspect(command, cwd=cwd)
             return {"ok": True, "tools": tools, "package_manager": pm}
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "tools": [], "package_manager": pm}
+
+    # ── Repository clone-and-build ───────────────────────────────────────────
+
+    @app.post("/api/clone-and-build")
+    async def clone_and_build(request: Request) -> dict:
+        """Clone (or pull) a git repo and run build_commands inside the workdir.
+
+        Body:
+          name           — provider name (used to derive the default workdir)
+          repo_url       — git URL (required)
+          ref            — optional branch/tag/commit
+          build_commands — optional list of shell commands run inside the workdir
+          workdir        — optional explicit workdir path (overrides default)
+
+        Idempotent: if ``<workdir>/.git`` exists, runs ``git pull`` instead of
+        ``git clone`` so persistent volumes pick up upstream changes.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        url = (body.get("repo_url") or "").strip()
+        ref = (body.get("ref") or "").strip()
+        explicit_workdir = (body.get("workdir") or "").strip()
+        build_commands: list[str] = body.get("build_commands") or []
+        if not name:
+            raise HTTPException(400, "name is required")
+        _guard_name(name)
+        if not url:
+            raise HTTPException(400, "repo_url is required")
+
+        workdir = _repository_workdir(name, explicit_workdir)
+
+        try:
+            Path(workdir).parent.mkdir(parents=True, exist_ok=True)
+            if (Path(workdir) / ".git").exists():
+                subprocess.run(["git", "-C", workdir, "pull", "--ff-only"], check=True)
+            else:
+                subprocess.run(["git", "clone", url, workdir], check=True)
+
+            if ref:
+                subprocess.run(["git", "-C", workdir, "checkout", ref], check=True)
+
+            for cmd in build_commands:
+                if not cmd:
+                    continue
+                subprocess.run(shlex.split(cmd), check=True, cwd=workdir)
+
+            return {"ok": True, "workdir": workdir}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "workdir": workdir}
 
     # ── Function extractor (code providers) ──────────────────────────────────
 
@@ -665,6 +781,7 @@ body{background:var(--bg);color:#cdd6f4;min-height:100vh;font-size:14px}
 /* badges */
 .badge-pkg{background:#cba6f7;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-code{background:#89b4fa;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-repo{background:#a6e3a1;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-count{background:#45475a;color:#cdd6f4;font-size:.65em;padding:2px 6px;border-radius:3px}
 /* modal */
 .modal-content{background:var(--bg);border:1px solid var(--border);color:#cdd6f4}
@@ -792,6 +909,36 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div class="mt-2 text-muted" style="font-size:.8em">Any command that spawns a stdio MCP server: <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or an installed binary. The process is started on demand and kept alive between calls.</div>
         </div>
 
+        <!-- Repository box -->
+        <div class="section-box" id="repository-box" style="display:none">
+          <div class="section-title">
+            📂 Repository
+            <button class="btn btn-sm btn-outline-secondary py-0" onclick="rebuildRepository()" title="Clone (or pull) and re-run build commands">↻ Re-clone &amp; build</button>
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Git URL</label>
+            <input id="f-repo-url" class="form-control form-control-sm font-monospace"
+              placeholder="https://github.com/owner/repo"
+              oninput="updateRepoField('repo_url', this.value)">
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Ref <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
+            <input id="f-repo-ref" class="form-control form-control-sm font-monospace"
+              placeholder="main"
+              oninput="updateRepoField('repo_ref', this.value)">
+          </div>
+          <div class="mb-2">
+            <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Build commands</span>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="addBuildCommand()">+ Add</button>
+            </label>
+            <div id="build-commands-container"></div>
+            <div class="text-muted" style="font-size:.8em">Shell commands run inside the workdir before the MCP server is spawned. Re-runs on every server start.</div>
+          </div>
+          <div class="text-muted" style="font-size:.8em">Workdir: <code id="f-repo-workdir">(auto)</code></div>
+          <div id="rebuild-status" class="mt-2 fn-status"></div>
+        </div>
+
         <!-- Code box (code providers) -->
         <div class="section-box" id="code-box" style="display:none">
           <div class="section-title">🐍 Python Code</div>
@@ -874,7 +1021,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
         <div id="wz-type" class="wizard-step active">
           <p class="text-muted mb-4">How do you want to create this provider?</p>
           <div class="row g-3">
-            <div class="col-md-6">
+            <div class="col-md-4">
               <div class="card wizard-choice h-100" onclick="wzSelectType('code')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">🐍</div>
@@ -883,12 +1030,21 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                 </div>
               </div>
             </div>
-            <div class="col-md-6">
+            <div class="col-md-4">
               <div class="card wizard-choice h-100" onclick="wzSelectType('package')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">📦</div>
                   <h6 class="mt-2">Package</h6>
                   <small class="text-muted">Run an existing MCP server via <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or any command — tools are auto-detected</small>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card wizard-choice h-100" onclick="wzSelectType('repository')">
+                <div class="card-body text-center p-4">
+                  <div style="font-size:2.5em">📂</div>
+                  <h6 class="mt-2">Repository</h6>
+                  <small class="text-muted">Clone a git repo, run build commands, then introspect & spawn the resulting stdio MCP server</small>
                 </div>
               </div>
             </div>
@@ -921,6 +1077,37 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           </div>
           <div class="text-muted" style="font-size:.8em">When you click <b>Next</b> the command is introspected automatically; tools it advertises become the dropdown options in the editor. If introspection fails you can still proceed and add tools by hand.</div>
           <div id="wz-introspect-result" class="mt-2"></div>
+        </div>
+
+        <!-- Step: repository -->
+        <div id="wz-repository" class="wizard-step">
+          <div class="mb-3">
+            <label class="form-label">Provider name</label>
+            <input class="form-control" id="wz-repo-name" placeholder="linkedin">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Git repository URL *</label>
+            <input class="form-control font-monospace" id="wz-repo-url"
+              placeholder="https://github.com/felipfr/linkedin-mcpserver">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Ref <span class="text-muted fw-normal" style="text-transform:none">optional — branch, tag, or commit SHA</span></label>
+            <input class="form-control font-monospace" id="wz-repo-ref" placeholder="main">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Build commands <span class="text-muted fw-normal" style="text-transform:none">run inside the cloned workdir, in order</span></label>
+            <div id="wz-repo-builds-container"></div>
+            <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddRepoBuild()">+ Add command</button>
+            <div class="text-muted mt-1" style="font-size:.8em">e.g. <code>npm install</code>, <code>npm run build</code>. Re-runs on every server start so ephemeral containers rebuild.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Spawn command *</label>
+            <input class="form-control font-monospace" id="wz-repo-cmd"
+              placeholder="node dist/main.js">
+            <div class="text-muted mt-1" style="font-size:.8em">The command used to launch the stdio MCP server, run from inside the workdir after the build commands complete.</div>
+          </div>
+          <div class="text-muted" style="font-size:.8em">Clicking <b>Next</b> clones the repo, runs the build commands, then introspects the spawn command to populate the tool list. All settings are saved to YAML so the server can re-build on container restart.</div>
+          <div id="wz-repo-result" class="mt-2"></div>
         </div>
 
         <!-- Step: code paste -->
@@ -977,7 +1164,7 @@ let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null;
-let wzType = null;            // 'code' | 'package'
+let wzType = null;            // 'code' | 'package' | 'repository'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
 let providersMeta = {};       // name → {missing_secrets, validation_errors}
@@ -1066,7 +1253,12 @@ async function loadList() {
       const alertRow = (warnBadge || errBadge)
         ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}</div>`
         : '';
-      const isPkg = p.is_package;
+      const isRepo = p.is_repository || p.provider_type === 'repository';
+      const isPkg = p.is_package && !isRepo;
+      let badgeClass = 'badge-code';
+      let badgeText = 'code';
+      if (isRepo) { badgeClass = 'badge-repo'; badgeText = 'repo'; }
+      else if (isPkg) { badgeClass = 'badge-pkg'; badgeText = 'pkg'; }
       return `
       <div class="provider-item ${p.name === currentName ? 'active' : ''}" onclick="openProvider('${p.name}')">
         <div style="min-width:0">
@@ -1077,7 +1269,7 @@ async function loadList() {
           ${alertRow}
         </div>
         <div class="d-flex flex-column gap-1 align-items-end ms-1 flex-shrink-0">
-          <span class="${isPkg ? 'badge-pkg' : 'badge-code'}">${isPkg ? 'pkg' : 'code'}</span>
+          <span class="${badgeClass}">${badgeText}</span>
           <span class="badge-count">${p.tool_count}</span>
         </div>
       </div>`;
@@ -1118,7 +1310,8 @@ async function openProvider(name) {
 // Failure (or absence of input) is silent — the editor falls back to free-form text.
 async function discoverFunctions() {
   if (!currentProvider) return;
-  const isPkg = currentProvider.type === 'package';
+  const isRepo = currentProvider.type === 'repository';
+  const isPkg = currentProvider.type === 'package' || isRepo;
   knownFnStatus = 'busy';
   knownFnMessage = isPkg ? 'Introspecting package…' : 'Analyzing code…';
   _renderKnownFnStatus();
@@ -1133,6 +1326,7 @@ async function discoverFunctions() {
         command: cmd,
         requirements: currentProvider.requirements || [],
         setup_commands: currentProvider.setup_commands || [],
+        cwd: isRepo ? (currentProvider.workdir || '') : '',
       });
       if (!r.ok) throw new Error(r.error || 'introspection failed');
       knownFunctions = (r.tools || []).map(t => t.name).filter(Boolean);
@@ -1166,7 +1360,7 @@ function _renderKnownFnStatus() {
 // reset focus / scroll position).  Each dropdown's inner option list is replaced.
 function _refreshToolDropdowns() {
   if (!currentProvider) return;
-  const isPkg = currentProvider.type === 'package';
+  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository';
   const field = isPkg ? 'name' : 'function';
   (currentProvider.tools || []).forEach((t, i) => {
     const sel = document.getElementById(`fn-pick-${i}`);
@@ -1209,16 +1403,27 @@ function _refreshEditorBars(name) {
 }
 
 function renderProvider(p) {
-  const isPkg = p.type === 'package';
-  document.getElementById('editor-title').textContent = p.name + (isPkg ? ' (package)' : ' (code)');
+  const isRepo = p.type === 'repository';
+  const isPkg = p.type === 'package' || isRepo; // repo also uses package.command
+  const isCode = p.type === 'code';
+  const label = isRepo ? ' (repository)' : isPkg ? ' (package)' : ' (code)';
+  document.getElementById('editor-title').textContent = p.name + label;
   document.getElementById('f-documentation').value = p.documentation || '';
 
   document.getElementById('package-box').style.display = isPkg ? '' : 'none';
-  document.getElementById('code-box').style.display = isPkg ? 'none' : '';
+  document.getElementById('repository-box').style.display = isRepo ? '' : 'none';
+  document.getElementById('code-box').style.display = isCode ? '' : 'none';
 
   if (isPkg) {
     document.getElementById('f-command').value = p.command || '';
-  } else {
+  }
+  if (isRepo) {
+    document.getElementById('f-repo-url').value = p.repo_url || '';
+    document.getElementById('f-repo-ref').value = p.repo_ref || '';
+    document.getElementById('f-repo-workdir').textContent = p.workdir || '(auto)';
+    renderBuildCommands(p.build_commands || []);
+  }
+  if (isCode) {
     codeEditor.setValue(p.code || '');
     setTimeout(() => codeEditor.refresh(), 50);
   }
@@ -1226,6 +1431,66 @@ function renderProvider(p) {
   renderRequirements(p.requirements || []);
   renderSetupCommands(p.setup_commands || []);
   renderTools(p.tools || [], isPkg);
+}
+
+// Build commands list (repository providers)
+function renderBuildCommands(cmds) {
+  const c = document.getElementById('build-commands-container');
+  if (!cmds.length) { c.innerHTML = ''; return; }
+  c.innerHTML = cmds.map((cmd, i) => `
+    <div class="list-row" id="bc-row-${i}">
+      <input class="form-control form-control-sm font-monospace" placeholder="npm install"
+        value="${esc(cmd)}" oninput="updateBuildCommand(${i},this.value)">
+      <button class="btn-icon" onclick="removeBuildCommand(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function addBuildCommand() {
+  ensureProvider();
+  currentProvider.build_commands = currentProvider.build_commands || [];
+  currentProvider.build_commands.push('');
+  renderBuildCommands(currentProvider.build_commands);
+}
+
+function removeBuildCommand(i) {
+  ensureProvider();
+  currentProvider.build_commands.splice(i, 1);
+  renderBuildCommands(currentProvider.build_commands);
+}
+
+function updateBuildCommand(i, val) {
+  ensureProvider();
+  currentProvider.build_commands[i] = val;
+}
+
+function updateRepoField(key, val) {
+  ensureProvider();
+  currentProvider[key] = val;
+}
+
+async function rebuildRepository() {
+  if (!currentProvider || currentProvider.type !== 'repository') return;
+  const el = document.getElementById('rebuild-status');
+  el.className = 'fn-status busy';
+  el.textContent = 'Cloning / pulling and running build commands…';
+  try {
+    const r = await api('POST', '/api/clone-and-build', {
+      name: currentName,
+      repo_url: currentProvider.repo_url,
+      ref: currentProvider.repo_ref,
+      build_commands: currentProvider.build_commands || [],
+      workdir: currentProvider.workdir || '',
+    });
+    if (!r.ok) throw new Error(r.error || 'build failed');
+    currentProvider.workdir = r.workdir;
+    document.getElementById('f-repo-workdir').textContent = r.workdir;
+    el.className = 'fn-status ok';
+    el.textContent = `Built ✓ (workdir: ${r.workdir})`;
+    discoverFunctions().catch(() => {});
+  } catch (e) {
+    el.className = 'fn-status error';
+    el.textContent = e.message || 'build failed';
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1463,7 +1728,12 @@ function ensureProvider() {
 function collectProvider() {
   const p = JSON.parse(JSON.stringify(currentProvider));
   p.documentation = document.getElementById('f-documentation').value;
-  if (p.type === 'package') {
+  if (p.type === 'repository') {
+    p.command = document.getElementById('f-command').value.trim();
+    p.repo_url = document.getElementById('f-repo-url').value.trim();
+    p.repo_ref = document.getElementById('f-repo-ref').value.trim();
+    p.build_commands = (currentProvider.build_commands || []).filter(c => c.trim());
+  } else if (p.type === 'package') {
     p.command = document.getElementById('f-command').value.trim();
   } else {
     p.code = codeEditor.getValue();
@@ -1491,7 +1761,7 @@ function updateSecret(ti, si, field, val) {
 
 function addTool() {
   ensureProvider();
-  const isPkg = currentProvider.type === 'package';
+  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository';
   currentProvider.tools.push({
     name: '', function: '', description: '', documentation: '',
     enabled: true, parameters: [], secrets: [],
@@ -1502,31 +1772,31 @@ function addTool() {
 function removeTool(i) {
   ensureProvider();
   currentProvider.tools.splice(i, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
 }
 
 function addParam(ti) {
   ensureProvider();
   currentProvider.tools[ti].parameters.push({name:'',type:'string',description:'',required:false,default:null});
-  renderTools(currentProvider.tools, currentProvider.type === 'package');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
 }
 
 function removeParam(ti, pi) {
   ensureProvider();
   currentProvider.tools[ti].parameters.splice(pi, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
 }
 
 function addSecret(ti) {
   ensureProvider();
   currentProvider.tools[ti].secrets.push({arg:'',env:''});
-  renderTools(currentProvider.tools, currentProvider.type === 'package');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
 }
 
 function removeSecret(ti, si) {
   ensureProvider();
   currentProvider.tools[ti].secrets.splice(si, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1616,7 +1886,7 @@ async function saveSecrets() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Wizard
 // ─────────────────────────────────────────────────────────────────────────────
-const WZ_STEPS = ['type','package','code','secrets'];
+const WZ_STEPS = ['type','package','repository','code','secrets'];
 
 function wzShowStep(step) {
   WZ_STEPS.forEach(s => {
@@ -1641,9 +1911,17 @@ function openWizard() {
   document.getElementById('wz-code-cmds-container').innerHTML = '';
   document.getElementById('wz-introspect-result').innerHTML = '';
   document.getElementById('wz-analyze-result').innerHTML = '';
+  document.getElementById('wz-repo-name').value = '';
+  document.getElementById('wz-repo-url').value = '';
+  document.getElementById('wz-repo-ref').value = '';
+  document.getElementById('wz-repo-cmd').value = '';
+  document.getElementById('wz-repo-builds-container').innerHTML = '';
+  document.getElementById('wz-repo-result').innerHTML = '';
   wzShowStep('type');
   wizModal.show();
 }
+
+function wzAddRepoBuild() { _wzListAdd('wz-repo-builds-container', 'npm install'); }
 
 function wzSelectType(type) {
   wzType = type;
@@ -1719,6 +1997,74 @@ async function wzNext() {
     return;
   }
 
+  if (wzStep === 'repository') {
+    const name = document.getElementById('wz-repo-name').value.trim();
+    const url  = document.getElementById('wz-repo-url').value.trim();
+    const ref  = document.getElementById('wz-repo-ref').value.trim();
+    const cmd  = document.getElementById('wz-repo-cmd').value.trim();
+    if (!name) { errEl.textContent = 'Provider name is required.'; return; }
+    if (!url)  { errEl.textContent = 'Git repository URL is required.'; return; }
+    if (!cmd)  { errEl.textContent = 'Spawn command is required.'; return; }
+    const build_commands = _wzGetListValues('wz-repo-builds-container');
+    const nextBtn = document.getElementById('wz-next-btn');
+    nextBtn.disabled = true;
+    const origText = nextBtn.textContent;
+    const resultEl = document.getElementById('wz-repo-result');
+    let workdir = '';
+    try {
+      nextBtn.textContent = '⏳ Cloning & building…';
+      resultEl.innerHTML = '<span class="text-muted" style="font-size:.875em">Cloning repo and running build commands — this may take a while…</span>';
+      const cb = await api('POST', '/api/clone-and-build', {
+        name, repo_url: url, ref, build_commands,
+      });
+      if (!cb.ok) throw new Error(cb.error || 'clone/build failed');
+      workdir = cb.workdir;
+      resultEl.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Built in <code>${esc(workdir)}</code></div>`;
+      nextBtn.textContent = '⏳ Introspecting…';
+      const ir = await api('POST', '/api/introspect', {
+        command: cmd, cwd: workdir,
+      });
+      if (!ir.ok) {
+        resultEl.innerHTML += `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(ir.error||'')}). Continuing — add tools manually in the editor.</div>`;
+        wzIntrospectedTools = [];
+      } else {
+        wzIntrospectedTools = ir.tools || [];
+        resultEl.innerHTML += `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s)</div>`;
+      }
+    } catch (e) {
+      errEl.textContent = e.message;
+      resultEl.innerHTML = `<div class="text-danger" style="font-size:.875em">✗ ${esc(e.message)}</div>`;
+      nextBtn.disabled = false;
+      nextBtn.textContent = origText;
+      return;
+    } finally {
+      nextBtn.disabled = false;
+      nextBtn.textContent = origText;
+    }
+    const provider = {
+      name, type: 'repository', command: cmd, documentation: '', code: '',
+      repo_url: url, repo_ref: ref, workdir,
+      build_commands,
+      requirements: [], setup_commands: [],
+      tools: wzIntrospectedTools.map(t => ({
+        name: t.name,
+        function: '',
+        description: t.description || '',
+        documentation: '',
+        enabled: true,
+        parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
+        secrets: [],
+      })),
+    };
+    try {
+      const r = await api('POST', '/api/tools', {name, provider});
+      currentName = name; currentProvider = provider;
+      loadList();
+      await wzGoSecrets(r.secret_keys || []);
+    } catch(e) { errEl.textContent = e.message; }
+    return;
+  }
+
   if (wzStep === 'code') {
     const name = document.getElementById('wz-code-name').value.trim();
     const code = document.getElementById('wz-code-input').value;
@@ -1754,7 +2100,7 @@ async function wzNext() {
 }
 
 function wzBack() {
-  const map = {package:'type', code:'type', secrets: wzType||'type'};
+  const map = {package:'type', repository:'type', code:'type', secrets: wzType||'type'};
   wzShowStep(map[wzStep] || 'type');
 }
 

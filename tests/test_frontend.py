@@ -76,6 +76,28 @@ PACKAGE_PROVIDER = {
     }],
 }
 
+REPOSITORY_PROVIDER = {
+    "name": "linkedin",
+    "type": "repository",
+    "documentation": "",
+    "command": "node dist/main.js",
+    "code": "",
+    "requirements": [],
+    "setup_commands": [],
+    "repo_url": "https://github.com/felipfr/linkedin-mcpserver",
+    "repo_ref": "main",
+    "build_commands": ["npm install", "npm run build"],
+    "workdir": "",
+    "tools": [{
+        "name": "search_jobs", "function": "", "description": "Search jobs",
+        "documentation": "", "enabled": True,
+        "parameters": [
+            {"name": "query", "type": "string", "description": "Search query", "required": True, "default": None}
+        ],
+        "secrets": [],
+    }],
+}
+
 
 # ---------------------------------------------------------------------------
 # GET /api/tools
@@ -412,6 +434,21 @@ class TestHTML:
         assert "wzSelectType('code')" in text
         assert "wzSelectType('package')" in text
 
+    def test_wizard_has_repository_card(self, client):
+        text = client.get("/").text
+        assert "wzSelectType('repository')" in text
+        assert "wz-repo-url" in text
+        assert "wz-repo-cmd" in text
+
+    def test_clone_and_build_endpoint_exposed(self, client):
+        assert "/api/clone-and-build" in client.get("/").text
+
+    def test_editor_has_repository_box(self, client):
+        text = client.get("/").text
+        assert "repository-box" in text
+        assert "f-repo-url" in text
+        assert "build-commands-container" in text
+
     def test_no_manual_introspect_button(self, client):
         """The 🔍 Introspect Tools button is replaced by auto-introspection."""
         text = client.get("/").text
@@ -659,3 +696,207 @@ class TestDetectPackageManager:
 
     def test_empty_string(self):
         assert _detect_package_manager("") == "command"
+
+
+# ---------------------------------------------------------------------------
+# Repository provider — round-trip + validation
+# ---------------------------------------------------------------------------
+
+class TestRepositoryRoundTrip:
+    def test_yaml_contains_both_blocks(self):
+        yaml_str = _structured_to_yaml(REPOSITORY_PROVIDER)
+        spec = yaml.safe_load(yaml_str)
+        assert "package" in spec
+        assert spec["package"]["command"] == "node dist/main.js"
+        assert "repository" in spec
+        assert spec["repository"]["url"] == "https://github.com/felipfr/linkedin-mcpserver"
+        assert spec["repository"]["ref"] == "main"
+        assert spec["repository"]["build_commands"] == ["npm install", "npm run build"]
+
+    def test_round_trip_preserves_fields(self):
+        yaml_str = _structured_to_yaml(REPOSITORY_PROVIDER)
+        spec = yaml.safe_load(yaml_str)
+        structured = _provider_to_structured("linkedin", spec)
+        assert structured["type"] == "repository"
+        assert structured["command"] == "node dist/main.js"
+        assert structured["repo_url"] == "https://github.com/felipfr/linkedin-mcpserver"
+        assert structured["repo_ref"] == "main"
+        assert structured["build_commands"] == ["npm install", "npm run build"]
+        # workdir is auto-derived from provider name when not explicitly set
+        assert structured["workdir"].endswith("linkedin")
+
+    def test_optional_fields_omitted_when_empty(self):
+        provider = {**REPOSITORY_PROVIDER, "repo_ref": "", "build_commands": []}
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert "ref" not in spec["repository"]
+        assert "build_commands" not in spec["repository"]
+
+    def test_explicit_workdir_preserved(self):
+        provider = {**REPOSITORY_PROVIDER, "workdir": "/custom/path"}
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["repository"]["workdir"] == "/custom/path"
+        structured = _provider_to_structured("linkedin", spec)
+        assert structured["workdir"] == "/custom/path"
+
+
+class TestRepositoryValidation:
+    def test_valid_repository(self):
+        assert _validate_provider(REPOSITORY_PROVIDER)["ok"] is True
+
+    def test_missing_url(self):
+        r = _validate_provider({**REPOSITORY_PROVIDER, "repo_url": ""})
+        assert not r["ok"]
+        assert any("repo_url" in e for e in r["errors"])
+
+    def test_missing_command(self):
+        r = _validate_provider({**REPOSITORY_PROVIDER, "command": ""})
+        assert not r["ok"]
+        assert any("command" in e for e in r["errors"])
+
+    def test_build_commands_must_be_list(self):
+        p = {**REPOSITORY_PROVIDER, "build_commands": "npm install"}  # string, not list
+        assert not _validate_provider(p)["ok"]
+
+    def test_empty_build_commands_is_valid(self):
+        assert _validate_provider({**REPOSITORY_PROVIDER, "build_commands": []})["ok"] is True
+
+
+class TestListToolsRepository:
+    def test_repository_provider_listed(self, app, tools_dir):
+        (tools_dir / "linkedin.yaml").write_text(_structured_to_yaml(REPOSITORY_PROVIDER))
+        r = TestClient(app).get("/api/tools")
+        data = r.json()
+        assert data[0]["provider_type"] == "repository"
+        assert data[0]["is_repository"] is True
+        # is_package is also true because repository providers reuse the package: block
+        assert data[0]["is_package"] is True
+
+
+# ---------------------------------------------------------------------------
+# /api/clone-and-build
+# ---------------------------------------------------------------------------
+
+class TestCloneAndBuild:
+    def test_missing_name_400(self, client):
+        r = client.post("/api/clone-and-build", json={"repo_url": "https://example.com/r.git"})
+        assert r.status_code == 400
+
+    def test_missing_url_400(self, client):
+        r = client.post("/api/clone-and-build", json={"name": "myrepo"})
+        assert r.status_code == 400
+
+    def test_invalid_name_400(self, client):
+        r = client.post("/api/clone-and-build", json={"name": "../evil", "repo_url": "https://e.com/r.git"})
+        assert r.status_code == 400
+
+    def test_clone_when_no_git_dir(self, client, tmp_path, monkeypatch):
+        # Force the workdir to land inside tmp_path
+        monkeypatch.setattr("frontend.app.REPOS_DIR", tmp_path)
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append((list(args), kwargs.get("cwd")))
+            class _R: returncode = 0
+            return _R()
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "myrepo",
+                "repo_url": "https://example.com/r.git",
+                "build_commands": ["npm install", "npm run build"],
+            })
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        # First call: git clone <url> <workdir>
+        assert calls[0][0][:2] == ["git", "clone"]
+        assert calls[0][0][2] == "https://example.com/r.git"
+        # Build commands ran with cwd=workdir
+        workdir = r.json()["workdir"]
+        assert calls[1] == (["npm", "install"], workdir)
+        assert calls[2] == (["npm", "run", "build"], workdir)
+
+    def test_pull_when_git_dir_exists(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr("frontend.app.REPOS_DIR", tmp_path)
+        # Pre-create .git so the endpoint detects an existing clone
+        wd = tmp_path / "myrepo"
+        (wd / ".git").mkdir(parents=True)
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            class _R: returncode = 0
+            return _R()
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "myrepo",
+                "repo_url": "https://example.com/r.git",
+            })
+        assert r.json()["ok"] is True
+        # First call should be a pull, not clone
+        assert calls[0][:3] == ["git", "-C", str(wd)]
+        assert calls[0][3] == "pull"
+
+    def test_ref_checkout(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr("frontend.app.REPOS_DIR", tmp_path)
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            class _R: returncode = 0
+            return _R()
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            client.post("/api/clone-and-build", json={
+                "name": "myrepo",
+                "repo_url": "https://example.com/r.git",
+                "ref": "v1.2.3",
+            })
+        # Expect clone + checkout
+        assert any(c[:2] == ["git", "clone"] for c in calls)
+        assert any("checkout" in c for c in calls)
+
+    def test_build_failure_returns_ok_false(self, client, tmp_path, monkeypatch):
+        import subprocess as sp
+        monkeypatch.setattr("frontend.app.REPOS_DIR", tmp_path)
+        def fake_run(args, **kwargs):
+            if "clone" in args:
+                class _R: returncode = 0
+                return _R()
+            raise sp.CalledProcessError(1, args)
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "myrepo",
+                "repo_url": "https://example.com/r.git",
+                "build_commands": ["broken-command"],
+            })
+        assert r.json()["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# /api/introspect forwards cwd
+# ---------------------------------------------------------------------------
+
+class TestIntrospectCwd:
+    def test_cwd_passed_through(self, client):
+        captured = {}
+
+        async def fake_introspect(command, cwd=None):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return []
+
+        with patch("process_runner.introspect", new=fake_introspect):
+            r = client.post("/api/introspect", json={
+                "command": "node dist/main.js",
+                "cwd": "/app/repos/linkedin",
+            })
+        assert r.status_code == 200
+        assert captured["cwd"] == "/app/repos/linkedin"
+
+    def test_no_cwd_when_omitted(self, client):
+        captured = {}
+
+        async def fake_introspect(command, cwd=None):
+            captured["cwd"] = cwd
+            return []
+
+        with patch("process_runner.introspect", new=fake_introspect):
+            client.post("/api/introspect", json={"command": "echo hi"})
+        assert captured["cwd"] is None

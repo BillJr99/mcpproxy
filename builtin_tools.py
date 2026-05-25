@@ -54,9 +54,9 @@ async def list_files(
     """List files and subdirectories at *path* inside the files base directory.
 
     Returns a JSON object with an ``entries`` list; each entry has ``name``
-    (basename), ``path`` (relative to the listed directory, using ``/`` as the
-    separator), ``type`` (``"file"`` or ``"directory"``), and ``size`` (bytes,
-    files only).
+    (basename), ``path`` (relative to the **base files directory**, using ``/``
+    as the separator — this is the value to pass to ``mcpproxy__getfile``),
+    ``type`` (``"file"`` or ``"directory"``), and ``size`` (bytes, files only).
 
     When *recursive* is true (default), descends into subdirectories. Each
     directory is still emitted as its own entry (with ``type="directory"``)
@@ -85,7 +85,7 @@ async def list_files(
         def _walk(directory: Path, depth: int) -> None:
             for entry in sorted(directory.iterdir()):
                 is_dir = entry.is_dir() and not entry.is_symlink()
-                rel = entry.relative_to(target).as_posix()
+                rel = entry.relative_to(base).as_posix()
                 entries.append(
                     {
                         "name": entry.name,

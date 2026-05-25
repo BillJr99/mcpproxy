@@ -200,6 +200,50 @@ class TestListFiles:
         assert paths == {"sub", "sub/a.txt", "sub/deep"}
 
     @pytest.mark.asyncio
+    async def test_entry_path_is_relative_to_base_not_listed_dir(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Entry 'path' must be passable directly to get_file regardless of
+        which subdirectory was listed. Writes one file at the base and one in
+        a nested subdir, then round-trips both through list_files -> get_file
+        using only the returned 'path' field."""
+        base = tmp_path / "files"
+        sub = base / "test-paths"
+        sub.mkdir(parents=True)
+        root_file = base / "root.txt"
+        root_file.write_text("root-content")
+        nested_file = sub / "nested.txt"
+        nested_file.write_text("nested-content")
+
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files, get_file
+
+        # Listing a subdirectory: 'path' should still be base-relative.
+        sub_listing = await list_files(_ctx(), path="test-paths")
+        nested_entry = next(
+            e for e in sub_listing["entries"] if e["name"] == "nested.txt"
+        )
+        assert nested_entry["path"] == "test-paths/nested.txt"
+        fetched_nested = await get_file(_ctx(), path=nested_entry["path"])
+        assert fetched_nested["ok"] is True
+        assert fetched_nested["content"] == "nested-content"
+
+        # Recursive listing from the root: every entry's 'path' must round-trip
+        # through get_file unchanged for files (directories return an error).
+        root_listing = await list_files(_ctx(), recursive=True)
+        paths = {e["path"] for e in root_listing["entries"]}
+        assert paths == {"root.txt", "test-paths", "test-paths/nested.txt"}
+        for entry in root_listing["entries"]:
+            if entry["type"] != "file":
+                continue
+            fetched = await get_file(_ctx(), path=entry["path"])
+            assert fetched["ok"] is True, f"failed to fetch {entry['path']}"
+        # Cross-check the root file specifically.
+        root_entry = next(e for e in root_listing["entries"] if e["path"] == "root.txt")
+        fetched_root = await get_file(_ctx(), path=root_entry["path"])
+        assert fetched_root["content"] == "root-content"
+
+    @pytest.mark.asyncio
     async def test_recursive_does_not_follow_dir_symlinks(self, tmp_path: Path, monkeypatch):
         base = tmp_path / "files"
         base.mkdir()

@@ -528,7 +528,11 @@ def register_builtin_tools() -> None:
                     "(default: /app/files, override with MCPPROXY_FILES_DIR). "
                     "Use this to discover screenshots, JSON snapshots, and other files "
                     "produced by package providers such as the Playwright MCP server. "
-                    "Pass a subdirectory path to drill down."
+                    "Pass a subdirectory path to drill down. "
+                    "Each returned entry has a 'path' field (relative to the base "
+                    "files directory) — pass that value directly to mcpproxy__getfile "
+                    "to read the file. Do NOT use just the 'name' (basename) for "
+                    "nested entries, or the file will not be found."
                 ),
                 "input_schema": {
                     "type": "object",

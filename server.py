@@ -81,6 +81,11 @@ SUBPROCESS_KEYS = ("package",)
 
 ADVERTISED_NAME_SEP = "__"
 
+# Maximum wall-clock time (seconds) a single build command may run before
+# materialize_repository gives up.  Protects against users pasting a
+# long-running server start (e.g. `npm run start:dev`) into build_commands.
+BUILD_COMMAND_TIMEOUT = int(os.environ.get("MCPPROXY_BUILD_TIMEOUT", "600"))
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -362,7 +367,20 @@ def materialize_repository(spec: dict[str, Any]) -> None:
             if not cmd:
                 continue
             print(f"Running build command in {workdir}: {cmd}")
-            subprocess.run(shlex.split(cmd), cwd=workdir, check=True)
+            try:
+                subprocess.run(
+                    shlex.split(cmd),
+                    cwd=workdir,
+                    check=True,
+                    timeout=BUILD_COMMAND_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"Build command timed out after {BUILD_COMMAND_TIMEOUT}s: {cmd!r}. "
+                    "Build commands must terminate — if this is a long-running "
+                    "server command (e.g. `npm run start:dev`), move it to the "
+                    "Spawn command field instead."
+                )
     except Exception as exc:
         print(f"materialize_repository error in {source_path}: {exc}")
         traceback.print_exc()
@@ -577,9 +595,27 @@ def register_builtin_tools() -> None:
 
 register_builtin_tools()
 
+# One bad provider must not crash startup — log and continue.  Providers whose
+# setup fails (e.g. a build command exits non-zero) are still registered if
+# register_provider succeeded; broken tool invocations will surface the error
+# at call time rather than preventing the whole server from coming up.
 for provider_spec in load_provider_specs(CONFIG_DIR):
-    register_provider(provider_spec)
-    run_provider_setup(provider_spec)
+    source_path = provider_spec.get("_config_path", "<unknown>")
+    try:
+        register_provider(provider_spec)
+    except Exception as exc:
+        print(f"Skipping provider {source_path} — register_provider failed: {exc}")
+        traceback.print_exc()
+        continue
+    try:
+        run_provider_setup(provider_spec)
+    except Exception as exc:
+        print(
+            f"Provider {source_path}: setup failed ({exc}). "
+            "Tools are registered but their subprocess may not work until the "
+            "build / requirements / setup_commands are fixed (see the editor)."
+        )
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------

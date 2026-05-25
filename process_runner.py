@@ -56,8 +56,25 @@ class ProcessSession:
         assert self._proc and self._proc.stdout
         line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
         if not line:
-            raise EOFError("MCP process closed stdout")
+            # The subprocess closed stdout — usually means it crashed.  Drain
+            # stderr (best-effort, non-blocking) so the caller sees the actual
+            # cause rather than a bare "closed stdout".
+            stderr_tail = await self._drain_stderr_tail()
+            suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
+            raise EOFError(f"MCP process closed stdout{suffix}")
         return json.loads(line)
+
+    async def _drain_stderr_tail(self, max_bytes: int = 4096) -> str:
+        """Return up to ``max_bytes`` of buffered stderr from the subprocess."""
+        if not self._proc or not self._proc.stderr:
+            return ""
+        try:
+            data = await asyncio.wait_for(
+                self._proc.stderr.read(max_bytes), timeout=2.0
+            )
+        except (asyncio.TimeoutError, Exception):
+            return ""
+        return data.decode(errors="replace").strip()
 
     async def _start(self) -> None:
         env = self._build_env()

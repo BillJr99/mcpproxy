@@ -686,8 +686,8 @@ def _extract(rpc):
     return {'content': content}
 
 
-# 1. Call mcpproxy-listfiles (root directory)
-listing = _extract(_mcp_call('tools/call', {'name': 'mcpproxy-listfiles', 'arguments': {}}))
+# 1. Call mcpproxy__listfiles (root directory)
+listing = _extract(_mcp_call('tools/call', {'name': 'mcpproxy__listfiles', 'arguments': {}}))
 entries  = listing.get('entries', [])
 base_dir = listing.get('base_dir', '.playwright-mcp')
 
@@ -698,7 +698,7 @@ for entry in entries:
         continue
     fname       = entry['name']
     file_result = _extract(
-        _mcp_call('tools/call', {'name': 'mcpproxy-getfile', 'arguments': {'path': fname}})
+        _mcp_call('tools/call', {'name': 'mcpproxy__getfile', 'arguments': {'path': fname}})
     )
     files_fetched.append({
         'name':     fname,

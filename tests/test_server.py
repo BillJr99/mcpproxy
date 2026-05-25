@@ -21,14 +21,18 @@ from server import (
     SUBPROCESS_KEYS,
     _build_typed_signature,
     _get_package_command,
+    advertised_tool_name,
     build_runtime_context,
     exec_provider_code,
     load_provider_specs,
+    normalize_provider_name,
     redact_secrets,
     register_builtin_tools,
+    register_provider,
     register_tool,
     resolve_env_defaults,
     run_provider_setup,
+    tool_is_enabled,
 )
 
 
@@ -464,11 +468,11 @@ class TestRegisterBuiltinTools:
             register_builtin_tools()
 
         assert len(tool_calls) == 2
-        assert "mcpproxy-listfiles" in tool_calls
-        assert "mcpproxy-getfile" in tool_calls
+        assert "mcpproxy__listfiles" in tool_calls
+        assert "mcpproxy__getfile" in tool_calls
 
     def test_listfiles_tool_spec_has_no_required_fields(self):
-        """mcpproxy-listfiles 'path' parameter should be optional."""
+        """mcpproxy__listfiles 'path' parameter should be optional."""
         captured_specs = []
 
         def fake_decorator(**kwargs):
@@ -481,12 +485,199 @@ class TestRegisterBuiltinTools:
 
         # Find the listfiles call — it was the first one registered
         names = [s["name"] for s in captured_specs]
-        assert "mcpproxy-listfiles" in names
+        assert "mcpproxy__listfiles" in names
 
     def test_getfile_tool_spec_requires_path(self):
-        """mcpproxy-getfile should declare 'path' as a required parameter."""
+        """mcpproxy__getfile should declare 'path' as a required parameter."""
         from builtin_tools import get_file
         import inspect
         sig = inspect.signature(get_file)
         # path has no default → required
         assert sig.parameters["path"].default is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
+# normalize_provider_name / advertised_tool_name
+# ---------------------------------------------------------------------------
+
+class TestNormalizeProviderName:
+    def test_simple_lowercase(self):
+        assert normalize_provider_name("playwright") == "playwright"
+
+    def test_simple_mixed_case_preserved(self):
+        assert normalize_provider_name("MyProvider") == "MyProvider"
+
+    def test_digits_preserved(self):
+        assert normalize_provider_name("v2tool") == "v2tool"
+
+    def test_hyphen_kept_as_hyphen(self):
+        # Hyphens are outside [a-zA-Z0-9] so they get replaced with hyphens
+        # (same character — net result unchanged).
+        assert normalize_provider_name("my-provider") == "my-provider"
+
+    def test_underscore_replaced_with_hyphen(self):
+        assert normalize_provider_name("my_provider") == "my-provider"
+
+    def test_dot_replaced_with_hyphen(self):
+        assert normalize_provider_name("my.tool") == "my-tool"
+
+    def test_spaces_replaced_with_hyphen(self):
+        assert normalize_provider_name("my tool") == "my-tool"
+
+    def test_at_sign_and_slash_replaced(self):
+        assert normalize_provider_name("@scope/pkg") == "-scope-pkg"
+
+    def test_empty_string(self):
+        assert normalize_provider_name("") == ""
+
+    def test_none_treated_as_empty(self):
+        assert normalize_provider_name(None) == ""
+
+
+class TestAdvertisedToolName:
+    def test_basic_combination(self):
+        assert advertised_tool_name("playwright", "browser_navigate") == "playwright__browser_navigate"
+
+    def test_provider_normalized(self):
+        assert advertised_tool_name("my.tool", "do_thing") == "my-tool__do_thing"
+
+    def test_double_underscore_separator(self):
+        # Must always be exactly two underscores, even if the tool name
+        # already starts with one.
+        assert advertised_tool_name("p", "_internal") == "p___internal"
+
+
+# ---------------------------------------------------------------------------
+# tool_is_enabled
+# ---------------------------------------------------------------------------
+
+class TestToolIsEnabled:
+    def test_missing_field_defaults_true(self):
+        assert tool_is_enabled({"name": "t"}) is True
+
+    def test_explicit_true(self):
+        assert tool_is_enabled({"name": "t", "enabled": True}) is True
+
+    def test_explicit_false(self):
+        assert tool_is_enabled({"name": "t", "enabled": False}) is False
+
+    def test_other_truthy_values_treated_as_enabled(self):
+        # Only an explicit `False` disables; everything else is on.
+        assert tool_is_enabled({"name": "t", "enabled": 0}) is True
+        assert tool_is_enabled({"name": "t", "enabled": ""}) is True
+        assert tool_is_enabled({"name": "t", "enabled": None}) is True
+
+
+# ---------------------------------------------------------------------------
+# register_provider — name prefixing and enabled filtering
+# ---------------------------------------------------------------------------
+
+class TestRegisterProviderPrefixing:
+    def _capture_registered(self, spec):
+        names: list[str] = []
+
+        def fake_decorator(**kwargs):
+            names.append(kwargs.get("name"))
+            return lambda fn: fn
+
+        with patch("server.mcp") as mock_mcp:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_provider(spec)
+        return names
+
+    def test_code_provider_tools_are_prefixed(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "playwright.yaml"),
+            "code": "async def navigate(context, url):\n    return {'ok': True}\n",
+            "tools": [{
+                "name": "navigate",
+                "function": "navigate",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        names = self._capture_registered(spec)
+        assert names == ["playwright__navigate"]
+
+    def test_package_provider_tools_are_prefixed(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "playwright.yaml"),
+            "package": {"command": "npx @playwright/mcp@latest"},
+            "tools": [{
+                "name": "browser_navigate",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        names = self._capture_registered(spec)
+        assert names == ["playwright__browser_navigate"]
+
+    def test_provider_name_normalized(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "my.tool.yaml"),
+            "package": {"command": "echo hi"},
+            "tools": [{
+                "name": "do",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        # .stem strips the final .yaml only, leaving "my.tool" — dots → hyphens.
+        names = self._capture_registered(spec)
+        assert names == ["my-tool__do"]
+
+    def test_disabled_tool_is_skipped(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "p.yaml"),
+            "package": {"command": "echo hi"},
+            "tools": [
+                {
+                    "name": "alive",
+                    "description": "x",
+                    "enabled": True,
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                {
+                    "name": "dead",
+                    "description": "x",
+                    "enabled": False,
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+            ],
+        }
+        names = self._capture_registered(spec)
+        assert names == ["p__alive"]
+
+    def test_missing_enabled_defaults_to_registered(self, tmp_path: Path):
+        spec = {
+            "_config_path": str(tmp_path / "p.yaml"),
+            "package": {"command": "echo hi"},
+            "tools": [{
+                "name": "t",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        names = self._capture_registered(spec)
+        assert names == ["p__t"]
+
+    def test_disabled_code_tool_skipped_without_loading_handler(self, tmp_path: Path):
+        # The code block must NOT define `dead` — registration should still
+        # succeed because the disabled tool is never looked up.
+        spec = {
+            "_config_path": str(tmp_path / "p.yaml"),
+            "code": "async def alive(context):\n    return {'ok': True}\n",
+            "tools": [
+                {
+                    "name": "alive", "function": "alive", "description": "x",
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                {
+                    "name": "dead", "function": "missing_function",
+                    "description": "x", "enabled": False,
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+            ],
+        }
+        names = self._capture_registered(spec)
+        assert names == ["p__alive"]

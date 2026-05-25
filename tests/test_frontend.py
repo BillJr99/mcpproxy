@@ -56,7 +56,7 @@ CODE_PROVIDER = {
     "setup_commands": [],
     "tools": [{
         "name": "ping", "function": "ping", "description": "Ping tool",
-        "documentation": "", "parameters": [], "secrets": [],
+        "documentation": "", "enabled": True, "parameters": [], "secrets": [],
     }],
 }
 
@@ -70,7 +70,7 @@ PACKAGE_PROVIDER = {
     "setup_commands": [],
     "tools": [{
         "name": "playwright_navigate", "function": "", "description": "Navigate",
-        "documentation": "", "parameters": [
+        "documentation": "", "enabled": True, "parameters": [
             {"name": "url", "type": "string", "description": "URL", "required": True, "default": None}
         ], "secrets": [],
     }],
@@ -412,6 +412,32 @@ class TestHTML:
         assert "wzSelectType('code')" in text
         assert "wzSelectType('package')" in text
 
+    def test_no_manual_introspect_button(self, client):
+        """The 🔍 Introspect Tools button is replaced by auto-introspection."""
+        text = client.get("/").text
+        assert "wz-introspect-btn" not in text
+        assert ">🔍 Introspect Tools<" not in text
+
+    def test_no_manual_analyze_button(self, client):
+        """The 🔍 Analyze Functions button is replaced by live auto-analysis."""
+        assert ">🔍 Analyze Functions<" not in client.get("/").text
+
+    def test_html_has_discover_functions(self, client):
+        """Auto-discovery wiring is present in the JS."""
+        assert "discoverFunctions" in client.get("/").text
+
+    def test_html_has_enable_disable_helper(self, client):
+        """Per-tool enable/disable hooks are wired up in the JS."""
+        text = client.get("/").text
+        assert "setToolEnabled" in text
+        assert "knownFunctions" in text
+
+    def test_html_has_function_picker(self, client):
+        """The function-name dropdown ('Other…') is wired up."""
+        text = client.get("/").text
+        assert "onFnPick" in text
+        assert "Other…" in text
+
 
 # ---------------------------------------------------------------------------
 # Pure function tests
@@ -489,6 +515,47 @@ class TestStructuredConversion:
         assert spec["setup_commands"] == ["npx playwright install chrome"]
         structured = _provider_to_structured("p", spec)
         assert structured["setup_commands"] == ["npx playwright install chrome"]
+
+    def test_enabled_true_round_trip(self):
+        yaml_str = _structured_to_yaml(CODE_PROVIDER)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["tools"][0]["enabled"] is True
+        structured = _provider_to_structured("p", spec)
+        assert structured["tools"][0]["enabled"] is True
+
+    def test_enabled_false_round_trip(self):
+        provider = {
+            **CODE_PROVIDER,
+            "tools": [{**CODE_PROVIDER["tools"][0], "enabled": False}],
+        }
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["tools"][0]["enabled"] is False
+        structured = _provider_to_structured("p", spec)
+        assert structured["tools"][0]["enabled"] is False
+
+    def test_missing_enabled_in_yaml_defaults_true(self):
+        """A YAML that pre-dates the `enabled` field is read as enabled=True."""
+        spec = {
+            "code": "async def t(context): pass\n",
+            "tools": [{
+                "name": "t", "function": "t", "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        structured = _provider_to_structured("p", spec)
+        assert structured["tools"][0]["enabled"] is True
+
+    def test_enabled_always_written_explicitly(self):
+        """Writer always emits enabled: true|false, never omits it."""
+        yaml_str = _structured_to_yaml(CODE_PROVIDER)
+        assert "enabled: true" in yaml_str
+        provider = {
+            **CODE_PROVIDER,
+            "tools": [{**CODE_PROVIDER["tools"][0], "enabled": False}],
+        }
+        yaml_str = _structured_to_yaml(provider)
+        assert "enabled: false" in yaml_str
 
     def test_empty_requirements_omitted_from_yaml(self):
         yaml_str = _structured_to_yaml(CODE_PROVIDER)  # requirements = []

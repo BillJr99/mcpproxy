@@ -22,9 +22,14 @@ Provider YAML keys:
   setup_commands:  List of shell commands run on every server startup
                    (e.g. "npx playwright install chrome").
   tools:           List of tool declarations:
-    name           — unique MCP tool name
+    name           — unique MCP tool name (advertised as
+                     "<provider>__<name>", with the provider's filename
+                     normalized to [a-zA-Z0-9-])
     function       — async function name from code block (code providers only)
     description    — shown to the LLM
+    enabled        — optional bool, default true; when false the tool is
+                     not registered (kept in YAML so you can re-enable
+                     it without re-typing the schema)
     input_schema   — JSON Schema object
     secrets.env    — maps handler arg names to environment variable names
     auth           — arbitrary dict forwarded to context["auth"]
@@ -36,6 +41,7 @@ The HTTP frontend (UI) runs on port 8889 alongside the MCP server on 8888.
 import builtins
 import inspect
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -72,10 +78,32 @@ _JSON_TYPE_MAP: dict[str, type] = {
 
 SUBPROCESS_KEYS = ("package",)
 
+ADVERTISED_NAME_SEP = "__"
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+def normalize_provider_name(name: str) -> str:
+    """Normalize a provider name for use as a tool-name prefix.
+
+    Any character outside [a-zA-Z0-9] is replaced with a single ``-`` so the
+    result is a stable, MCP-safe identifier (callers can prepend it to a
+    tool name with ``__`` to namespace it: ``playwright__browser_navigate``).
+    """
+    return re.sub(r"[^a-zA-Z0-9]", "-", name or "")
+
+
+def advertised_tool_name(provider_name: str, tool_name: str) -> str:
+    """Return the namespaced tool name advertised to MCP clients."""
+    return f"{normalize_provider_name(provider_name)}{ADVERTISED_NAME_SEP}{tool_name}"
+
+
+def tool_is_enabled(tool_spec: dict[str, Any]) -> bool:
+    """Return False only when the spec explicitly sets ``enabled: false``."""
+    return tool_spec.get("enabled", True) is not False
+
 
 def redact_secrets(value: Any) -> Any:
     try:
@@ -198,26 +226,39 @@ def _build_typed_signature(
     return inspect.Signature(params, return_annotation=Any), annotations
 
 
-def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> None:
-    """Register a single MCP tool backed by the given async handler function."""
+def register_tool(
+    tool_spec: dict[str, Any],
+    handler: Callable[..., Any],
+    advertised_name: str | None = None,
+) -> None:
+    """Register a single MCP tool backed by the given async handler function.
+
+    ``advertised_name`` is the name shown to MCP clients (defaults to
+    ``tool_spec["name"]``).  Provider-loaded tools pass a namespaced value
+    such as ``playwright__browser_navigate`` so tools from different
+    providers cannot collide.  ``tool_spec["name"]`` itself is the
+    upstream / unprefixed name used when proxying to subprocesses.
+    """
     try:
+        exposed_name = advertised_name or tool_spec["name"]
+
         async def dynamic_tool(ctx: Context, **kwargs: Any) -> Any:
             try:
                 resolved_kwargs = resolve_env_defaults(tool_spec, kwargs)
                 runtime_context = build_runtime_context(tool_spec, ctx)
                 return await handler(context=runtime_context, **resolved_kwargs)
             except Exception as exc:
-                print(f"dynamic_tool error in {tool_spec.get('name')}: {exc}")
+                print(f"dynamic_tool error in {exposed_name}: {exc}")
                 traceback.print_exc()
-                return {"ok": False, "error": str(exc), "tool": tool_spec.get("name")}
+                return {"ok": False, "error": str(exc), "tool": exposed_name}
 
-        dynamic_tool.__name__ = tool_spec["name"]
+        dynamic_tool.__name__ = exposed_name
         sig, annotations = _build_typed_signature(tool_spec)
         dynamic_tool.__signature__ = sig          # type: ignore[attr-defined]
         dynamic_tool.__annotations__ = annotations
 
-        mcp.tool(name=tool_spec["name"], description=tool_spec.get("description", ""))(dynamic_tool)
-        print(f"Registered tool: {tool_spec['name']}")
+        mcp.tool(name=exposed_name, description=tool_spec.get("description", ""))(dynamic_tool)
+        print(f"Registered tool: {exposed_name}")
     except Exception as exc:
         print(f"register_tool error for '{tool_spec.get('name')}': {exc}")
         traceback.print_exc()
@@ -249,8 +290,16 @@ def _make_process_handler(command: str, tool_name: str) -> Callable[..., Any]:
 
 
 def register_provider(spec: dict[str, Any]) -> None:
-    """Register all tools declared in one provider spec."""
+    """Register all tools declared in one provider spec.
+
+    The advertised name of each tool is ``<provider>__<tool>``, where
+    ``<provider>`` comes from the YAML filename (normalized via
+    ``normalize_provider_name``).  Tools whose spec carries
+    ``enabled: false`` are skipped entirely — they remain in the YAML so
+    they can be flipped back on without re-typing the schema.
+    """
     source_path = spec.get("_config_path", "<unknown>")
+    provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
     try:
         command = _get_package_command(spec)
 
@@ -258,8 +307,15 @@ def register_provider(spec: dict[str, Any]) -> None:
             # ── package provider (npx / uvx / python -m / any binary) ──────────
             for tool_spec in spec.get("tools", []):
                 tool_name = tool_spec.get("name", "<unnamed>")
+                if not tool_is_enabled(tool_spec):
+                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                    continue
                 handler = _make_process_handler(command, tool_name)
-                register_tool(tool_spec, handler)
+                register_tool(
+                    tool_spec,
+                    handler,
+                    advertised_name=advertised_tool_name(provider_name, tool_name),
+                )
 
         else:
             # ── code provider ─────────────────────────────────────────────────
@@ -271,6 +327,9 @@ def register_provider(spec: dict[str, Any]) -> None:
 
             for tool_spec in tools:
                 tool_name = tool_spec.get("name", "<unnamed>")
+                if not tool_is_enabled(tool_spec):
+                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                    continue
                 function_name = tool_spec.get("function")
                 if not function_name:
                     raise ValueError(
@@ -282,7 +341,11 @@ def register_provider(spec: dict[str, Any]) -> None:
                         f"Function '{function_name}' (tool '{tool_name}') not found "
                         f"in the code block of {source_path}"
                     )
-                register_tool(tool_spec, handler)
+                register_tool(
+                    tool_spec,
+                    handler,
+                    advertised_name=advertised_tool_name(provider_name, tool_name),
+                )
 
     except Exception as exc:
         print(f"register_provider error in {source_path}: {exc}")
@@ -322,7 +385,7 @@ def run_provider_setup(spec: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def register_builtin_tools() -> None:
-    """Register the mcpproxy-listfiles and mcpproxy-getfile utility tools.
+    """Register the mcpproxy__listfiles and mcpproxy__getfile utility tools.
 
     These tools expose read-only access to the files directory (default:
     ``.playwright-mcp``, override with ``MCPPROXY_FILES_DIR``).  They are
@@ -335,7 +398,7 @@ def register_builtin_tools() -> None:
 
         register_tool(
             {
-                "name": "mcpproxy-listfiles",
+                "name": "mcpproxy__listfiles",
                 "description": (
                     "List files and directories inside the mcpproxy files directory "
                     "(default: .playwright-mcp, override with MCPPROXY_FILES_DIR). "
@@ -363,13 +426,13 @@ def register_builtin_tools() -> None:
 
         register_tool(
             {
-                "name": "mcpproxy-getfile",
+                "name": "mcpproxy__getfile",
                 "description": (
                     "Read the contents of a file from the mcpproxy files directory "
                     "(default: .playwright-mcp). "
                     "Returns UTF-8 text for text files (JSON, HTML, Markdown, …) or "
                     "base64-encoded bytes for binary files (PNG screenshots, …). "
-                    "Use mcpproxy-listfiles first to discover available file paths."
+                    "Use mcpproxy__listfiles first to discover available file paths."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -395,7 +458,7 @@ def register_builtin_tools() -> None:
             get_file,
         )
 
-        print("Registered built-in tools: mcpproxy-listfiles, mcpproxy-getfile")
+        print("Registered built-in tools: mcpproxy__listfiles, mcpproxy__getfile")
     except Exception as exc:
         print(f"register_builtin_tools error: {exc}")
         traceback.print_exc()

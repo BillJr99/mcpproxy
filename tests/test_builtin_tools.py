@@ -1,4 +1,4 @@
-"""Tests for builtin_tools.py — mcpproxy-listfiles and mcpproxy-getfile.
+"""Tests for builtin_tools.py — mcpproxy__listfiles and mcpproxy__getfile.
 
 These tests monkeypatch MCPPROXY_FILES_DIR to a fresh temp directory so
 they never touch the real .playwright-mcp directory.

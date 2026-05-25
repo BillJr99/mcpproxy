@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/mcp_interactive.sh — Generic interactive MCP tool tester + Ollama summary
+# tests/test_mcp_client.sh — Generic interactive MCP tool tester + Ollama summary
 #
 # Flow
 # ────
@@ -41,42 +41,65 @@ next_id() { _RPC_ID=$(( _RPC_ID + 1 )); printf '%d' "$_RPC_ID"; }
 
 mcp_post() {
   # mcp_post <request_file> <response_file>
+  # Sends a JSON-RPC POST; accepts both plain JSON and SSE responses.
   curl -fsS --max-time 120 \
     "${SESSION_HEADER_ARGS[@]}" \
     --data "@${1}" \
     "${MCP_URL}" > "${2}"
 }
 
-# Unwrap SSE or plain JSON-RPC, extract tool result payload
+# ── Shared Python helper: unwrap SSE or plain JSON-RPC ───────────────────────
+#
+# Written to a temp file; sourced by heredoc Python blocks via:
+#   exec(open(os.environ['_PY_LOAD_RPC']).read())
+#   rpc = load_rpc('/path/to/response_file')
+
+_PY_LOAD_RPC="${TMP_DIR}/_load_rpc.py"
+cat > "${_PY_LOAD_RPC}" <<'PYHELPER'
+def load_rpc(path):
+    """Read a file that is plain JSON-RPC or an SSE envelope; return parsed dict."""
+    import json
+    from pathlib import Path
+    raw = Path(path).read_text(encoding='utf-8').strip()
+    if not raw:
+        return {}
+    # Unwrap SSE envelope  (event: message\ndata: {...}\n\n)
+    if raw.startswith('event:') or raw.startswith('data:'):
+        for line in raw.splitlines():
+            if line.startswith('data: '):
+                raw = line[6:].strip()
+                break
+        else:
+            return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+PYHELPER
+export _PY_LOAD_RPC
+
+# Extract + normalise the payload from a tools/call response file.
 extract_tool_result() {
   local raw="$1" out="$2"
   python3 - "$raw" "$out" <<'PY'
-import sys, json
+import sys, json, os
 from pathlib import Path
 
-raw = Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+exec(open(os.environ['_PY_LOAD_RPC']).read())
+
 out = Path(sys.argv[2])
 
 def write(obj):
     out.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding='utf-8')
 
-# Unwrap SSE envelope if present
-if raw.startswith('event:') or (raw.startswith('data:') and '\n' in raw):
-    for line in raw.splitlines():
-        if line.startswith('data: '):
-            raw = line[6:].strip()
-            break
-    else:
-        write({'ok': False, 'error': 'No data: line in SSE response'}); sys.exit(0)
-
-try:
-    rpc = json.loads(raw)
-except json.JSONDecodeError as e:
-    write({'ok': False, 'error': f'JSON parse error: {e}', 'raw': raw[:300]}); sys.exit(0)
+rpc = load_rpc(sys.argv[1])
+if not rpc:
+    write({'ok': False, 'error': 'Empty or unreadable response from MCP server'}); sys.exit(0)
 
 if 'error' in rpc:
     e = rpc['error']
-    write({'ok': False, 'rpc_error': e.get('message', str(e))}); sys.exit(0)
+    write({'ok': False, 'rpc_error': e.get('message', str(e)) if isinstance(e, dict) else str(e)})
+    sys.exit(0)
 
 result  = rpc.get('result', {})
 content = result.get('content', [])
@@ -89,7 +112,7 @@ first = content[0] if isinstance(content, list) else content
 if isinstance(first, dict) and first.get('type') == 'text':
     try:
         write(json.loads(first['text']))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         write({'ok': True, 'text': first['text']})
 else:
     write({'ok': True, 'content': content})
@@ -183,7 +206,7 @@ cat > "${INIT_REQ}" <<'JSON'
   "params": {
     "protocolVersion": "2024-11-05",
     "capabilities": {},
-    "clientInfo": {"name": "mcp-interactive", "version": "0.1"}
+    "clientInfo": {"name": "test-mcp-client", "version": "0.1"}
   }
 }
 JSON
@@ -218,12 +241,16 @@ printf '{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}\n' "$(next_i
   > "${TOOLS_REQ}"
 mcp_post "${TOOLS_REQ}" "${TOOLS_RESP}"
 
-# Write tool names + descriptions to a TSV
+# Write tool names + descriptions to a TSV; handles SSE or plain JSON.
 TOOLS_TSV="${TMP_DIR}/tools.tsv"
 python3 - "${TOOLS_RESP}" "${TOOLS_TSV}" <<'PY'
-import json, sys
-r = json.load(open(sys.argv[1]))
-tools = r.get('result', {}).get('tools', [])
+import json, sys, os
+from pathlib import Path
+
+exec(open(os.environ['_PY_LOAD_RPC']).read())
+
+rpc   = load_rpc(sys.argv[1])
+tools = rpc.get('result', {}).get('tools', [])
 if not tools:
     print("no_tools", flush=True)
     sys.exit(0)
@@ -301,49 +328,84 @@ sep
 info "Parameters for '${SELECTED_TOOL}'"
 printf '\n  (* = required)\n'
 
+# Pre-seed with [] so even if the parsing block fails, the file is valid JSON.
 PARAMS_FILE="${TMP_DIR}/params.json"
+printf '[]' > "${PARAMS_FILE}"
+
 python3 - "${SELECTED_TOOL}" "${TOOLS_RESP}" "${PARAMS_FILE}" <<'PY'
-import json, sys
+import json, sys, os
+from pathlib import Path
+
+exec(open(os.environ['_PY_LOAD_RPC']).read())
 
 tool_name = sys.argv[1]
-r         = json.load(open(sys.argv[2]))
-tools     = r.get('result', {}).get('tools', [])
+rpc       = load_rpc(sys.argv[2])
+tools     = rpc.get('result', {}).get('tools', [])
 tool      = next((t for t in tools if t['name'] == tool_name), None)
 
 if not tool:
-    json.dump([], open(sys.argv[3], 'w')); sys.exit(0)
+    Path(sys.argv[3]).write_text('[]', encoding='utf-8')
+    sys.exit(0)
 
 schema = tool.get('inputSchema') or tool.get('input_schema') or {}
 props  = schema.get('properties', {})
 req    = set(schema.get('required', []))
 params = []
 for name, defn in props.items():
+    default = defn.get('default')
+    # Coerce non-JSON-serializable defaults (e.g. datetime.date from YAML) to strings
+    try:
+        json.dumps(default)
+    except (TypeError, ValueError):
+        default = str(default)
     params.append({
         'name':        name,
         'type':        defn.get('type', 'string'),
         'description': defn.get('description', ''),
         'required':    name in req,
-        'default':     defn.get('default'),
+        'default':     default,
     })
-json.dump(params, open(sys.argv[3], 'w'), indent=2)
+
+Path(sys.argv[3]).write_text(
+    json.dumps(params, indent=2, ensure_ascii=False),
+    encoding='utf-8'
+)
 PY
 
+# Read params from the file — use try/except so process-substitution failures
+# produce empty arrays instead of bare tracebacks.
 mapfile -t PNAMES < <(python3 -c "
-import json; [print(p['name']) for p in json.load(open('${PARAMS_FILE}'))]
+import json, sys
+try:
+    [print(x['name']) for x in json.load(open('${PARAMS_FILE}'))]
+except Exception as e:
+    print(f'# error: {e}', file=sys.stderr)
 ")
 mapfile -t PTYPES < <(python3 -c "
-import json; [print(p.get('type','string')) for p in json.load(open('${PARAMS_FILE}'))]
+import json, sys
+try:
+    [print(x.get('type','string')) for x in json.load(open('${PARAMS_FILE}'))]
+except Exception: pass
 ")
 mapfile -t PDESCS < <(python3 -c "
-import json; [print(p.get('description','')) for p in json.load(open('${PARAMS_FILE}'))]
+import json, sys
+try:
+    [print(x.get('description','')) for x in json.load(open('${PARAMS_FILE}'))]
+except Exception: pass
 ")
 mapfile -t PREQS  < <(python3 -c "
-import json; [print('1' if p.get('required') else '0') for p in json.load(open('${PARAMS_FILE}'))]
+import json, sys
+try:
+    [print('1' if x.get('required') else '0') for x in json.load(open('${PARAMS_FILE}'))]
+except Exception: pass
 ")
 mapfile -t PDEFS  < <(python3 -c "
-import json
-for p in json.load(open('${PARAMS_FILE}')):
-    d = p.get('default'); print('' if d is None else str(d))
+import json, sys
+try:
+    for x in json.load(open('${PARAMS_FILE}')):
+        d = x.get('default')
+        print('' if d is None else str(d))
+except Exception: pass
 ")
 
 if [[ ${#PNAMES[@]} -eq 0 ]]; then
@@ -356,10 +418,13 @@ VALS_TSV="${TMP_DIR}/values.tsv"
 
 for i in "${!PNAMES[@]}"; do
   pname="${PNAMES[$i]}"
-  ptype="${PTYPES[$i]}"
-  pdesc="${PDESCS[$i]}"
-  preq="${PREQS[$i]}"
-  pdef="${PDEFS[$i]}"
+  ptype="${PTYPES[$i]:-string}"
+  pdesc="${PDESCS[$i]:-}"
+  preq="${PREQS[$i]:-0}"
+  pdef="${PDEFS[$i]:-}"
+
+  # Skip internal error markers
+  [[ "${pname}" == "# error:"* ]] && continue
 
   printf '\n  '
   bold "${pname}"
@@ -411,12 +476,18 @@ done
 
 # ── Step 7: Build typed JSON arguments ────────────────────────────────────────
 
+# Pre-seed with {} so downstream step never sees an empty file.
 ARGS_FILE="${TMP_DIR}/call_args.json"
+printf '{}' > "${ARGS_FILE}"
+
 python3 - "${PARAMS_FILE}" "${VALS_TSV}" "${ARGS_FILE}" <<'PY'
 import json, sys
 from pathlib import Path
 
-params  = json.load(open(sys.argv[1]))
+try:
+    params = json.load(open(sys.argv[1]))
+except Exception:
+    params = []
 tsv_raw = Path(sys.argv[2]).read_text(encoding='utf-8') if Path(sys.argv[2]).exists() else ''
 
 # Map name → raw string value
@@ -448,7 +519,7 @@ for name, raw in raw_vals.items():
     else:
         args[name] = raw
 
-json.dump(args, open(sys.argv[3], 'w'), indent=2)
+Path(sys.argv[3]).write_text(json.dumps(args, indent=2), encoding='utf-8')
 PY
 
 # ── Step 8: Call the tool ─────────────────────────────────────────────────────
@@ -456,12 +527,15 @@ PY
 sep
 printf '  Calling '; bold "${SELECTED_TOOL}"; printf '…\n'
 python3 -c "
-import json
-args = json.load(open('${ARGS_FILE}'))
-if args:
-    print(f'  Arguments: {json.dumps(args, indent=2)}')
-else:
-    print('  (no arguments — secrets injected server-side)')
+import json, sys
+try:
+    args = json.load(open('${ARGS_FILE}'))
+    if args:
+        print(f'  Arguments: {json.dumps(args, indent=2)}')
+    else:
+        print('  (no arguments — secrets injected server-side)')
+except Exception as e:
+    print(f'  (could not read args: {e})', file=sys.stderr)
 "
 
 CALL_REQ="${TMP_DIR}/call_req.json"
@@ -471,11 +545,14 @@ CALL_RESULT="${TMP_DIR}/call_result.json"
 python3 - "${SELECTED_TOOL}" "${ARGS_FILE}" "${CALL_REQ}" "$(next_id)" <<'PY'
 import json, sys
 from pathlib import Path
-tool  = sys.argv[1]
-args  = json.load(open(sys.argv[2]))
-rid   = int(sys.argv[4])
-req   = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
-         "params": {"name": tool, "arguments": args}}
+tool = sys.argv[1]
+try:
+    args = json.load(open(sys.argv[2]))
+except Exception:
+    args = {}
+rid = int(sys.argv[4])
+req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+       "params": {"name": tool, "arguments": args}}
 Path(sys.argv[3]).write_text(json.dumps(req, indent=2), encoding='utf-8')
 PY
 
@@ -485,15 +562,18 @@ extract_tool_result "${CALL_RAW}" "${CALL_RESULT}"
 sep
 printf '  Result:\n\n'
 python3 -c "
-import json
-r = json.load(open('${CALL_RESULT}'))
-print(json.dumps(r, indent=2, ensure_ascii=False))
+import json, sys
+try:
+    r = json.load(open('${CALL_RESULT}'))
+    print(json.dumps(r, indent=2, ensure_ascii=False))
+except Exception as e:
+    print(f'(could not parse result: {e})', file=sys.stderr)
 "
 
 # ── Step 9: Ollama summary ────────────────────────────────────────────────────
 
 sep
-info "Asking $(bold "${OLLAMA_MODEL}") to summarise the result"
+info "Asking Ollama to summarise the result"
 
 OLLAMA_PAYLOAD="${TMP_DIR}/ollama_payload.json"
 OLLAMA_RESP="${TMP_DIR}/ollama_resp.json"
@@ -529,8 +609,11 @@ curl -fsS --max-time 300 \
 printf '\n'
 python3 -c "
 import json, sys
-r = json.load(open('${OLLAMA_RESP}', encoding='utf-8'))
-print(r.get('response', r))
+try:
+    r = json.load(open('${OLLAMA_RESP}', encoding='utf-8'))
+    print(r.get('response', r))
+except Exception as e:
+    print(f'(could not read Ollama response: {e})', file=sys.stderr)
 "
 
 sep

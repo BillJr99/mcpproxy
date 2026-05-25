@@ -26,6 +26,7 @@ __pycache__/
 *.pyd
 dist/
 *.egg-info/
+.pytest_cache/
 
 # Local tool configs (not committed — mount into Docker at runtime)
 tools/

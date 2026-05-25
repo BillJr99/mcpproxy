@@ -10,6 +10,7 @@ __pycache__/
 *.pyd
 .venv/
 *.egg-info/
+.pytest_cache/
 
 # Dev/VCS
 .git/

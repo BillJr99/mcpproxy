@@ -748,15 +748,26 @@ use a **repository provider**. mcpproxy will:
    - **Provider name** — e.g. `linkedin`.
    - **Git URL** — `https://github.com/felipfr/linkedin-mcpserver` (https or ssh).
    - **Ref** *(optional)* — branch, tag, or commit SHA. Defaults to the repo's default branch.
-   - **Build commands** — one per row, e.g. `npm install`, then `npm run build`.
-   - **Spawn command** — the stdio MCP launch command, e.g. `node dist/main.js`. Runs inside the workdir.
+   - **Build commands** — one per row. For most Node/TypeScript MCP repos: `npm install`, then `npm run build`. Click **⚡ Pre-fill Node/TS** to drop these in automatically along with the spawn command.
+   - **Spawn command** — the stdio MCP launch command. For the compiled-TS pattern above, use `node build/index.js` (the `npm run build` step compiles `src/*.ts` → `build/*.js`). Runs inside the workdir.
 3. Click **Next** — mcpproxy clones, builds, and introspects. The tool list is auto-populated.
+
+> **Recommended for Node/TypeScript repos** (covers `linkedin-mcpserver` and most fastmcp-style projects):
+>
+> | Field | Value |
+> |---|---|
+> | Build commands | `npm install`<br>`npm run build` |
+> | Spawn command | `node build/index.js` |
+>
+> The **⚡ Pre-fill Node/TS** button in the wizard's Build commands header populates all three at once.
+
+> **Do not** put `npm run start:dev`, `npm start`, or any other long-running server command in **Build commands** — those go in **Spawn command**. Build commands must terminate; mcpproxy enforces a `MCPPROXY_BUILD_TIMEOUT` (default 600s) and aborts a hanging build.
 
 #### YAML produced
 
 ```yaml
 package:
-  command: node dist/main.js          # spawn command, run inside the workdir
+  command: node build/index.js        # spawn command, run inside the workdir
 repository:
   url: https://github.com/felipfr/linkedin-mcpserver
   ref: main                           # optional
@@ -765,9 +776,9 @@ repository:
     - npm install
     - npm run build
   env_keys:                            # auto-discovered from .env.example
-    - LINKEDIN_EMAIL                   # values live in MCP_ENV_FILE
-    - LINKEDIN_PASSWORD                # (the proxy's .env) and are written
-    - LINKEDIN_LI_AT                   # into <workdir>/.env on every build / spawn
+    - LINKEDIN_CLIENT_ID               # values live in MCP_ENV_FILE
+    - LINKEDIN_CLIENT_SECRET           # (the proxy's .env) and are written
+                                       # into <workdir>/.env on every build / spawn
 tools:
   - name: search_jobs                 # advertised as linkedin__search_jobs
     description: Search LinkedIn job postings.

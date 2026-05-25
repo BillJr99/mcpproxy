@@ -1198,16 +1198,21 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <input class="form-control font-monospace" id="wz-repo-ref" placeholder="main">
           </div>
           <div class="mb-3">
-            <label class="form-label">Build commands <span class="text-muted fw-normal" style="text-transform:none">run inside the cloned workdir, in order — must terminate</span></label>
+            <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Build commands <span class="text-muted fw-normal" style="text-transform:none">run inside the cloned workdir, in order — must terminate</span></span>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="wzPrefillRepoNodeTs()" title="Pre-fill the Node/TypeScript defaults: npm install + npm run build, spawn node build/index.js">⚡ Pre-fill Node/TS</button>
+            </label>
             <div id="wz-repo-builds-container"></div>
             <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddRepoBuild()">+ Add command</button>
-            <div class="text-muted mt-1" style="font-size:.8em">e.g. <code>npm install</code>, <code>npm run build</code>. <b>Do not</b> put the long-running server start here (e.g. <code>npm run start:dev</code>) — that goes in <b>Spawn command</b>. Build commands re-run on every server start so ephemeral containers rebuild.</div>
+            <div class="text-muted mt-1" style="font-size:.8em">
+              <b>Recommended for Node/TypeScript repos</b>: <code>npm install</code> then <code>npm run build</code> (then spawn with <code>node build/index.js</code>). <b>Do not</b> put a long-running server start here (e.g. <code>npm run start:dev</code>) — that goes in <b>Spawn command</b>. Build commands re-run on every server start so ephemeral containers rebuild.
+            </div>
           </div>
           <div class="mb-3">
             <label class="form-label">Spawn command *</label>
             <input class="form-control font-monospace" id="wz-repo-cmd"
-              placeholder="node dist/main.js">
-            <div class="text-muted mt-1" style="font-size:.8em">The long-running command that launches the stdio MCP server, run from inside the workdir after the build commands complete.</div>
+              placeholder="node build/index.js">
+            <div class="text-muted mt-1" style="font-size:.8em">The long-running command that launches the stdio MCP server, run from inside the workdir after the build commands complete. Common values: <code>node build/index.js</code> (compiled TS), <code>npx tsx src/main.ts</code> (un-compiled TS), <code>python -m my_server</code>.</div>
           </div>
           <div class="text-muted" style="font-size:.8em">Clicking <b>Next</b> clones the repo, parses <code>.env.example</code> (so its keys appear as secrets on the next step), runs the build commands, then introspects the spawn command to populate the tool list. If the build fails because secrets aren't set yet, you can still continue — the next server restart will re-build with the secrets in place.</div>
           <div id="wz-repo-result" class="mt-2"></div>
@@ -2089,6 +2094,22 @@ function openWizard() {
 }
 
 function wzAddRepoBuild() { _wzListAdd('wz-repo-builds-container', 'npm install'); }
+
+// One-click Node/TypeScript defaults — covers the common case (e.g. the
+// linkedin-mcpserver / typical fastmcp-style TS repos).
+function wzPrefillRepoNodeTs() {
+  const container = document.getElementById('wz-repo-builds-container');
+  container.innerHTML = '';
+  _wzListAdd('wz-repo-builds-container', 'npm install');
+  _wzListAdd('wz-repo-builds-container', 'npm run build');
+  // Populate the two input slots we just appended
+  const inputs = container.querySelectorAll('input');
+  if (inputs.length >= 2) {
+    inputs[0].value = 'npm install';
+    inputs[1].value = 'npm run build';
+  }
+  document.getElementById('wz-repo-cmd').value = 'node build/index.js';
+}
 
 function wzSelectType(type) {
   wzType = type;

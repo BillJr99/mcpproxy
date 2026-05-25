@@ -1,5 +1,10 @@
 # mcpproxy: Config-Driven MCP Host
 
+> **⚠️ Disclaimer:** This software is **experimental** and provided **as-is**, with no
+> guarantees of security, stability, or fitness for any particular purpose. It has not
+> undergone a security audit. Do not expose it to untrusted networks or use it to handle
+> sensitive data in production. See [LICENSE](LICENSE) for the full MIT license terms.
+
 A Dockerized, config-driven MCP server with a built-in web UI.  
 Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 

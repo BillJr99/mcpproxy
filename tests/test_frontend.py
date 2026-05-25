@@ -456,6 +456,19 @@ class TestHTML:
         assert "f-repo-url" in text
         assert "build-commands-container" in text
 
+    def test_wizard_defers_provider_creation_until_secrets(self, client):
+        text = client.get("/").text
+        # New idempotent helpers must be present
+        assert "_wzRepoBuildAndIntrospect" in text
+        assert "_wzRepoFinalize" in text
+        assert "wzRepoCtx" in text
+
+    def test_wizard_uses_put_for_idempotent_create(self, client):
+        # _wzRepoFinalize must PUT to /api/tools/{name} so retries don't 409.
+        text = client.get("/").text
+        assert "PUT" in text
+        assert "/api/tools/${ctx.name}" in text or "/api/tools/" in text
+
     def test_no_manual_introspect_button(self, client):
         """The 🔍 Introspect Tools button is replaced by auto-introspection."""
         text = client.get("/").text

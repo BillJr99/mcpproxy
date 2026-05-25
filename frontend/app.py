@@ -1270,6 +1270,10 @@ let secretsModal = null, wizModal = null;
 let wzType = null;            // 'code' | 'package' | 'repository'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
+let wzRepoCtx = null;         // repository-wizard state carried across steps
+                              //   {name, command, repo_url, repo_ref,
+                              //    build_commands, workdir, env_keys, tools,
+                              //    buildOk, buildErr, introErr}
 let providersMeta = {};       // name → {missing_secrets, validation_errors}
 let knownFunctions = [];      // names available in the current provider:
                               //   code provider    → async def names in the code block
@@ -2063,7 +2067,7 @@ function wzShowStep(step) {
 }
 
 function openWizard() {
-  wzType = null; wzStep = 'type'; wzIntrospectedTools = [];
+  wzType = null; wzStep = 'type'; wzIntrospectedTools = []; wzRepoCtx = null;
   document.getElementById('wz-pkg-name').value = '';
   document.getElementById('wz-pkg-cmd').value = '';
   document.getElementById('wz-pkg-reqs-container').innerHTML = '';
@@ -2170,87 +2174,55 @@ async function wzNext() {
     if (!cmd)  { errEl.textContent = 'Spawn command is required.'; return; }
     const build_commands = _wzGetListValues('wz-repo-builds-container');
     const nextBtn = document.getElementById('wz-next-btn');
-    nextBtn.disabled = true;
     const origText = nextBtn.textContent;
     const resultEl = document.getElementById('wz-repo-result');
-    let workdir = '', env_keys = [], buildFailed = false;
+    nextBtn.disabled = true;
+
+    let result;
     try {
       nextBtn.textContent = '⏳ Cloning & building…';
       resultEl.innerHTML = '<span class="text-muted" style="font-size:.875em">Cloning repo and running build commands — this may take a while…</span>';
-      const cb = await api('POST', '/api/clone-and-build', {
-        name, repo_url: url, ref, build_commands,
-      });
-      workdir = cb.workdir || '';
-      env_keys = cb.env_keys || [];
-      if (!cb.ok) {
-        // Build failure is tolerated — we still have a workdir and the
-        // env_keys discovered from .env.example.  Surface the error and
-        // let the user continue to the Secrets step.
-        buildFailed = true;
-        resultEl.innerHTML = `<div class="text-warning" style="font-size:.875em">⚠ Build failed: ${esc(cb.error || '')}${cb.failed_command ? ` (running <code>${esc(cb.failed_command)}</code>)` : ''}.</div>`;
-        if (env_keys.length) {
-          resultEl.innerHTML += `<div style="font-size:.875em;color:var(--yellow)">Discovered ${env_keys.length} env key(s) from .env.example. Fill them in on the next step and the build will run again on the next server restart.</div>`;
-        }
-      } else {
-        resultEl.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Built in <code>${esc(workdir)}</code>${env_keys.length ? ` · Discovered ${env_keys.length} env key(s) from .env.example` : ''}</div>`;
-        nextBtn.textContent = '⏳ Introspecting…';
-        const ir = await api('POST', '/api/introspect', {
-          command: cmd, cwd: workdir, env_keys,
-        });
-        if (!ir.ok) {
-          resultEl.innerHTML += `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(ir.error||'')}). Continuing — add tools manually in the editor.</div>`;
-          wzIntrospectedTools = [];
-        } else {
-          wzIntrospectedTools = ir.tools || [];
-          resultEl.innerHTML += `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s)</div>`;
-        }
-      }
+      result = await _wzRepoBuildAndIntrospect({name, url, ref, build_commands, cmd, nextBtn});
     } catch (e) {
       errEl.textContent = e.message;
       resultEl.innerHTML = `<div class="text-danger" style="font-size:.875em">✗ ${esc(e.message)}</div>`;
-      nextBtn.disabled = false;
-      nextBtn.textContent = origText;
+      nextBtn.disabled = false; nextBtn.textContent = origText;
       return;
     } finally {
-      nextBtn.disabled = false;
-      nextBtn.textContent = origText;
+      nextBtn.disabled = false; nextBtn.textContent = origText;
     }
-    // Repository providers with a build failure may have no tools yet —
-    // add a placeholder so the create-provider validation passes.  Users
-    // can replace it once secrets are populated and the next restart
-    // builds successfully.
-    let tools;
-    if (wzIntrospectedTools.length) {
-      tools = wzIntrospectedTools.map(t => ({
-        name: t.name,
-        function: '',
-        description: t.description || '',
-        documentation: '',
-        enabled: true,
-        parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
-        secrets: [],
-      }));
+
+    // Render the outcome summary
+    const lines = [];
+    if (result.ok) {
+      lines.push(`<div style="color:var(--green);font-size:.875em">✓ Built in <code>${esc(result.workdir)}</code></div>`);
     } else {
-      tools = [{
-        name: '_placeholder', function: '',
-        description: 'Placeholder — re-introspect after the next successful build.',
-        documentation: '', enabled: false, parameters: [], secrets: [],
-      }];
+      lines.push(`<div class="text-warning" style="font-size:.875em">⚠ Build failed: ${esc(result.buildErr || '')}${result.failed_command ? ` (running <code>${esc(result.failed_command)}</code>)` : ''}.</div>`);
     }
-    const provider = {
-      name, type: 'repository', command: cmd, documentation: '', code: '',
-      repo_url: url, repo_ref: ref, workdir,
-      build_commands,
-      repo_env_keys: env_keys,
-      requirements: [], setup_commands: [],
-      tools,
+    if (result.env_keys.length) {
+      lines.push(`<div style="font-size:.875em;color:var(--yellow)">Discovered ${result.env_keys.length} env key(s) from .env.example — fill them in next.</div>`);
+    }
+    if (result.tools.length) {
+      lines.push(`<div style="color:var(--green);font-size:.875em">✓ Found ${result.tools.length} tool(s)</div>`);
+    } else if (result.introErr) {
+      lines.push(`<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(result.introErr)}).</div>`);
+    }
+    resultEl.innerHTML = lines.join('');
+
+    // Stash state — finalisation happens after the Secrets step (or
+    // immediately if no env_keys were discovered).
+    wzRepoCtx = {
+      name, command: cmd, repo_url: url, repo_ref: ref,
+      build_commands, ...result,
     };
-    try {
-      const r = await api('POST', '/api/tools', {name, provider});
-      currentName = name; currentProvider = provider;
-      loadList();
-      await wzGoSecrets(r.secret_keys || env_keys);
-    } catch(e) { errEl.textContent = e.message; }
+
+    if (result.env_keys.length) {
+      // Defer provider creation until secrets are saved so we can re-run
+      // the build with .env in place.
+      await wzGoSecrets(result.env_keys);
+    } else {
+      await _wzRepoFinalize();
+    }
     return;
   }
 
@@ -2374,9 +2346,123 @@ async function wzSaveSecretsAndFinish() {
     try { await api('POST', '/api/env', {vars}); toast(`Saved ${Object.keys(vars).length} secret(s) ✓`); }
     catch(e) { toast(e.message, false); }
   }
+
+  // Repository providers: with the secrets now in .env, retry the build
+  // (which writes <workdir>/.env from os.environ) and re-introspect, then
+  // finalise.  If the retry still fails we save anyway so the user can
+  // edit manually — much better than getting stuck on the wizard.
+  if (wzRepoCtx) {
+    const nextBtn = document.getElementById('wz-next-btn');
+    const origText = nextBtn.textContent;
+    nextBtn.disabled = true;
+    try {
+      nextBtn.textContent = '⏳ Re-building with secrets…';
+      const retry = await _wzRepoBuildAndIntrospect({
+        name: wzRepoCtx.name,
+        url: wzRepoCtx.repo_url,
+        ref: wzRepoCtx.repo_ref,
+        build_commands: wzRepoCtx.build_commands,
+        cmd: wzRepoCtx.command,
+        nextBtn,
+      });
+      Object.assign(wzRepoCtx, retry);
+      if (!retry.ok) {
+        toast(`Build still failing: ${retry.buildErr || ''}. Saving the provider anyway — use "↻ Re-clone & build" in the editor once you've fixed it.`, false);
+      } else if (retry.introErr) {
+        toast(`Build succeeded but introspection failed: ${retry.introErr}. Add tools manually in the editor.`, false);
+      } else if (retry.tools.length) {
+        toast(`Re-built ✓ · ${retry.tools.length} tool(s) introspected`);
+      }
+    } catch (e) {
+      toast(`Build retry failed: ${e.message}`, false);
+    } finally {
+      nextBtn.disabled = false; nextBtn.textContent = origText;
+    }
+    await _wzRepoFinalize();
+    return;
+  }
+
   wizModal.hide();
   await loadList();
   await openProvider(currentName);
+}
+
+// ── Repository wizard helpers ─────────────────────────────────────────────
+
+async function _wzRepoBuildAndIntrospect({name, url, ref, build_commands, cmd, nextBtn}) {
+  const cb = await api('POST', '/api/clone-and-build', {
+    name, repo_url: url, ref, build_commands,
+  });
+  const out = {
+    ok: !!cb.ok,
+    buildErr: cb.error || null,
+    failed_command: cb.failed_command || null,
+    workdir: cb.workdir || '',
+    env_keys: cb.env_keys || [],
+    tools: [],
+    introErr: null,
+  };
+  if (cb.ok && cmd) {
+    if (nextBtn) nextBtn.textContent = '⏳ Introspecting…';
+    try {
+      const ir = await api('POST', '/api/introspect', {
+        command: cmd, cwd: out.workdir, env_keys: out.env_keys,
+      });
+      if (ir.ok) out.tools = ir.tools || [];
+      else out.introErr = ir.error || 'introspection failed';
+    } catch (e) {
+      out.introErr = e.message;
+    }
+  }
+  return out;
+}
+
+// Build the provider object and PUT it (idempotent across retries).
+async function _wzRepoFinalize() {
+  const ctx = wzRepoCtx;
+  if (!ctx) return;
+  let tools;
+  if (ctx.tools && ctx.tools.length) {
+    tools = ctx.tools.map(t => ({
+      name: t.name,
+      function: '',
+      description: t.description || '',
+      documentation: '',
+      enabled: true,
+      parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
+      secrets: [],
+    }));
+  } else {
+    // No tools yet (build still failing or introspection failed).  Insert a
+    // disabled placeholder so create/update validation passes; user can
+    // replace it from the editor after fixing the build.
+    tools = [{
+      name: '_placeholder', function: '',
+      description: 'Placeholder — re-introspect once the build succeeds.',
+      documentation: '', enabled: false, parameters: [], secrets: [],
+    }];
+  }
+  const provider = {
+    name: ctx.name, type: 'repository',
+    command: ctx.command, documentation: '', code: '',
+    repo_url: ctx.repo_url, repo_ref: ctx.repo_ref, workdir: ctx.workdir,
+    build_commands: ctx.build_commands,
+    repo_env_keys: ctx.env_keys,
+    requirements: [], setup_commands: [],
+    tools,
+  };
+  try {
+    // PUT is idempotent — creates if missing, replaces if present.  This
+    // makes the wizard safe to retry without 409 collisions.
+    await api('PUT', `/api/tools/${ctx.name}`, {provider});
+    currentName = ctx.name; currentProvider = provider;
+  } catch (e) {
+    toast(e.message, false);
+  }
+  wzRepoCtx = null;
+  wizModal.hide();
+  await loadList();
+  if (currentName) await openProvider(currentName);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

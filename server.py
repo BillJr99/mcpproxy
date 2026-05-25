@@ -540,7 +540,25 @@ def register_builtin_tools() -> None:
                                 "Omit or pass an empty string to list the root."
                             ),
                             "default": "",
-                        }
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": (
+                                "If true (default), also list files inside subdirectories. "
+                                "Directories themselves are still listed as entries with "
+                                "type='directory'. Symlinks to directories are not followed. "
+                                "Set to false for a shallow (one-level) listing."
+                            ),
+                            "default": True,
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": (
+                                "Maximum recursion depth when recursive=true "
+                                "(1 = immediate children only). Omit for unlimited."
+                            ),
+                            "minimum": 1,
+                        },
                     },
                     "required": [],
                 },

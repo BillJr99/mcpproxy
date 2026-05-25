@@ -48,11 +48,22 @@ def _safe_resolve(relative: str | None) -> Path:
 async def list_files(
     context: dict[str, Any],
     path: str | None = None,
+    recursive: bool = True,
+    max_depth: int | None = None,
 ) -> dict[str, Any]:
     """List files and subdirectories at *path* inside the files base directory.
 
-    Returns a JSON object with an ``entries`` list; each entry has ``name``,
-    ``type`` (``"file"`` or ``"directory"``), and ``size`` (bytes, files only).
+    Returns a JSON object with an ``entries`` list; each entry has ``name``
+    (basename), ``path`` (relative to the listed directory, using ``/`` as the
+    separator), ``type`` (``"file"`` or ``"directory"``), and ``size`` (bytes,
+    files only).
+
+    When *recursive* is true (default), descends into subdirectories. Each
+    directory is still emitted as its own entry (with ``type="directory"``)
+    before its children. *max_depth* limits the recursion depth (``1`` =
+    immediate children only, same as ``recursive=False``; ``None`` = unlimited).
+    Symlinks to directories are not followed, to avoid cycles.
+
     If the directory does not exist yet the entries list is empty (not an error).
     """
     try:
@@ -63,23 +74,36 @@ async def list_files(
                 "ok": True,
                 "base_dir": str(base),
                 "path": path or "",
+                "recursive": recursive,
                 "entries": [],
             }
         if not target.is_dir():
             return {"ok": False, "error": f"'{path}' is not a directory"}
+
         entries: list[dict[str, Any]] = []
-        for entry in sorted(target.iterdir()):
-            entries.append(
-                {
-                    "name": entry.name,
-                    "type": "directory" if entry.is_dir() else "file",
-                    "size": entry.stat().st_size if entry.is_file() else None,
-                }
-            )
+
+        def _walk(directory: Path, depth: int) -> None:
+            for entry in sorted(directory.iterdir()):
+                is_dir = entry.is_dir() and not entry.is_symlink()
+                rel = entry.relative_to(target).as_posix()
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "path": rel,
+                        "type": "directory" if is_dir else "file",
+                        "size": entry.stat().st_size if entry.is_file() else None,
+                    }
+                )
+                if recursive and is_dir and (max_depth is None or depth + 1 < max_depth):
+                    _walk(entry, depth + 1)
+
+        _walk(target, 0)
+
         return {
             "ok": True,
             "base_dir": str(base),
             "path": path or "",
+            "recursive": recursive,
             "entries": entries,
         }
     except Exception as exc:

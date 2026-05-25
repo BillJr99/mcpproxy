@@ -1,10 +1,28 @@
-# Base compose file — uses named Docker volumes for tools.
+# Base compose file — uses named Docker volumes for tools, artefacts, and caches.
 # Suitable for production / CI / any environment without the repo checked out.
 #
 # handlers/ is baked into the image — no volume needed.
 #
 # Populate tools volume before first run:
 #   docker run --rm -v mcpproxy-tools:/dst -v "$(pwd)/tools":/src alpine cp -r /src/. /dst/
+#
+# Volumes
+# ───────
+# mcpproxy-tools    /app/tools                — provider YAML configs (required)
+# mcpproxy-files    /app/files                — provider output artefacts surfaced via
+#                                               mcpproxy__listfiles / mcpproxy__getfile
+#                                               (e.g. Playwright screenshots under
+#                                               /app/files/playwright)
+# mcpproxy-repos    /app/repos                — git workdirs + build artefacts for
+#                                               repository-mode providers
+# mcpproxy-cache    /root/.cache              — XDG cache (pip wheels, uv wheels,
+#                                               Playwright browser binaries, …)
+# mcpproxy-npm      /root/.npm                — npm/npx package cache
+# mcpproxy-uv-tools /root/.local/share/uv     — uvx per-tool venvs
+#
+# Every cache/artefact volume is optional in spirit — remove the entry and the
+# container falls back to ephemeral storage on its writable layer (re-clones,
+# re-downloads, re-builds on each fresh container).
 #
 # For local development, docker-compose.override.yml is merged automatically.
 
@@ -19,9 +37,21 @@ services:
     environment:
       MCP_TOOL_CONFIG_DIR: "/app/tools"
       MCP_ENV_FILE: "/app/.env"
+      MCPPROXY_FILES_DIR: "/app/files"
+      MCPPROXY_REPOS_DIR: "/app/repos"
     volumes:
       - mcpproxy-tools:/app/tools
+      - mcpproxy-files:/app/files
+      - mcpproxy-repos:/app/repos
+      - mcpproxy-cache:/root/.cache
+      - mcpproxy-npm:/root/.npm
+      - mcpproxy-uv-tools:/root/.local/share/uv
       - ./.env:/app/.env
 
 volumes:
   mcpproxy-tools:
+  mcpproxy-files:
+  mcpproxy-repos:
+  mcpproxy-cache:
+  mcpproxy-npm:
+  mcpproxy-uv-tools:

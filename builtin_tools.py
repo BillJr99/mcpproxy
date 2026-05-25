@@ -5,9 +5,9 @@ no YAML config file required.
   mcpproxy__listfiles   List files/directories inside the mcpproxy files dir.
   mcpproxy__getfile     Read a file from the mcpproxy files dir (text or base64).
 
-The *base directory* defaults to ``.playwright-mcp`` (relative to the server's
-working directory) and can be overridden at runtime with the
-``MCPPROXY_FILES_DIR`` environment variable.  Only files **inside** the base
+The *base directory* defaults to ``/app/files`` (mounted as a Docker volume so
+artefacts persist across container restarts) and can be overridden at runtime with
+the ``MCPPROXY_FILES_DIR`` environment variable.  Only files **inside** the base
 directory are accessible — path-traversal attempts are rejected.
 """
 
@@ -23,7 +23,7 @@ def _base_dir() -> Path:
     Evaluated on each call so that tests can override MCPPROXY_FILES_DIR
     with monkeypatch without restarting the process.
     """
-    raw = os.environ.get("MCPPROXY_FILES_DIR", ".playwright-mcp")
+    raw = os.environ.get("MCPPROXY_FILES_DIR", "/app/files")
     return Path(raw).resolve()
 
 

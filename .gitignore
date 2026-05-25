@@ -31,5 +31,9 @@ dist/
 # Local tool configs (not committed — mount into Docker at runtime)
 tools/
 
-# Playwright MCP browser data
+# Local bind-mount targets for docker-compose.override.yml
+files/
+repos/
+
+# Legacy Playwright MCP output directory (replaced by ./files in docker-compose)
 .playwright-mcp/

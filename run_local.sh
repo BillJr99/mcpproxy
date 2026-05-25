@@ -327,6 +327,10 @@ set +a
 export MCP_TOOL_CONFIG_DIR="$ROOT_DIR/tools"   # local path always wins
 export MCP_SERVER_NAME="${MCP_SERVER_NAME:-mcpproxy}"
 export MCP_ENV_FILE="$ENV_FILE"
+# Local-friendly defaults for the files / repos directories.  In Docker these
+# default to /app/files and /app/repos (see Dockerfile + docker-compose.yml).
+export MCPPROXY_FILES_DIR="${MCPPROXY_FILES_DIR:-$ROOT_DIR/files}"
+export MCPPROXY_REPOS_DIR="${MCPPROXY_REPOS_DIR:-$ROOT_DIR/repos}"
 unset MCP_REPOS_DIR  # no longer used
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -899,7 +899,7 @@ def _extract(rpc):
 # 1. Call mcpproxy__listfiles (root directory)
 listing = _extract(_call_tool('mcpproxy__listfiles', {}))
 entries  = listing.get('entries', [])
-base_dir = listing.get('base_dir', '.playwright-mcp')
+base_dir = listing.get('base_dir', '/app/files')
 
 # 2. Fetch every file entry
 files_fetched = []
@@ -936,7 +936,7 @@ python3 -c "
 import json, sys
 try:
     d = json.load(open('${FILES_DATA}', encoding='utf-8'))
-    base_dir = d.get('base_dir', '.playwright-mcp')
+    base_dir = d.get('base_dir', '/app/files')
     entries  = d.get('entries',  [])
     files    = d.get('files',    [])
 
@@ -993,7 +993,7 @@ files_data   = json.loads(Path(sys.argv[3]).read_text(encoding='utf-8'))
 out          = Path(sys.argv[4])
 model        = sys.argv[5]
 
-base_dir = files_data.get('base_dir', '.playwright-mcp')
+base_dir = files_data.get('base_dir', '/app/files')
 files    = files_data.get('files', [])
 
 sections = []

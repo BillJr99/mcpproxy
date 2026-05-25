@@ -617,5 +617,229 @@ except Exception as e:
 "
 
 sep
+
+# ── Step 10: List files in the mcpproxy files directory ───────────────────────
+
+info "Listing files produced in the mcpproxy files directory"
+
+FILES_DATA="${TMP_DIR}/files_data.json"
+
+# One Python block handles all MCP calls (listfiles + one getfile per entry)
+# so we avoid bash escaping issues with arbitrary file names.
+python3 - "${MCP_URL}" "${SESSION_ID:-}" "$(( _RPC_ID + 1 ))" "${FILES_DATA}" <<'PY'
+import json, sys, urllib.request, urllib.error
+from pathlib import Path
+
+mcp_url    = sys.argv[1]
+session_id = sys.argv[2]
+rpc_id     = int(sys.argv[3])
+out_path   = Path(sys.argv[4])
+
+
+def _mcp_call(method, params):
+    global rpc_id
+    rid = rpc_id
+    rpc_id += 1
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+    }
+    if session_id:
+        headers['Mcp-Session-Id'] = session_id
+    body = json.dumps(
+        {'jsonrpc': '2.0', 'id': rid, 'method': method, 'params': params}
+    ).encode()
+    req = urllib.request.Request(mcp_url, data=body, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode('utf-8')
+    except urllib.error.HTTPError as exc:
+        return {'error': {'code': exc.code, 'message': str(exc)}}
+    # Unwrap SSE envelope (event: message\ndata: {...}\n\n)
+    if raw.lstrip().startswith(('event:', 'data:')):
+        for line in raw.splitlines():
+            if line.startswith('data: '):
+                raw = line[6:].strip()
+                break
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _extract(rpc):
+    """Unwrap a tools/call JSON-RPC response to its payload dict."""
+    if 'error' in rpc:
+        e = rpc['error']
+        msg = e.get('message', str(e)) if isinstance(e, dict) else str(e)
+        return {'ok': False, 'error': msg}
+    result  = rpc.get('result', {})
+    content = result.get('content', [])
+    if not content:
+        return result if isinstance(result, dict) else {'raw': result}
+    first = content[0] if isinstance(content, list) else content
+    if isinstance(first, dict) and first.get('type') == 'text':
+        try:
+            return json.loads(first['text'])
+        except (json.JSONDecodeError, TypeError):
+            return {'text': first['text']}
+    return {'content': content}
+
+
+# 1. Call mcpproxy-listfiles (root directory)
+listing = _extract(_mcp_call('tools/call', {'name': 'mcpproxy-listfiles', 'arguments': {}}))
+entries  = listing.get('entries', [])
+base_dir = listing.get('base_dir', '.playwright-mcp')
+
+# 2. Fetch every file entry
+files_fetched = []
+for entry in entries:
+    if entry.get('type') != 'file':
+        continue
+    fname       = entry['name']
+    file_result = _extract(
+        _mcp_call('tools/call', {'name': 'mcpproxy-getfile', 'arguments': {'path': fname}})
+    )
+    files_fetched.append({
+        'name':     fname,
+        'size':     entry.get('size'),
+        'ok':       file_result.get('ok', True),
+        'encoding': file_result.get('encoding', 'text'),
+        'content':  file_result.get('content', ''),
+        'error':    file_result.get('error', ''),
+    })
+
+out_path.write_text(
+    json.dumps({
+        'ok':       listing.get('ok', True),
+        'base_dir': base_dir,
+        'entries':  entries,
+        'files':    files_fetched,
+    }, indent=2, ensure_ascii=False),
+    encoding='utf-8',
+)
+PY
+
+# Display listing + fetch status
+printf '\n'
+python3 -c "
+import json, sys
+try:
+    d = json.load(open('${FILES_DATA}', encoding='utf-8'))
+    base_dir = d.get('base_dir', '.playwright-mcp')
+    entries  = d.get('entries',  [])
+    files    = d.get('files',    [])
+
+    if not entries:
+        print(f'  (no files found in {base_dir})')
+    else:
+        print(f'  Base directory: {base_dir}')
+        print()
+        for e in entries:
+            icon = '📁' if e.get('type') == 'directory' else '📄'
+            size = f\" ({e['size']} bytes)\" if e.get('size') is not None else ''
+            print(f\"  {icon}  {e['name']}{size}\")
+        print()
+        for f in files:
+            if f.get('error'):
+                print(f\"  ✗  {f['name']}  — {f['error']}\")
+            elif f.get('encoding') == 'base64':
+                print(f\"  ✓  {f['name']}  [binary, {f.get('size','?')} bytes]\")
+            else:
+                preview = f.get('content','')[:80].replace('\n',' ')
+                ellipsis = '…' if len(f.get('content','')) > 80 else ''
+                print(f\"  ✓  {f['name']}  →  {preview}{ellipsis}\")
+except Exception as e:
+    print(f'  (could not display file data: {e})', file=sys.stderr)
+"
+
+# ── Step 11: Ollama summary of file contents ──────────────────────────────────
+
+HAS_FILES="$(python3 -c "
+import json
+try:
+    d = json.load(open('${FILES_DATA}', encoding='utf-8'))
+    print('yes' if d.get('files') else 'no')
+except Exception:
+    print('no')
+")"
+
+if [[ "${HAS_FILES}" == "yes" ]]; then
+
+  sep
+  info "Asking Ollama to summarise the file contents"
+
+  OLLAMA_FILES_PAYLOAD="${TMP_DIR}/ollama_files_payload.json"
+  OLLAMA_FILES_RESP="${TMP_DIR}/ollama_files_resp.json"
+
+  python3 - "${SELECTED_TOOL}" "${CALL_RESULT}" "${FILES_DATA}" \
+            "${OLLAMA_FILES_PAYLOAD}" "${OLLAMA_MODEL}" <<'PY'
+import json, sys
+from pathlib import Path
+
+tool         = sys.argv[1]
+orig_result  = Path(sys.argv[2]).read_text(encoding='utf-8')
+files_data   = json.loads(Path(sys.argv[3]).read_text(encoding='utf-8'))
+out          = Path(sys.argv[4])
+model        = sys.argv[5]
+
+base_dir = files_data.get('base_dir', '.playwright-mcp')
+files    = files_data.get('files', [])
+
+sections = []
+for f in files:
+    fname = f['name']
+    if f.get('error'):
+        sections.append(f"--- {fname} (error: {f['error']}) ---")
+    elif f.get('encoding') == 'base64':
+        sections.append(
+            f"--- {fname} [binary file, {f.get('size', '?')} bytes — content omitted] ---"
+        )
+    else:
+        content = f.get('content', '')
+        if len(content) > 4000:
+            content = content[:4000] + '\n…[truncated]'
+        sections.append(f"--- {fname} ---\n{content}")
+
+files_block = '\n\n'.join(sections) if sections else 'No files retrieved.'
+
+prompt = (
+    f"You just called the MCP tool '{tool}'.\n\n"
+    f"Original tool result:\n{orig_result}\n\n"
+    f"The following files were found in the mcpproxy files directory ({base_dir}) "
+    f"and retrieved for you:\n\n"
+    f"{files_block}\n\n"
+    "Please summarise what was produced. For each file, describe its contents or "
+    "purpose. For binary files (e.g. PNG screenshots), note their presence and size. "
+    "For text files (JSON snapshots, HTML, logs, etc.), describe what they contain. "
+    "Relate the files back to the tool call where relevant. Be concise."
+)
+
+out.write_text(
+    json.dumps({"model": model, "prompt": prompt, "stream": False}),
+    encoding='utf-8',
+)
+PY
+
+  curl -fsS --max-time 300 \
+    -H 'Content-Type: application/json' \
+    --data "@${OLLAMA_FILES_PAYLOAD}" \
+    "${OLLAMA_URL}/api/generate" > "${OLLAMA_FILES_RESP}"
+
+  printf '\n'
+  python3 -c "
+import json
+try:
+    r = json.load(open('${OLLAMA_FILES_RESP}', encoding='utf-8'))
+    print(r.get('response', r))
+except Exception as e:
+    print(f'(could not read Ollama response: {e})', file=sys.stderr)
+"
+
+else
+  printf '\n  No files found — nothing to summarise.\n'
+fi
+
+sep
 ok "Done."
 printf '\n'

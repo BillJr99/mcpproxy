@@ -70,9 +70,7 @@ _JSON_TYPE_MAP: dict[str, type] = {
     "array": list,
 }
 
-# Keys that indicate a subprocess/package provider (in priority order).
-# "npx" is kept for backward compatibility with existing YAML files.
-SUBPROCESS_KEYS = ("package", "npx")
+SUBPROCESS_KEYS = ("package",)
 
 
 # ---------------------------------------------------------------------------
@@ -227,16 +225,10 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
 
 
 def _get_package_command(spec: dict[str, Any]) -> str | None:
-    """Return the spawn command for package providers, or None for code providers.
-
-    Checks ``package:`` first, then ``npx:`` for backward compatibility with
-    existing YAML configs that used the old key name.
-    """
-    for key in SUBPROCESS_KEYS:
-        sub = spec.get(key)
-        if sub:
-            command = (sub.get("command") or "").strip()
-            return command or None
+    """Return the spawn command for package providers, or None for code providers."""
+    sub = spec.get("package")
+    if sub:
+        return (sub.get("command") or "").strip() or None
     return None
 
 

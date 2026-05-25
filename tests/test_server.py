@@ -341,18 +341,6 @@ class TestGetPackageCommand:
         spec = {"package": {"command": "npx @playwright/mcp@latest --isolated"}}
         assert _get_package_command(spec) == "npx @playwright/mcp@latest --isolated"
 
-    def test_npx_key_backward_compat(self):
-        """Legacy 'npx:' key must still be recognised."""
-        spec = {"npx": {"command": "npx @playwright/mcp@latest"}}
-        assert _get_package_command(spec) == "npx @playwright/mcp@latest"
-
-    def test_package_key_takes_priority_over_npx(self):
-        spec = {
-            "package": {"command": "uvx mcp-server-fetch"},
-            "npx": {"command": "npx something"},
-        }
-        assert _get_package_command(spec) == "uvx mcp-server-fetch"
-
     def test_uvx_command(self):
         spec = {"package": {"command": "uvx mcp-server-fetch"}}
         assert _get_package_command(spec) == "uvx mcp-server-fetch"
@@ -380,9 +368,8 @@ class TestGetPackageCommand:
         spec = {"package": {"command": "   "}}
         assert _get_package_command(spec) is None
 
-    def test_subprocess_keys_constant_includes_both(self):
-        assert "package" in SUBPROCESS_KEYS
-        assert "npx" in SUBPROCESS_KEYS
+    def test_subprocess_keys_constant(self):
+        assert SUBPROCESS_KEYS == ("package",)
 
 
 # ---------------------------------------------------------------------------

@@ -694,9 +694,6 @@ tools: []
 The server spawns the process, performs the MCP handshake once, then forwards every tool
 call to it. The process is reused across calls (started lazily on the first tool call).
 
-**Backward compatibility:** The legacy `npx:` key still works and is treated identically
-to `package:`. Saving the provider through the UI rewrites it to `package:` format.
-
 ### pip Requirements vs setup_commands
 
 | Feature | Use for |
@@ -803,6 +800,3 @@ tools:
       any_key: any_value
 ```
 
-> **Legacy `npx:` key:** still accepted for backward compatibility. Existing configs
-> with `npx: {command: ...}` continue to work unchanged; saving through the UI rewrites
-> them to `package:` format.

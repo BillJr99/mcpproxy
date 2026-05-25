@@ -104,23 +104,6 @@ class TestListTools:
         assert data[0]["is_package"] is True
         assert data[0]["provider_type"] == "package"
 
-    def test_is_npx_backward_compat_alias(self, app, tools_dir):
-        """is_npx must still be present and equal is_package."""
-        content = _structured_to_yaml(PACKAGE_PROVIDER)
-        (tools_dir / "playwright.yaml").write_text(content)
-        r = TestClient(app).get("/api/tools")
-        d = r.json()[0]
-        assert d["is_npx"] == d["is_package"]
-
-    def test_legacy_npx_key_listed_as_package(self, app, tools_dir):
-        """A YAML with the legacy 'npx:' key is shown as a package provider."""
-        spec = {
-            "npx": {"command": "npx @playwright/mcp@latest"},
-            "tools": [{"name": "nav", "description": "Navigate", "input_schema": {"type": "object", "properties": {}, "required": []}}],
-        }
-        (tools_dir / "legacy.yaml").write_text(yaml.dump(spec))
-        r = TestClient(app).get("/api/tools")
-        assert r.json()[0]["is_package"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -147,18 +130,6 @@ class TestGetTool:
         assert data["type"] == "package"
         assert "command" in data
         assert data["command"] == "npx @playwright/mcp@latest --isolated"
-
-    def test_legacy_npx_key_returns_package_type(self, app, tools_dir):
-        """GET on a YAML with legacy 'npx:' key returns type='package'."""
-        spec = {
-            "npx": {"command": "npx @playwright/mcp@latest"},
-            "tools": [{"name": "nav", "description": "Nav", "input_schema": {"type": "object", "properties": {}, "required": []}}],
-        }
-        (tools_dir / "legacy.yaml").write_text(yaml.dump(spec))
-        r = TestClient(app).get("/api/tools/legacy")
-        data = r.json()
-        assert data["type"] == "package"
-        assert data["command"] == "npx @playwright/mcp@latest"
 
     def test_requirements_and_setup_commands_returned(self, app, tools_dir):
         provider = {
@@ -493,16 +464,6 @@ class TestStructuredConversion:
         spec = yaml.safe_load(yaml_str)
         assert "package" in spec
         assert "npx" not in spec
-
-    def test_legacy_npx_key_reads_as_package(self):
-        """Loading a YAML with the old 'npx:' key returns type='package'."""
-        spec = {
-            "npx": {"command": "npx @playwright/mcp@latest"},
-            "tools": [],
-        }
-        structured = _provider_to_structured("legacy", spec)
-        assert structured["type"] == "package"
-        assert structured["command"] == "npx @playwright/mcp@latest"
 
     def test_parameters_preserved(self):
         yaml_str = _structured_to_yaml(PACKAGE_PROVIDER)

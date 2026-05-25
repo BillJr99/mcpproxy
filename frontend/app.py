@@ -111,17 +111,9 @@ def _detect_package_manager(command: str) -> str:
 # Structured ↔ YAML conversion
 # ---------------------------------------------------------------------------
 
-# Legacy "npx:" key is kept for backward compatibility.
-_SUBPROCESS_KEYS = ("package", "npx")
-
-
 def _get_package_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the subprocess sub-dict (package: or npx:), or None for code providers."""
-    for key in _SUBPROCESS_KEYS:
-        sub = spec.get(key)
-        if sub:
-            return sub
-    return None
+    """Return the subprocess sub-dict (package:), or None for code providers."""
+    return spec.get("package") or None
 
 
 def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -341,7 +333,6 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                     "tool_names": [t.get("name") for t in tool_entries],
                     "provider_type": structured["type"],
                     "is_package": is_package,
-                    "is_npx": is_package,   # backward-compat alias
                     "secret_keys": secret_keys,
                     "missing_secrets": missing_secrets,
                     "validation_errors": validation["errors"],
@@ -924,7 +915,7 @@ async function loadList() {
       const alertRow = (warnBadge || errBadge)
         ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}</div>`
         : '';
-      const isPkg = p.is_package || p.is_npx;
+      const isPkg = p.is_package;
       return `
       <div class="provider-item ${p.name === currentName ? 'active' : ''}" onclick="openProvider('${p.name}')">
         <div style="min-width:0">

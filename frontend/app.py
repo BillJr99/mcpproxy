@@ -10,12 +10,11 @@ POST /api/tools                 — create provider from structured JSON
 PUT  /api/tools/{name}          — update provider from structured JSON
 DELETE /api/tools/{name}        — delete provider YAML
 POST /api/validate              — validate structured provider {provider}
-POST /api/introspect-npx        — run npx command, return tools list
+POST /api/introspect            — spawn command, run requirements/setup, return tools list
 POST /api/extract-functions     — parse Python code for async functions
 GET  /api/env                   — list .env vars (values masked)
 POST /api/env                   — upsert vars into .env  {vars: {KEY: VALUE}}
 POST /api/restart               — send SIGTERM to restart server
-POST /api/run-command           — stream a shell command's output as SSE
 """
 
 import ast
@@ -23,7 +22,10 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
+import subprocess
+import sys
 import textwrap
 import threading
 import traceback
@@ -88,8 +90,39 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Package manager detection (for logging / display — execution is identical)
+# ---------------------------------------------------------------------------
+
+def _detect_package_manager(command: str) -> str:
+    """Identify the package manager from the first token of a command string."""
+    first = command.strip().split()[0] if command.strip() else ""
+    if first == "npx":
+        return "npx"
+    if first == "uvx":
+        return "uvx"
+    if first in ("python", "python3"):
+        return "pip"
+    if first == "npm":
+        return "npm"
+    return "command"
+
+
+# ---------------------------------------------------------------------------
 # Structured ↔ YAML conversion
 # ---------------------------------------------------------------------------
+
+# Legacy "npx:" key is kept for backward compatibility.
+_SUBPROCESS_KEYS = ("package", "npx")
+
+
+def _get_package_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the subprocess sub-dict (package: or npx:), or None for code providers."""
+    for key in _SUBPROCESS_KEYS:
+        sub = spec.get(key)
+        if sub:
+            return sub
+    return None
+
 
 def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     """Convert a loaded YAML spec into the structured JSON the UI works with."""
@@ -119,12 +152,22 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
             "secrets": secrets,
         })
 
+    pkg_sub = _get_package_spec(spec)
+    if pkg_sub is not None:
+        ptype = "package"
+        command = (pkg_sub.get("command") or "").strip()
+    else:
+        ptype = "code"
+        command = ""
+
     return {
         "name": name,
         "documentation": spec.get("documentation", ""),
-        "type": "npx" if spec.get("npx") else "code",
-        "npx_command": (spec.get("npx") or {}).get("command", ""),
+        "type": ptype,
+        "command": command,
         "code": spec.get("code", ""),
+        "requirements": list(spec.get("requirements") or []),
+        "setup_commands": list(spec.get("setup_commands") or []),
         "tools": tools_out,
     }
 
@@ -139,12 +182,20 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
 
     ptype = provider.get("type", "code")
 
-    if ptype == "npx":
-        spec["npx"] = {"command": (provider.get("npx_command") or "").strip()}
+    if ptype == "package":
+        spec["package"] = {"command": (provider.get("command") or "").strip()}
     else:
         code = (provider.get("code") or "").strip()
         if code:
             spec["code"] = code + "\n"
+
+    requirements = [r for r in (provider.get("requirements") or []) if r]
+    if requirements:
+        spec["requirements"] = requirements
+
+    setup_commands = [c for c in (provider.get("setup_commands") or []) if c]
+    if setup_commands:
+        spec["setup_commands"] = setup_commands
 
     tools_out = []
     for t in provider.get("tools", []):
@@ -188,12 +239,20 @@ def _validate_provider(provider: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     ptype = provider.get("type", "code")
 
-    if ptype == "npx":
-        if not (provider.get("npx_command") or "").strip():
-            errors.append("npx_command is required for npx providers")
+    if ptype == "package":
+        if not (provider.get("command") or "").strip():
+            errors.append("command is required for package providers")
     else:
         if not (provider.get("code") or "").strip():
             errors.append("code is required for code providers")
+
+    requirements = provider.get("requirements")
+    if requirements is not None and not isinstance(requirements, list):
+        errors.append("requirements must be a list")
+
+    setup_commands = provider.get("setup_commands")
+    if setup_commands is not None and not isinstance(setup_commands, list):
+        errors.append("setup_commands must be a list")
 
     tools = provider.get("tools", [])
     if not tools:
@@ -274,12 +333,15 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                 missing_secrets = [k for k in secret_keys if not env_vars.get(k)]
                 structured = _provider_to_structured(path.stem, spec)
                 validation = _validate_provider(structured)
+                is_package = bool(_get_package_spec(spec))
                 out.append({
                     "name": path.stem,
                     "file": path.name,
                     "tool_count": len(tool_entries),
                     "tool_names": [t.get("name") for t in tool_entries],
-                    "is_npx": bool(spec.get("npx")),
+                    "provider_type": structured["type"],
+                    "is_package": is_package,
+                    "is_npx": is_package,   # backward-compat alias
                     "secret_keys": secret_keys,
                     "missing_secrets": missing_secrets,
                     "validation_errors": validation["errors"],
@@ -345,20 +407,52 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         provider = body.get("provider") or body
         return _validate_provider(provider)
 
-    # ── npx introspection ────────────────────────────────────────────────────
+    # ── Package introspection ─────────────────────────────────────────────────
 
-    @app.post("/api/introspect-npx")
-    async def introspect_npx(request: Request) -> dict:
+    @app.post("/api/introspect")
+    async def introspect_package(request: Request) -> dict:
+        """Introspect any stdio MCP server command.
+
+        Accepts:
+          command        — the command to run (required)
+          requirements   — list of pip packages to install first (optional)
+          setup_commands — list of shell commands to run before spawning (optional)
+
+        Auto-detects the package manager from the command prefix (npx, uvx,
+        python, etc.) for logging purposes; execution is identical for all.
+        """
         body = await request.json()
         command = (body.get("command") or "").strip()
+        requirements: list[str] = body.get("requirements") or []
+        setup_commands: list[str] = body.get("setup_commands") or []
         if not command:
             raise HTTPException(400, "command is required")
+
+        pm = _detect_package_manager(command)
+
         try:
-            from npx_runner import introspect
+            # 1. Install pip requirements
+            for req in requirements:
+                if not req:
+                    continue
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", req],
+                    check=True,
+                )
+
+            # 2. Run setup commands
+            for cmd in setup_commands:
+                if not cmd:
+                    continue
+                subprocess.run(shlex.split(cmd), check=True)
+
+            # 3. Introspect the MCP server
+            from process_runner import introspect
             tools = await introspect(command)
-            return {"ok": True, "tools": tools}
+            return {"ok": True, "tools": tools, "package_manager": pm}
         except Exception as exc:
-            return {"ok": False, "error": str(exc), "tools": []}
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "tools": [], "package_manager": pm}
 
     # ── Function extractor (code providers) ──────────────────────────────────
 
@@ -402,50 +496,6 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                 pass
         threading.Thread(target=_send, daemon=True).start()
         return {"ok": True}
-
-    # ── Command runner (SSE streaming) ────────────────────────────────────────
-
-    @app.post("/api/run-command")
-    async def run_command(request: Request) -> StreamingResponse:
-        body = await request.json()
-        command = (body.get("command") or "").strip()
-        if not command:
-            raise HTTPException(400, "command is required")
-
-        async def _generate():
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                assert proc.stdout is not None
-                while True:
-                    try:
-                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=300.0)
-                    except asyncio.TimeoutError:
-                        yield f"data: {json.dumps({'error': 'Timed out after 5 min', 'done': True, 'returncode': -1})}\n\n"
-                        proc.kill()
-                        return
-                    if not line:
-                        break
-                    yield f"data: {json.dumps({'line': line.decode(errors='replace').rstrip()})}\n\n"
-                await proc.wait()
-                yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode})}\n\n"
-            except Exception as exc:
-                if proc is not None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                yield f"data: {json.dumps({'error': str(exc), 'done': True, 'returncode': -1})}\n\n"
-
-        return StreamingResponse(
-            _generate(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
 
     # ── HTML UI ───────────────────────────────────────────────────────────────
 
@@ -499,12 +549,13 @@ body{background:var(--bg);color:#cdd6f4;min-height:100vh;font-size:14px}
 /* param rows */
 .param-row{display:grid;grid-template-columns:1fr 120px 2fr auto;gap:8px;align-items:start;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px}
 .secret-row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px}
+.list-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-bottom:6px}
 /* CodeMirror */
 .CodeMirror{height:260px;font-size:13px;border-radius:0 0 6px 6px;font-family:'JetBrains Mono',Consolas,monospace;border:1px solid #45475a;border-top:none}
 .cm-wrap{border:1px solid #45475a;border-radius:6px;overflow:hidden}
 .cm-label{background:#313244;padding:4px 10px;font-size:.75em;color:var(--muted);border:1px solid #45475a;border-bottom:none;border-radius:6px 6px 0 0;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
 /* badges */
-.badge-npx{background:#cba6f7;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-pkg{background:#cba6f7;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-code{background:#89b4fa;color:#1e1e2e;font-size:.65em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-count{background:#45475a;color:#cdd6f4;font-size:.65em;padding:2px 6px;border-radius:3px}
 /* modal */
@@ -580,7 +631,6 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <h6 id="editor-title" class="mb-0 fw-semibold" style="color:#cdd6f4"></h6>
           <div class="d-flex gap-2">
             <button class="btn btn-sm btn-outline-info" onclick="openSecretsModal()">🔑 Secrets</button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="openCmdModal()">🛠 Run Command</button>
             <button class="btn btn-sm btn-primary" onclick="saveProvider()">Save</button>
             <button class="btn btn-sm btn-outline-danger" onclick="deleteProvider()">Delete</button>
           </div>
@@ -612,11 +662,13 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <textarea id="f-documentation" class="form-control" rows="3" placeholder="Describe what this provider does, its tools, any usage notes…" style="font-size:.875em;resize:vertical"></textarea>
         </div>
 
-        <!-- npx command box (npx providers) -->
-        <div class="section-box" id="npx-box" style="display:none">
-          <div class="section-title">📦 NPX Command</div>
-          <input id="f-npx-command" class="form-control font-monospace" placeholder="npx @playwright/mcp@latest --isolated" style="font-size:.875em">
-          <div class="mt-2 text-muted" style="font-size:.8em">The MCP server started by this command handles all tool calls. The server is started on demand and kept alive between calls.</div>
+        <!-- Package command box -->
+        <div class="section-box" id="package-box" style="display:none">
+          <div class="section-title">📦 Package Command</div>
+          <input id="f-command" class="form-control font-monospace"
+            placeholder="npx @playwright/mcp@latest --isolated  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github  ·  mcp-server-github"
+            style="font-size:.875em">
+          <div class="mt-2 text-muted" style="font-size:.8em">Any command that spawns a stdio MCP server: <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or an installed binary. The process is started on demand and kept alive between calls.</div>
         </div>
 
         <!-- Code box (code providers) -->
@@ -624,6 +676,26 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div class="section-title">🐍 Python Code</div>
           <div class="cm-label">code</div>
           <textarea id="f-code"></textarea>
+        </div>
+
+        <!-- Requirements box (both types) -->
+        <div class="section-box">
+          <div class="section-title">
+            📦 pip Requirements <span class="text-muted fw-normal" style="text-transform:none;letter-spacing:0;font-size:.9em">optional</span>
+            <button class="btn btn-sm btn-outline-secondary py-0" onclick="addRequirement()">+ Add</button>
+          </div>
+          <div id="requirements-container"></div>
+          <div class="text-muted" style="font-size:.8em">pip packages installed before the server starts (e.g. <code>httpx</code>, <code>requests==2.32.0</code>)</div>
+        </div>
+
+        <!-- Setup Commands box (both types) -->
+        <div class="section-box">
+          <div class="section-title">
+            ⚙ Setup Commands <span class="text-muted fw-normal" style="text-transform:none;letter-spacing:0;font-size:.9em">optional</span>
+            <button class="btn btn-sm btn-outline-secondary py-0" onclick="addSetupCommand()">+ Add</button>
+          </div>
+          <div id="setup-commands-container"></div>
+          <div class="text-muted" style="font-size:.8em">Shell commands run automatically on every server startup (e.g. <code>npx playwright install chrome</code>)</div>
         </div>
 
         <!-- Tools box -->
@@ -682,32 +754,45 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">🐍</div>
                   <h6 class="mt-2">Python Code</h6>
-                  <small class="text-muted">Write async Python functions — each one becomes an MCP tool</small>
+                  <small class="text-muted">Write <code>async def</code> functions — each one becomes an MCP tool</small>
                 </div>
               </div>
             </div>
             <div class="col-md-6">
-              <div class="card wizard-choice h-100" onclick="wzSelectType('npx')">
+              <div class="card wizard-choice h-100" onclick="wzSelectType('package')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">📦</div>
-                  <h6 class="mt-2">NPX Package</h6>
-                  <small class="text-muted">Supply an <code>npx</code> command — the server introspects the MCP tools automatically</small>
+                  <h6 class="mt-2">Package</h6>
+                  <small class="text-muted">Run an existing MCP server via <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or any command — tools are auto-detected</small>
                 </div>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- Step: npx command -->
-        <div id="wz-npx" class="wizard-step">
+        <!-- Step: package command -->
+        <div id="wz-package" class="wizard-step">
           <div class="mb-3">
             <label class="form-label">Provider name</label>
-            <input class="form-control" id="wz-npx-name" placeholder="playwright">
+            <input class="form-control" id="wz-pkg-name" placeholder="playwright">
           </div>
           <div class="mb-3">
-            <label class="form-label">NPX command *</label>
-            <input class="form-control font-monospace" id="wz-npx-cmd" placeholder="npx @playwright/mcp@latest --isolated">
-            <div class="text-muted mt-1" style="font-size:.8em">The full command used to start the MCP server process.</div>
+            <label class="form-label">Command *</label>
+            <input class="form-control font-monospace" id="wz-pkg-cmd"
+              placeholder="npx @playwright/mcp@latest  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github">
+            <div class="text-muted mt-1" style="font-size:.8em">Any command that spawns a stdio MCP server (npx, uvx, python -m, or an installed binary).</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">pip Requirements <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
+            <div id="wz-pkg-reqs-container"></div>
+            <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddReq()">+ Add requirement</button>
+            <div class="text-muted mt-1" style="font-size:.8em">pip packages installed before introspection and on every server restart.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Setup Commands <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
+            <div id="wz-pkg-cmds-container"></div>
+            <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddSetupCmd()">+ Add command</button>
+            <div class="text-muted mt-1" style="font-size:.8em">Shell commands run on every server startup (e.g. <code>npx playwright install chrome</code>).</div>
           </div>
           <button class="btn btn-sm btn-outline-info" id="wz-introspect-btn" onclick="wzIntrospect()">🔍 Introspect Tools</button>
           <div id="wz-introspect-result" class="mt-2"></div>
@@ -723,6 +808,16 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <label class="form-label">Python code — paste <code>async def</code> functions</label>
             <textarea id="wz-code-input" class="form-control font-monospace" rows="10"
               placeholder="async def my_tool(context, query: str) -> dict:&#10;    return {'ok': True, 'result': query}"></textarea>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">pip Requirements <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
+            <div id="wz-code-reqs-container"></div>
+            <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddCodeReq()">+ Add requirement</button>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Setup Commands <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
+            <div id="wz-code-cmds-container"></div>
+            <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddCodeSetupCmd()">+ Add command</button>
           </div>
           <button class="btn btn-sm btn-outline-info" onclick="wzAnalyze()">🔍 Analyze Functions</button>
           <div id="wz-analyze-result" class="mt-2" style="font-size:.85em"></div>
@@ -746,35 +841,6 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
-<!-- Command runner modal -->
-<div class="modal fade" id="cmd-modal" tabindex="-1">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title">🛠 Run Command</h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-      </div>
-      <div class="modal-body">
-        <p class="text-muted" style="font-size:.85em">Runs in the server process environment (inside Docker if you're using the container). Output streams live.</p>
-        <div class="d-flex gap-2 mb-2">
-          <input class="form-control font-monospace" id="cmd-input"
-            placeholder="npx playwright install chrome"
-            onkeydown="if(event.key==='Enter'&&!cmdRunning)runCommand()">
-          <button class="btn btn-primary" id="cmd-run-btn" onclick="runCommand()" style="white-space:nowrap">▶ Run</button>
-        </div>
-        <div id="cmd-suggestions" class="d-flex gap-1 flex-wrap mb-2"></div>
-        <div id="cmd-output"
-          style="background:#0d0d0d;border:1px solid var(--border);border-radius:6px;padding:10px;min-height:180px;max-height:380px;overflow-y:auto;font-family:'JetBrains Mono',Consolas,monospace;font-size:.8em;white-space:pre-wrap;word-break:break-all;color:#a6e3a1"></div>
-        <div id="cmd-status" class="mt-1" style="font-size:.8em;color:var(--muted)"></div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-sm btn-outline-secondary" onclick="clearCmdOutput()">Clear</button>
-        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
-      </div>
-    </div>
-  </div>
-</div>
-
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -785,13 +851,11 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
-let secretsModal = null, wizModal = null, cmdModal = null;
-let wzType = null;            // 'code' | 'npx'
+let secretsModal = null, wizModal = null;
+let wzType = null;            // 'code' | 'package'
 let wzStep = 'type';
-let wzIntrospectedTools = []; // tools returned by introspect-npx
+let wzIntrospectedTools = []; // tools returned by introspect
 let providersMeta = {};       // name → {missing_secrets, validation_errors}
-let cmdRunning = false;
-let cmdAbortController = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Boot
@@ -803,7 +867,6 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   secretsModal = new bootstrap.Modal('#secrets-modal');
   wizModal     = new bootstrap.Modal('#wizard-modal');
-  cmdModal     = new bootstrap.Modal('#cmd-modal');
   loadList();
 });
 
@@ -861,6 +924,7 @@ async function loadList() {
       const alertRow = (warnBadge || errBadge)
         ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}</div>`
         : '';
+      const isPkg = p.is_package || p.is_npx;
       return `
       <div class="provider-item ${p.name === currentName ? 'active' : ''}" onclick="openProvider('${p.name}')">
         <div style="min-width:0">
@@ -871,7 +935,7 @@ async function loadList() {
           ${alertRow}
         </div>
         <div class="d-flex flex-column gap-1 align-items-end ms-1 flex-shrink-0">
-          <span class="${p.is_npx ? 'badge-npx' : 'badge-code'}">${p.is_npx ? 'npx' : 'code'}</span>
+          <span class="${isPkg ? 'badge-pkg' : 'badge-code'}">${isPkg ? 'pkg' : 'code'}</span>
           <span class="badge-count">${p.tool_count}</span>
         </div>
       </div>`;
@@ -926,36 +990,99 @@ function _refreshEditorBars(name) {
 }
 
 function renderProvider(p) {
-  document.getElementById('editor-title').textContent = p.name + (p.type === 'npx' ? ' (npx)' : ' (code)');
+  const isPkg = p.type === 'package';
+  document.getElementById('editor-title').textContent = p.name + (isPkg ? ' (package)' : ' (code)');
   document.getElementById('f-documentation').value = p.documentation || '';
 
-  const isNpx = p.type === 'npx';
-  document.getElementById('npx-box').style.display = isNpx ? '' : 'none';
-  document.getElementById('code-box').style.display = isNpx ? 'none' : '';
+  document.getElementById('package-box').style.display = isPkg ? '' : 'none';
+  document.getElementById('code-box').style.display = isPkg ? 'none' : '';
 
-  if (isNpx) {
-    document.getElementById('f-npx-command').value = p.npx_command || '';
+  if (isPkg) {
+    document.getElementById('f-command').value = p.command || '';
   } else {
     codeEditor.setValue(p.code || '');
     setTimeout(() => codeEditor.refresh(), 50);
   }
 
-  renderTools(p.tools || [], isNpx);
+  renderRequirements(p.requirements || []);
+  renderSetupCommands(p.setup_commands || []);
+  renderTools(p.tools || [], isPkg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Requirements and Setup Commands rendering
+// ─────────────────────────────────────────────────────────────────────────────
+function renderRequirements(reqs) {
+  const c = document.getElementById('requirements-container');
+  if (!reqs.length) { c.innerHTML = ''; return; }
+  c.innerHTML = reqs.map((r, i) => `
+    <div class="list-row" id="req-row-${i}">
+      <input class="form-control form-control-sm font-monospace" placeholder="package-name==1.2.3"
+        value="${esc(r)}" oninput="updateRequirement(${i},this.value)">
+      <button class="btn-icon" onclick="removeRequirement(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function renderSetupCommands(cmds) {
+  const c = document.getElementById('setup-commands-container');
+  if (!cmds.length) { c.innerHTML = ''; return; }
+  c.innerHTML = cmds.map((cmd, i) => `
+    <div class="list-row" id="sc-row-${i}">
+      <input class="form-control form-control-sm font-monospace" placeholder="npx playwright install chrome"
+        value="${esc(cmd)}" oninput="updateSetupCommand(${i},this.value)">
+      <button class="btn-icon" onclick="removeSetupCommand(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function addRequirement() {
+  ensureProvider();
+  currentProvider.requirements = currentProvider.requirements || [];
+  currentProvider.requirements.push('');
+  renderRequirements(currentProvider.requirements);
+}
+
+function removeRequirement(i) {
+  ensureProvider();
+  currentProvider.requirements.splice(i, 1);
+  renderRequirements(currentProvider.requirements);
+}
+
+function updateRequirement(i, val) {
+  ensureProvider();
+  currentProvider.requirements[i] = val;
+}
+
+function addSetupCommand() {
+  ensureProvider();
+  currentProvider.setup_commands = currentProvider.setup_commands || [];
+  currentProvider.setup_commands.push('');
+  renderSetupCommands(currentProvider.setup_commands);
+}
+
+function removeSetupCommand(i) {
+  ensureProvider();
+  currentProvider.setup_commands.splice(i, 1);
+  renderSetupCommands(currentProvider.setup_commands);
+}
+
+function updateSetupCommand(i, val) {
+  ensureProvider();
+  currentProvider.setup_commands[i] = val;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tools rendering
 // ─────────────────────────────────────────────────────────────────────────────
-function renderTools(tools, isNpx) {
+function renderTools(tools, isPkg) {
   const container = document.getElementById('tools-container');
   if (!tools.length) {
     container.innerHTML = '<div class="empty-state" style="padding:16px">No tools yet — click <b>+ Add Tool</b>.</div>';
     return;
   }
-  container.innerHTML = tools.map((t, i) => renderToolCard(t, i, isNpx)).join('');
+  container.innerHTML = tools.map((t, i) => renderToolCard(t, i, isPkg)).join('');
 }
 
-function renderToolCard(t, i, isNpx) {
+function renderToolCard(t, i, isPkg) {
   const params = (t.parameters || []).map((p, j) => `
     <div class="param-row" id="param-${i}-${j}">
       <input class="form-control form-control-sm" placeholder="name" value="${esc(p.name)}"
@@ -984,7 +1111,7 @@ function renderToolCard(t, i, isNpx) {
       <button class="btn-icon" onclick="removeSecret(${i},${k})" title="Remove">✕</button>
     </div>`).join('');
 
-  const fnField = isNpx ? '' : `
+  const fnField = isPkg ? '' : `
     <div class="mb-2">
       <label class="form-label">Function name</label>
       <input class="form-control form-control-sm font-monospace" placeholder="my_function" value="${esc(t.function||'')}"
@@ -1047,11 +1174,14 @@ function ensureProvider() {
 function collectProvider() {
   const p = JSON.parse(JSON.stringify(currentProvider));
   p.documentation = document.getElementById('f-documentation').value;
-  if (p.type === 'npx') {
-    p.npx_command = document.getElementById('f-npx-command').value.trim();
+  if (p.type === 'package') {
+    p.command = document.getElementById('f-command').value.trim();
   } else {
     p.code = codeEditor.getValue();
   }
+  // requirements and setup_commands are kept in currentProvider (updated live via oninput)
+  p.requirements = (currentProvider.requirements || []).filter(r => r.trim());
+  p.setup_commands = (currentProvider.setup_commands || []).filter(c => c.trim());
   return p;
 }
 
@@ -1072,43 +1202,42 @@ function updateSecret(ti, si, field, val) {
 
 function addTool() {
   ensureProvider();
-  const isNpx = currentProvider.type === 'npx';
+  const isPkg = currentProvider.type === 'package';
   currentProvider.tools.push({
     name: '', function: '', description: '', documentation: '',
     parameters: [], secrets: [],
   });
-  renderTools(currentProvider.tools, isNpx);
+  renderTools(currentProvider.tools, isPkg);
 }
 
 function removeTool(i) {
   ensureProvider();
   currentProvider.tools.splice(i, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'npx');
+  renderTools(currentProvider.tools, currentProvider.type === 'package');
 }
 
 function addParam(ti) {
   ensureProvider();
   currentProvider.tools[ti].parameters.push({name:'',type:'string',description:'',required:false,default:null});
-  const isNpx = currentProvider.type === 'npx';
-  renderTools(currentProvider.tools, isNpx);
+  renderTools(currentProvider.tools, currentProvider.type === 'package');
 }
 
 function removeParam(ti, pi) {
   ensureProvider();
   currentProvider.tools[ti].parameters.splice(pi, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'npx');
+  renderTools(currentProvider.tools, currentProvider.type === 'package');
 }
 
 function addSecret(ti) {
   ensureProvider();
   currentProvider.tools[ti].secrets.push({arg:'',env:''});
-  renderTools(currentProvider.tools, currentProvider.type === 'npx');
+  renderTools(currentProvider.tools, currentProvider.type === 'package');
 }
 
 function removeSecret(ti, si) {
   ensureProvider();
   currentProvider.tools[ti].secrets.splice(si, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'npx');
+  renderTools(currentProvider.tools, currentProvider.type === 'package');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1152,7 +1281,6 @@ async function openSecretsModal() {
   document.getElementById('secrets-provider-name').textContent = currentName;
   const env = await api('GET', '/api/env').catch(() => ({vars:{}, env_file:'.env'}));
   document.getElementById('secrets-env-path').textContent = env.env_file || '.env';
-  // Collect all declared secret env var names from in-memory tools
   const keys = [];
   for (const t of currentProvider.tools) {
     for (const s of (t.secrets || [])) {
@@ -1199,7 +1327,7 @@ async function saveSecrets() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Wizard
 // ─────────────────────────────────────────────────────────────────────────────
-const WZ_STEPS = ['type','npx','code','secrets'];
+const WZ_STEPS = ['type','package','code','secrets'];
 
 function wzShowStep(step) {
   WZ_STEPS.forEach(s => {
@@ -1214,10 +1342,14 @@ function wzShowStep(step) {
 
 function openWizard() {
   wzType = null; wzStep = 'type'; wzIntrospectedTools = [];
-  document.getElementById('wz-npx-name').value = '';
-  document.getElementById('wz-npx-cmd').value = '';
+  document.getElementById('wz-pkg-name').value = '';
+  document.getElementById('wz-pkg-cmd').value = '';
+  document.getElementById('wz-pkg-reqs-container').innerHTML = '';
+  document.getElementById('wz-pkg-cmds-container').innerHTML = '';
   document.getElementById('wz-code-name').value = '';
   document.getElementById('wz-code-input').value = '';
+  document.getElementById('wz-code-reqs-container').innerHTML = '';
+  document.getElementById('wz-code-cmds-container').innerHTML = '';
   document.getElementById('wz-introspect-result').innerHTML = '';
   document.getElementById('wz-analyze-result').innerHTML = '';
   wzShowStep('type');
@@ -1231,21 +1363,43 @@ function wzSelectType(type) {
   setTimeout(() => wzShowStep(type), 120);
 }
 
+// Wizard requirement/setup-command list helpers
+function _wzListAdd(containerId, placeholder) {
+  const c = document.getElementById(containerId);
+  const idx = c.children.length;
+  const div = document.createElement('div');
+  div.className = 'list-row mt-1';
+  div.innerHTML = `<input class="form-control form-control-sm font-monospace" placeholder="${placeholder}">
+    <button class="btn-icon" onclick="this.parentElement.remove()" title="Remove">✕</button>`;
+  c.appendChild(div);
+}
+function wzAddReq()          { _wzListAdd('wz-pkg-reqs-container',  'requests==2.32.0'); }
+function wzAddSetupCmd()     { _wzListAdd('wz-pkg-cmds-container',  'npx playwright install chrome'); }
+function wzAddCodeReq()      { _wzListAdd('wz-code-reqs-container', 'httpx'); }
+function wzAddCodeSetupCmd() { _wzListAdd('wz-code-cmds-container', 'python -m playwright install chromium'); }
+
+function _wzGetListValues(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} input`))
+    .map(el => el.value.trim()).filter(Boolean);
+}
+
 async function wzNext() {
   const errEl = document.getElementById('wz-error');
   errEl.textContent = '';
 
-  if (wzStep === 'type') return; // handled by card click
+  if (wzStep === 'type') return;
 
-  if (wzStep === 'npx') {
-    const name = document.getElementById('wz-npx-name').value.trim();
-    const cmd  = document.getElementById('wz-npx-cmd').value.trim();
+  if (wzStep === 'package') {
+    const name = document.getElementById('wz-pkg-name').value.trim();
+    const cmd  = document.getElementById('wz-pkg-cmd').value.trim();
     if (!name) { errEl.textContent = 'Provider name is required.'; return; }
-    if (!cmd)  { errEl.textContent = 'NPX command is required.'; return; }
+    if (!cmd)  { errEl.textContent = 'Command is required.'; return; }
     if (!wzIntrospectedTools.length) { errEl.textContent = 'Click "Introspect Tools" first.'; return; }
-    // Create the provider
+    const requirements   = _wzGetListValues('wz-pkg-reqs-container');
+    const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
     const provider = {
-      name, type: 'npx', npx_command: cmd, documentation: '', code: '',
+      name, type: 'package', command: cmd, documentation: '', code: '',
+      requirements, setup_commands,
       tools: wzIntrospectedTools.map(t => ({
         name: t.name,
         function: '',
@@ -1269,10 +1423,12 @@ async function wzNext() {
     const code = document.getElementById('wz-code-input').value;
     if (!name) { errEl.textContent = 'Provider name is required.'; return; }
     if (!code.trim()) { errEl.textContent = 'Code is required.'; return; }
-    // Build tools from analyzed functions
+    const requirements   = _wzGetListValues('wz-code-reqs-container');
+    const setup_commands = _wzGetListValues('wz-code-cmds-container');
     const fns = await _analyzeFns(code);
     const provider = {
-      name, type: 'code', npx_command: '', documentation: '', code,
+      name, type: 'code', command: '', documentation: '', code,
+      requirements, setup_commands,
       tools: fns.map(fn => ({
         name: fn.name, function: fn.name,
         description: `TODO — describe what ${fn.name} does`,
@@ -1296,19 +1452,21 @@ async function wzNext() {
 }
 
 function wzBack() {
-  const map = {npx:'type', code:'type', secrets: wzType||'type'};
+  const map = {package:'type', code:'type', secrets: wzType||'type'};
   wzShowStep(map[wzStep] || 'type');
 }
 
 async function wzIntrospect() {
-  const cmd = document.getElementById('wz-npx-cmd').value.trim();
-  const el  = document.getElementById('wz-introspect-result');
-  const btn = document.getElementById('wz-introspect-btn');
-  if (!cmd) { el.innerHTML = '<span class="text-danger">Enter an npx command first.</span>'; return; }
+  const cmd  = document.getElementById('wz-pkg-cmd').value.trim();
+  const el   = document.getElementById('wz-introspect-result');
+  const btn  = document.getElementById('wz-introspect-btn');
+  if (!cmd) { el.innerHTML = '<span class="text-danger">Enter a command first.</span>'; return; }
+  const requirements   = _wzGetListValues('wz-pkg-reqs-container');
+  const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
   btn.disabled = true; btn.textContent = '⏳ Introspecting…';
-  el.innerHTML = '<span class="text-muted">Running npx — this may take a moment on first use…</span>';
+  el.innerHTML = '<span class="text-muted">Running — this may take a moment on first use…</span>';
   try {
-    const r = await api('POST', '/api/introspect-npx', {command: cmd});
+    const r = await api('POST', '/api/introspect', {command: cmd, requirements, setup_commands});
     if (!r.ok) throw new Error(r.error || 'Introspection failed');
     wzIntrospectedTools = r.tools || [];
     el.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s): <b>${wzIntrospectedTools.map(t=>t.name).join(', ')}</b></div>`;
@@ -1375,7 +1533,7 @@ async function wzSaveSecretsAndFinish() {
     catch(e) { toast(e.message, false); }
   }
   wizModal.hide();
-  await loadList();  // refresh providersMeta before openProvider reads it
+  await loadList();
   await openProvider(currentName);
 }
 
@@ -1396,133 +1554,6 @@ function _schemaToParams(schema) {
     required: required.has(name),
     default: def.default ?? null,
   }));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Command runner
-// ─────────────────────────────────────────────────────────────────────────────
-function openCmdModal() {
-  // Build context-aware suggestions
-  const suggestions = [];
-  if (currentProvider) {
-    const npxCmd = (currentProvider.npx_command || '').toLowerCase();
-    if (npxCmd.includes('playwright')) {
-      suggestions.push('npx playwright install chrome');
-      suggestions.push('npx playwright install --with-deps chromium');
-      suggestions.push('npx playwright install');
-    }
-    // Generic: show current npx command with --help
-    if (currentProvider.type === 'npx' && currentProvider.npx_command) {
-      const base = currentProvider.npx_command.trim();
-      suggestions.push(base + ' --help');
-    }
-  }
-  suggestions.push('node --version');
-  suggestions.push('npx --version');
-  suggestions.push('which npx');
-
-  const suggestEl = document.getElementById('cmd-suggestions');
-  suggestEl.innerHTML = suggestions.map(s =>
-    `<button class="btn btn-sm btn-outline-secondary py-0 px-2 font-monospace"
-      style="font-size:.75em" onclick="document.getElementById('cmd-input').value=${JSON.stringify(s)}">${esc(s)}</button>`
-  ).join('');
-
-  clearCmdOutput();
-  cmdModal.show();
-  setTimeout(() => document.getElementById('cmd-input').focus(), 300);
-}
-
-function clearCmdOutput() {
-  document.getElementById('cmd-output').textContent = '';
-  document.getElementById('cmd-status').textContent = '';
-  document.getElementById('cmd-status').style.color = 'var(--muted)';
-}
-
-async function runCommand() {
-  // If already running, cancel it
-  if (cmdRunning) {
-    if (cmdAbortController) cmdAbortController.abort();
-    return;
-  }
-
-  const command = document.getElementById('cmd-input').value.trim();
-  if (!command) return;
-
-  const outEl    = document.getElementById('cmd-output');
-  const statusEl = document.getElementById('cmd-status');
-  const btn      = document.getElementById('cmd-run-btn');
-
-  outEl.textContent = `$ ${command}\n`;
-  statusEl.textContent = 'Running…';
-  statusEl.style.color = 'var(--muted)';
-  btn.textContent = '⏹ Stop';
-  btn.classList.replace('btn-primary', 'btn-danger');
-  cmdRunning = true;
-  cmdAbortController = new AbortController();
-
-  try {
-    const response = await fetch('/api/run-command', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command}),
-      signal: cmdAbortController.signal,
-    });
-
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      outEl.textContent += `Error: ${data.detail || response.statusText}\n`;
-      return;
-    }
-
-    const reader  = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, {stream: true});
-      const parts = buffer.split('\n');
-      buffer = parts.pop(); // keep any incomplete line
-
-      for (const part of parts) {
-        if (!part.startsWith('data: ')) continue;
-        let data;
-        try { data = JSON.parse(part.slice(6)); } catch { continue; }
-
-        if (data.line !== undefined) {
-          outEl.textContent += data.line + '\n';
-          outEl.scrollTop = outEl.scrollHeight;
-        }
-        if (data.error && data.line === undefined) {
-          outEl.textContent += `Error: ${data.error}\n`;
-        }
-        if (data.done) {
-          const ok = data.returncode === 0;
-          statusEl.textContent = ok
-            ? `✓ Exited 0`
-            : `✗ Exited ${data.returncode}`;
-          statusEl.style.color = ok ? 'var(--green)' : 'var(--red)';
-          outEl.scrollTop = outEl.scrollHeight;
-        }
-      }
-    }
-  } catch (e) {
-    if (e.name === 'AbortError') {
-      outEl.textContent += '\n[Cancelled]\n';
-      statusEl.textContent = 'Cancelled';
-      statusEl.style.color = 'var(--yellow)';
-    } else {
-      outEl.textContent += `\n[Connection error: ${e.message}]\n`;
-      statusEl.textContent = 'Error';
-      statusEl.style.color = 'var(--red)';
-    }
-  } finally {
-    cmdRunning = false;
-    cmdAbortController = null;
-    btn.textContent = '▶ Run';
-    btn.classList.replace('btn-danger', 'btn-primary');
-  }
 }
 </script>
 </body>

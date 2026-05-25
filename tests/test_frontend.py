@@ -1,11 +1,13 @@
 """Unit tests for the HTTP frontend (frontend/app.py)."""
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from frontend.app import (
+    _detect_package_manager,
     _extract_functions,
     _extract_secret_env_keys,
     _provider_to_structured,
@@ -48,20 +50,24 @@ CODE_PROVIDER = {
     "name": "myprovider",
     "type": "code",
     "documentation": "",
-    "npx_command": "",
+    "command": "",
     "code": "async def ping(context, msg='hi'):\n    return {'ok': True}\n",
+    "requirements": [],
+    "setup_commands": [],
     "tools": [{
         "name": "ping", "function": "ping", "description": "Ping tool",
         "documentation": "", "parameters": [], "secrets": [],
     }],
 }
 
-NPX_PROVIDER = {
+PACKAGE_PROVIDER = {
     "name": "playwright",
-    "type": "npx",
+    "type": "package",
     "documentation": "",
-    "npx_command": "npx @playwright/mcp@latest --isolated",
+    "command": "npx @playwright/mcp@latest --isolated",
     "code": "",
+    "requirements": [],
+    "setup_commands": [],
     "tools": [{
         "name": "playwright_navigate", "function": "", "description": "Navigate",
         "documentation": "", "parameters": [
@@ -87,13 +93,34 @@ class TestListTools:
         data = r.json()
         assert len(data) == 1
         assert data[0]["name"] == "myprovider"
-        assert data[0]["is_npx"] is False
+        assert data[0]["is_package"] is False
+        assert data[0]["provider_type"] == "code"
 
-    def test_lists_npx_provider(self, app, tools_dir):
-        content = _structured_to_yaml(NPX_PROVIDER)
+    def test_lists_package_provider(self, app, tools_dir):
+        content = _structured_to_yaml(PACKAGE_PROVIDER)
         (tools_dir / "playwright.yaml").write_text(content)
         r = TestClient(app).get("/api/tools")
-        assert r.json()[0]["is_npx"] is True
+        data = r.json()
+        assert data[0]["is_package"] is True
+        assert data[0]["provider_type"] == "package"
+
+    def test_is_npx_backward_compat_alias(self, app, tools_dir):
+        """is_npx must still be present and equal is_package."""
+        content = _structured_to_yaml(PACKAGE_PROVIDER)
+        (tools_dir / "playwright.yaml").write_text(content)
+        r = TestClient(app).get("/api/tools")
+        d = r.json()[0]
+        assert d["is_npx"] == d["is_package"]
+
+    def test_legacy_npx_key_listed_as_package(self, app, tools_dir):
+        """A YAML with the legacy 'npx:' key is shown as a package provider."""
+        spec = {
+            "npx": {"command": "npx @playwright/mcp@latest"},
+            "tools": [{"name": "nav", "description": "Navigate", "input_schema": {"type": "object", "properties": {}, "required": []}}],
+        }
+        (tools_dir / "legacy.yaml").write_text(yaml.dump(spec))
+        r = TestClient(app).get("/api/tools")
+        assert r.json()[0]["is_package"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +140,37 @@ class TestGetTool:
     def test_not_found(self, client):
         assert client.get("/api/tools/nope").status_code == 404
 
-    def test_npx_provider(self, app, tools_dir):
-        (tools_dir / "playwright.yaml").write_text(_structured_to_yaml(NPX_PROVIDER))
+    def test_package_provider(self, app, tools_dir):
+        (tools_dir / "playwright.yaml").write_text(_structured_to_yaml(PACKAGE_PROVIDER))
         r = TestClient(app).get("/api/tools/playwright")
-        assert r.json()["type"] == "npx"
-        assert "npx_command" in r.json()
+        data = r.json()
+        assert data["type"] == "package"
+        assert "command" in data
+        assert data["command"] == "npx @playwright/mcp@latest --isolated"
+
+    def test_legacy_npx_key_returns_package_type(self, app, tools_dir):
+        """GET on a YAML with legacy 'npx:' key returns type='package'."""
+        spec = {
+            "npx": {"command": "npx @playwright/mcp@latest"},
+            "tools": [{"name": "nav", "description": "Nav", "input_schema": {"type": "object", "properties": {}, "required": []}}],
+        }
+        (tools_dir / "legacy.yaml").write_text(yaml.dump(spec))
+        r = TestClient(app).get("/api/tools/legacy")
+        data = r.json()
+        assert data["type"] == "package"
+        assert data["command"] == "npx @playwright/mcp@latest"
+
+    def test_requirements_and_setup_commands_returned(self, app, tools_dir):
+        provider = {
+            **CODE_PROVIDER,
+            "requirements": ["httpx", "requests"],
+            "setup_commands": ["echo hello"],
+        }
+        (tools_dir / "myprovider.yaml").write_text(_structured_to_yaml(provider))
+        r = TestClient(app).get("/api/tools/myprovider")
+        data = r.json()
+        assert data["requirements"] == ["httpx", "requests"]
+        assert data["setup_commands"] == ["echo hello"]
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +205,34 @@ class TestCreateTool:
         r = client.post("/api/tools", json={"name": "x", "provider": p})
         assert r.status_code == 400
 
-    def test_create_npx_provider(self, client):
-        r = client.post("/api/tools", json={"name": "playwright", "provider": NPX_PROVIDER})
+    def test_create_package_provider(self, client):
+        r = client.post("/api/tools", json={"name": "playwright", "provider": PACKAGE_PROVIDER})
         assert r.status_code == 200
+
+    def test_package_yaml_uses_package_key(self, client, tools_dir):
+        """Saved YAML must use 'package:' key, not 'npx:'."""
+        client.post("/api/tools", json={"name": "pw", "provider": PACKAGE_PROVIDER})
+        spec = yaml.safe_load((tools_dir / "pw.yaml").read_text())
+        assert "package" in spec
+        assert "npx" not in spec
+
+    def test_requirements_saved_to_yaml(self, client, tools_dir):
+        provider = {**CODE_PROVIDER, "requirements": ["httpx"]}
+        client.post("/api/tools", json={"name": "myprovider", "provider": provider})
+        spec = yaml.safe_load((tools_dir / "myprovider.yaml").read_text())
+        assert spec.get("requirements") == ["httpx"]
+
+    def test_setup_commands_saved_to_yaml(self, client, tools_dir):
+        provider = {**PACKAGE_PROVIDER, "setup_commands": ["npx playwright install chrome"]}
+        client.post("/api/tools", json={"name": "playwright", "provider": provider})
+        spec = yaml.safe_load((tools_dir / "playwright.yaml").read_text())
+        assert spec.get("setup_commands") == ["npx playwright install chrome"]
+
+    def test_empty_requirements_not_written(self, client, tools_dir):
+        """Empty requirements list should be omitted from YAML."""
+        client.post("/api/tools", json={"name": "myprovider", "provider": CODE_PROVIDER})
+        spec = yaml.safe_load((tools_dir / "myprovider.yaml").read_text())
+        assert "requirements" not in spec or spec["requirements"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +276,8 @@ class TestValidate:
         r = client.post("/api/validate", json={"provider": CODE_PROVIDER})
         assert r.json()["ok"] is True
 
-    def test_valid_npx_provider(self, client):
-        r = client.post("/api/validate", json={"provider": NPX_PROVIDER})
+    def test_valid_package_provider(self, client):
+        r = client.post("/api/validate", json={"provider": PACKAGE_PROVIDER})
         assert r.json()["ok"] is True
 
     def test_missing_tools(self, client):
@@ -210,8 +288,8 @@ class TestValidate:
         r = client.post("/api/validate", json={"provider": {**CODE_PROVIDER, "code": ""}})
         assert not r.json()["ok"]
 
-    def test_missing_npx_command(self, client):
-        r = client.post("/api/validate", json={"provider": {**NPX_PROVIDER, "npx_command": ""}})
+    def test_missing_command(self, client):
+        r = client.post("/api/validate", json={"provider": {**PACKAGE_PROVIDER, "command": ""}})
         assert not r.json()["ok"]
 
     def test_tool_missing_description(self, client):
@@ -239,6 +317,60 @@ class TestExtractFunctions:
     def test_syntax_error(self, client):
         r = client.post("/api/extract-functions", json={"code": "def broken(: pass"})
         assert not r.json()["ok"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/introspect
+# ---------------------------------------------------------------------------
+
+class TestIntrospect:
+    def test_missing_command_400(self, client):
+        r = client.post("/api/introspect", json={})
+        assert r.status_code == 400
+
+    def test_introspect_returns_tools(self, client):
+        fake_tools = [{"name": "nav", "description": "Navigate", "inputSchema": {}}]
+        with patch("process_runner.introspect", new=AsyncMock(return_value=fake_tools)):
+            r = client.post("/api/introspect", json={"command": "npx @playwright/mcp@latest"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert len(data["tools"]) == 1
+        assert data["tools"][0]["name"] == "nav"
+
+    def test_introspect_detects_package_manager(self, client):
+        with patch("process_runner.introspect", new=AsyncMock(return_value=[])):
+            r = client.post("/api/introspect", json={"command": "uvx mcp-server-fetch"})
+        assert r.json().get("package_manager") == "uvx"
+
+    def test_introspect_error_returns_ok_false(self, client):
+        with patch("process_runner.introspect", new=AsyncMock(side_effect=RuntimeError("failed"))):
+            r = client.post("/api/introspect", json={"command": "bad-command"})
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+
+    def test_requirements_installed_before_introspect(self, client):
+        """pip install is called for each requirement before introspection."""
+        with patch("process_runner.introspect", new=AsyncMock(return_value=[])), \
+             patch("frontend.app.subprocess.run") as mock_run:
+            r = client.post("/api/introspect", json={
+                "command": "python -m mcp_server_github",
+                "requirements": ["mcp-server-github"],
+            })
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "pip" in args
+        assert "mcp-server-github" in args
+
+    def test_old_introspect_npx_path_not_found(self, client):
+        """The old /api/introspect-npx endpoint must no longer exist."""
+        r = client.post("/api/introspect-npx", json={"command": "npx something"})
+        assert r.status_code == 404
+
+    def test_run_command_endpoint_not_found(self, client):
+        """The /api/run-command endpoint has been removed."""
+        r = client.post("/api/run-command", json={"command": "echo hi"})
+        assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +415,6 @@ class TestHTML:
 
     def test_no_raw_yaml_editor(self, client):
         r = client.get("/")
-        # The UI should not contain a raw YAML CodeMirror editor referencing 'yaml' mode
         assert "mode/yaml" not in r.text
 
     def test_no_discover_tab(self, client):
@@ -291,6 +422,24 @@ class TestHTML:
 
     def test_contains_api_calls(self, client):
         assert "/api/tools" in client.get("/").text
+
+    def test_no_run_command_modal(self, client):
+        """Run Command modal has been replaced by setup_commands field."""
+        assert "cmd-modal" not in client.get("/").text
+
+    def test_contains_introspect_endpoint(self, client):
+        assert "/api/introspect" in client.get("/").text
+
+    def test_contains_setup_commands_ui(self, client):
+        assert "setup_commands" in client.get("/").text or "setup-commands" in client.get("/").text
+
+    def test_wizard_has_package_type(self, client):
+        assert "wzSelectType('package')" in client.get("/").text
+
+    def test_wizard_has_two_type_cards(self, client):
+        text = client.get("/").text
+        assert "wzSelectType('code')" in text
+        assert "wzSelectType('package')" in text
 
 
 # ---------------------------------------------------------------------------
@@ -324,27 +473,82 @@ class TestStructuredConversion:
         yaml_str = _structured_to_yaml(CODE_PROVIDER)
         spec = yaml.safe_load(yaml_str)
         assert "code" in spec
+        assert not spec.get("package")
         assert not spec.get("npx")
         structured = _provider_to_structured("myprovider", spec)
         assert structured["type"] == "code"
         assert len(structured["tools"]) == 1
 
-    def test_npx_round_trip(self):
-        yaml_str = _structured_to_yaml(NPX_PROVIDER)
+    def test_package_round_trip(self):
+        yaml_str = _structured_to_yaml(PACKAGE_PROVIDER)
         spec = yaml.safe_load(yaml_str)
-        assert spec.get("npx", {}).get("command") == "npx @playwright/mcp@latest --isolated"
+        assert "package" in spec
+        assert spec["package"]["command"] == "npx @playwright/mcp@latest --isolated"
         structured = _provider_to_structured("playwright", spec)
-        assert structured["type"] == "npx"
-        assert structured["npx_command"] == "npx @playwright/mcp@latest --isolated"
+        assert structured["type"] == "package"
+        assert structured["command"] == "npx @playwright/mcp@latest --isolated"
+
+    def test_package_yaml_uses_package_key_not_npx(self):
+        yaml_str = _structured_to_yaml(PACKAGE_PROVIDER)
+        spec = yaml.safe_load(yaml_str)
+        assert "package" in spec
+        assert "npx" not in spec
+
+    def test_legacy_npx_key_reads_as_package(self):
+        """Loading a YAML with the old 'npx:' key returns type='package'."""
+        spec = {
+            "npx": {"command": "npx @playwright/mcp@latest"},
+            "tools": [],
+        }
+        structured = _provider_to_structured("legacy", spec)
+        assert structured["type"] == "package"
+        assert structured["command"] == "npx @playwright/mcp@latest"
 
     def test_parameters_preserved(self):
-        yaml_str = _structured_to_yaml(NPX_PROVIDER)
+        yaml_str = _structured_to_yaml(PACKAGE_PROVIDER)
         spec = yaml.safe_load(yaml_str)
         structured = _provider_to_structured("playwright", spec)
         params = structured["tools"][0]["parameters"]
         assert len(params) == 1
         assert params[0]["name"] == "url"
         assert params[0]["required"] is True
+
+    def test_requirements_round_trip(self):
+        provider = {**CODE_PROVIDER, "requirements": ["httpx", "requests"]}
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["requirements"] == ["httpx", "requests"]
+        structured = _provider_to_structured("p", spec)
+        assert structured["requirements"] == ["httpx", "requests"]
+
+    def test_setup_commands_round_trip(self):
+        provider = {**PACKAGE_PROVIDER, "setup_commands": ["npx playwright install chrome"]}
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["setup_commands"] == ["npx playwright install chrome"]
+        structured = _provider_to_structured("p", spec)
+        assert structured["setup_commands"] == ["npx playwright install chrome"]
+
+    def test_empty_requirements_omitted_from_yaml(self):
+        yaml_str = _structured_to_yaml(CODE_PROVIDER)  # requirements = []
+        spec = yaml.safe_load(yaml_str)
+        assert "requirements" not in spec
+
+    def test_empty_setup_commands_omitted_from_yaml(self):
+        yaml_str = _structured_to_yaml(CODE_PROVIDER)  # setup_commands = []
+        spec = yaml.safe_load(yaml_str)
+        assert "setup_commands" not in spec
+
+    def test_requirements_defaults_to_empty_list(self):
+        """Specs without requirements return [] not None."""
+        spec = {"code": "pass\n", "tools": []}
+        structured = _provider_to_structured("p", spec)
+        assert structured["requirements"] == []
+
+    def test_setup_commands_defaults_to_empty_list(self):
+        spec = {"code": "pass\n", "tools": []}
+        structured = _provider_to_structured("p", spec)
+        assert structured["setup_commands"] == []
 
 
 class TestExtractSecretEnvKeys:
@@ -367,8 +571,8 @@ class TestValidateProvider:
     def test_valid_code(self):
         assert _validate_provider(CODE_PROVIDER)["ok"] is True
 
-    def test_valid_npx(self):
-        assert _validate_provider(NPX_PROVIDER)["ok"] is True
+    def test_valid_package(self):
+        assert _validate_provider(PACKAGE_PROVIDER)["ok"] is True
 
     def test_no_tools(self):
         assert not _validate_provider({**CODE_PROVIDER, "tools": []})["ok"]
@@ -376,8 +580,22 @@ class TestValidateProvider:
     def test_code_required_for_code_type(self):
         assert not _validate_provider({**CODE_PROVIDER, "code": ""})["ok"]
 
-    def test_command_required_for_npx_type(self):
-        assert not _validate_provider({**NPX_PROVIDER, "npx_command": ""})["ok"]
+    def test_command_required_for_package_type(self):
+        assert not _validate_provider({**PACKAGE_PROVIDER, "command": ""})["ok"]
+
+    def test_requirements_must_be_list_if_present(self):
+        p = {**CODE_PROVIDER, "requirements": "httpx"}  # string, not list
+        assert not _validate_provider(p)["ok"]
+
+    def test_setup_commands_must_be_list_if_present(self):
+        p = {**CODE_PROVIDER, "setup_commands": "echo hi"}  # string, not list
+        assert not _validate_provider(p)["ok"]
+
+    def test_empty_requirements_list_is_valid(self):
+        assert _validate_provider({**CODE_PROVIDER, "requirements": []})["ok"] is True
+
+    def test_non_empty_requirements_list_is_valid(self):
+        assert _validate_provider({**CODE_PROVIDER, "requirements": ["httpx"]})["ok"] is True
 
 
 class TestExtractFunctionsPure:
@@ -392,35 +610,24 @@ class TestExtractFunctionsPure:
         assert not r["ok"]
 
 
-# ---------------------------------------------------------------------------
-# POST /api/run-command
-# ---------------------------------------------------------------------------
+class TestDetectPackageManager:
+    def test_npx(self):
+        assert _detect_package_manager("npx @playwright/mcp@latest") == "npx"
 
-class TestRunCommand:
-    def test_missing_command_400(self, client):
-        r = client.post("/api/run-command", json={})
-        assert r.status_code == 400
+    def test_uvx(self):
+        assert _detect_package_manager("uvx mcp-server-fetch") == "uvx"
 
-    def test_simple_command_streams_sse(self, client):
-        """A fast echo command should return SSE with a 'done' event."""
-        with client.stream("POST", "/api/run-command", json={"command": "echo hello"}) as r:
-            assert r.status_code == 200
-            assert "text/event-stream" in r.headers["content-type"]
-            text = r.read().decode()
-        # Should have at least one data line and a done event
-        assert "hello" in text
-        assert '"done": true' in text or '"done":true' in text
+    def test_python(self):
+        assert _detect_package_manager("python -m mcp_server_github") == "pip"
 
-    def test_exit_code_nonzero(self, client):
-        """A failing command should report a non-zero returncode."""
-        with client.stream("POST", "/api/run-command", json={"command": "exit 42"}) as r:
-            text = r.read().decode()
-        import json as _json
-        events = [
-            _json.loads(line[6:])
-            for line in text.splitlines()
-            if line.startswith("data: ")
-        ]
-        done_events = [e for e in events if e.get("done")]
-        assert done_events, "Expected a done event"
-        assert done_events[-1]["returncode"] != 0
+    def test_python3(self):
+        assert _detect_package_manager("python3 -m something") == "pip"
+
+    def test_npm(self):
+        assert _detect_package_manager("npm run serve") == "npm"
+
+    def test_installed_binary(self):
+        assert _detect_package_manager("mcp-server-github") == "command"
+
+    def test_empty_string(self):
+        assert _detect_package_manager("") == "command"

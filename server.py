@@ -3,15 +3,25 @@ Config-driven MCP server.
 
 Each YAML file in MCP_TOOL_CONFIG_DIR defines one *provider*.  Two kinds:
 
-  Code provider   — has a ``code:`` block with async Python functions.
-  npx provider    — has an ``npx:`` block; tool calls are proxied to the
-                    npx process over stdio (no code block needed).
+  Code provider    — has a ``code:`` block with async Python functions.
+  Package provider — has a ``package:`` block; tool calls are proxied to
+                     the subprocess over stdio (no code block needed).
+                     Supports any command: npx, uvx, python -m, or an
+                     installed binary.
+                     Legacy ``npx:`` key is also accepted (backward compat).
 
 Provider YAML keys:
-  code:        Python source executed once at startup (code providers).
-  npx:
-    command:   npx command string, e.g. "npx @playwright/mcp@latest"
-  tools:       List of tool declarations:
+  code:            Python source executed once at startup (code providers).
+  package:
+    command:       Full command to spawn the MCP server, e.g.:
+                     "npx @playwright/mcp@latest --isolated"
+                     "uvx mcp-server-fetch"
+                     "python -m mcp_server_github"
+                     "mcp-server-github"
+  requirements:    List of pip packages installed before the server starts.
+  setup_commands:  List of shell commands run on every server startup
+                   (e.g. "npx playwright install chrome").
+  tools:           List of tool declarations:
     name           — unique MCP tool name
     function       — async function name from code block (code providers only)
     description    — shown to the LLM
@@ -26,6 +36,9 @@ The HTTP frontend (UI) runs on port 8889 alongside the MCP server on 8888.
 import builtins
 import inspect
 import os
+import shlex
+import subprocess
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -56,6 +69,10 @@ _JSON_TYPE_MAP: dict[str, type] = {
     "object": dict,
     "array": list,
 }
+
+# Keys that indicate a subprocess/package provider (in priority order).
+# "npx" is kept for backward compatibility with existing YAML files.
+SUBPROCESS_KEYS = ("package", "npx")
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +226,25 @@ def register_tool(tool_spec: dict[str, Any], handler: Callable[..., Any]) -> Non
         raise
 
 
-def _make_npx_handler(command: str, tool_name: str) -> Callable[..., Any]:
-    """Return an async handler that proxies calls to an npx MCP process."""
-    from npx_runner import get_session
+def _get_package_command(spec: dict[str, Any]) -> str | None:
+    """Return the spawn command for package providers, or None for code providers.
 
-    async def npx_handler(context: dict[str, Any], **kwargs: Any) -> Any:
+    Checks ``package:`` first, then ``npx:`` for backward compatibility with
+    existing YAML configs that used the old key name.
+    """
+    for key in SUBPROCESS_KEYS:
+        sub = spec.get(key)
+        if sub:
+            command = (sub.get("command") or "").strip()
+            return command or None
+    return None
+
+
+def _make_process_handler(command: str, tool_name: str) -> Callable[..., Any]:
+    """Return an async handler that proxies calls to a subprocess MCP process."""
+    from process_runner import get_session
+
+    async def process_handler(context: dict[str, Any], **kwargs: Any) -> Any:
         try:
             session = get_session(command)
             return await session.call_tool(tool_name, kwargs)
@@ -221,25 +252,21 @@ def _make_npx_handler(command: str, tool_name: str) -> Callable[..., Any]:
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "tool": tool_name}
 
-    npx_handler.__name__ = tool_name
-    return npx_handler
+    process_handler.__name__ = tool_name
+    return process_handler
 
 
 def register_provider(spec: dict[str, Any]) -> None:
     """Register all tools declared in one provider spec."""
     source_path = spec.get("_config_path", "<unknown>")
     try:
-        npx_spec = spec.get("npx")
+        command = _get_package_command(spec)
 
-        if npx_spec:
-            # ── npx provider ─────────────────────────────────────────────────
-            command = (npx_spec.get("command") or "").strip()
-            if not command:
-                raise ValueError(f"npx provider in {source_path} has no 'command' field")
-
+        if command is not None:
+            # ── package provider (npx / uvx / python -m / any binary) ──────────
             for tool_spec in spec.get("tools", []):
                 tool_name = tool_spec.get("name", "<unnamed>")
-                handler = _make_npx_handler(command, tool_name)
+                handler = _make_process_handler(command, tool_name)
                 register_tool(tool_spec, handler)
 
         else:
@@ -271,12 +298,40 @@ def register_provider(spec: dict[str, Any]) -> None:
         raise
 
 
+def run_provider_setup(spec: dict[str, Any]) -> None:
+    """Install requirements and run setup commands declared in a provider spec.
+
+    Runs synchronously at startup so that every ``docker restart`` re-executes
+    the setup steps. pip is a no-op when packages are already installed.
+    """
+    source_path = spec.get("_config_path", "<unknown>")
+    try:
+        for req in spec.get("requirements", []):
+            if not req:
+                continue
+            print(f"Installing requirement '{req}' for {source_path}")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", req],
+                check=True,
+            )
+        for cmd in spec.get("setup_commands", []):
+            if not cmd:
+                continue
+            print(f"Running setup command: {cmd}")
+            subprocess.run(shlex.split(cmd), check=True)
+    except Exception as exc:
+        print(f"run_provider_setup error in {source_path}: {exc}")
+        traceback.print_exc()
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Load all providers at import time
 # ---------------------------------------------------------------------------
 
 for provider_spec in load_provider_specs(CONFIG_DIR):
     register_provider(provider_spec)
+    run_provider_setup(provider_spec)
 
 
 # ---------------------------------------------------------------------------

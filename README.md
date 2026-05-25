@@ -11,11 +11,12 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 - The Python code for all tool functions (embedded directly in the file)
 - One or more tool declarations that reference those functions
 - Per-tool input schemas, secrets, and auth metadata
-- Or an `npx:` block to delegate to an existing MCP npm package
+- Or a `package:` block to delegate to any existing MCP subprocess server — launched
+  via `npx`, `uvx`, `python -m`, or any installed binary
 
-`server.py` loads every YAML at startup, executes its `code` block (or spawns the
-declared `npx` process), and registers each declared tool automatically — no Python
-files to maintain separately, no changes to `server.py` needed when adding new tools.
+`server.py` loads every YAML at startup, installs declared `requirements` (pip packages),
+runs `setup_commands`, then registers each tool automatically — no Python files to
+maintain separately, no changes to `server.py` needed when adding new tools.
 
 ## Ports
 
@@ -36,7 +37,7 @@ files to maintain separately, no changes to `server.py` needed when adding new t
 ├── requirements-dev.txt            ← test dependencies
 ├── server.py
 ├── config.py                       ← shared env-var config (imported by all modules)
-├── npx_runner.py                   ← spawns & proxies npx-based MCP providers
+├── process_runner.py               ← spawns & proxies any stdio MCP subprocess
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -76,7 +77,7 @@ Click **+ New Provider** and choose a provider type:
 | Type | Description |
 |---|---|
 | **Python code** | Write `async def` functions; declare tools that reference them |
-| **npx package** | Enter an `npx` command (e.g. `npx @playwright/mcp@latest`); the UI auto-introspects the MCP server and populates tool definitions — no code needed |
+| **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary); the UI auto-introspects tools — no code needed |
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
@@ -87,39 +88,24 @@ The **🔑 Secrets** button (also available in the wizard's final step) reads al
 entries from the selected provider, shows which variables are already set in `.env`, and lets
 you fill in or update missing values — all without leaving the browser.
 
-### Run Command
+### Setup Commands
 
-The **🛠 Run Command** button (in the editor toolbar when a provider is open) lets you run
-any shell command inside the server environment — whether that's the local process or inside
-the Docker container — and streams the output live in a terminal panel.
+Each provider has a **Setup Commands** list (editable in the editor panel, saved to YAML).
+These shell commands run automatically every time the MCP server starts — perfect for
+installing browser binaries, downloading data, or any one-time setup that must survive a
+Docker restart.
 
-This is particularly useful for npx-based providers that need browser binaries or other
-one-time setup steps. For example, after adding a Playwright provider, install the Chrome
-browser with:
-
+Example — for a Playwright package provider:
 ```
 npx playwright install chrome
 ```
 
-Or install Chromium together with its system dependencies (recommended inside Docker):
+Commands run in order before the server accepts connections. The subprocess package is
+launched lazily on the first tool call, not at startup, so the browser binary is always
+ready when needed.
 
-```
-npx playwright install --with-deps chromium
-```
-
-The modal auto-suggests relevant commands based on the open provider's npx command (e.g. it
-pre-fills the playwright install variants when a Playwright provider is selected). Press
-**Enter** or click **▶ Run** to stream output; click **⏹ Stop** to kill the process.
-
-> **How npx providers start:** the npx process is launched *lazily* — on the first tool call
-> after server startup, not at startup itself. This means a `playwright install` run in **Run
-> Command** installs the binaries into the server environment; the actual browser process only
-> starts when a tool like `browser_navigate` is first called.
->
-> When you edit an npx command in the UI and save, the YAML on disk is updated but the running
-> process keeps the old command. Click **Restart MCP Server** (the yellow bar that appears
-> after saving) to apply the new command — the updated process is then started on the next
-> tool call.
+> **After editing and saving** a provider's command or setup steps, click **Restart MCP Server**
+> (the yellow bar that appears after saving) to apply the changes.
 
 ## Secrets
 
@@ -644,13 +630,19 @@ Add `WEATHER_API_KEY=replace-me` to `.env.example` and `.env` (or use the Secret
 
 ---
 
-### Part 3 — an npx-based provider (no code required)
+### Part 3 — a package provider (no code required)
 
-Use the **+ New Provider → npx package** wizard in the web UI, or create the YAML manually:
+Use the **+ New Provider → Package** wizard in the web UI, or create the YAML manually.
+Any command that spawns a stdio MCP server works — `npx`, `uvx`, `python -m`, or an
+installed binary:
 
 ```yaml
-npx:
+# ── npx (Node.js, no install needed) ─────────────────────────────────────────
+package:
   command: npx @playwright/mcp@latest --headless --isolated
+
+setup_commands:
+  - npx playwright install chrome   # installs browser on every startup
 
 tools:
   # Populated automatically by the UI's Introspect button — or fill manually
@@ -665,20 +657,54 @@ tools:
       required: [url]
 ```
 
+```yaml
+# ── uvx (Python package, no install needed) ───────────────────────────────────
+package:
+  command: uvx mcp-server-fetch
+
+tools: []   # auto-populated by Introspect
+```
+
+```yaml
+# ── pip-installed Python module ───────────────────────────────────────────────
+package:
+  command: python -m mcp_server_github
+
+requirements:
+  - mcp-server-github   # installed by pip before the server starts
+
+tools: []
+```
+
+```yaml
+# ── globally installed npm binary ─────────────────────────────────────────────
+package:
+  command: mcp-server-github
+
+setup_commands:
+  - npm install -g @modelcontextprotocol/server-github
+
+tools: []
+```
+
 > **`--headless`** runs Chromium without a visible window — required inside Docker or any
 > headless server environment. Remove it if you want to watch the browser on a desktop.
 > **`--isolated`** gives each session its own browser context (no shared cookies/storage).
 
-The server spawns the `npx` process, performs the MCP handshake once, then forwards
-every tool call to it. The process is reused across calls (and started lazily on the
-first tool call, not at server startup).
+The server spawns the process, performs the MCP handshake once, then forwards every tool
+call to it. The process is reused across calls (started lazily on the first tool call).
 
-If the provider requires browser binaries (e.g. Playwright), install them via the
-**🛠 Run Command** panel in the web UI before making the first tool call:
+**Backward compatibility:** The legacy `npx:` key still works and is treated identically
+to `package:`. Saving the provider through the UI rewrites it to `package:` format.
 
-```
-npx playwright install chrome
-```
+### pip Requirements vs setup_commands
+
+| Feature | Use for |
+|---|---|
+| `requirements:` | pip packages to install in the Python environment (`httpx`, `requests`, etc.) |
+| `setup_commands:` | Any other one-time setup — browser binaries, npm installs, data downloads |
+
+Both run on every server startup (pip is a no-op if the package is already installed).
 
 ---
 
@@ -736,10 +762,24 @@ documentation: |                   # optional — shown in the web UI; markdown 
 code: |                            # Python source — executed once at startup
   # Import anything, define helpers and async tool functions.
 
-# ── npx provider (mutually exclusive with code) ───────────────────────────────
+# ── Package provider (mutually exclusive with code) ───────────────────────────
+# Supports any command: npx, uvx, python -m, or an installed binary.
 
-npx:
+package:
   command: string                  # e.g. "npx @playwright/mcp@latest --isolated"
+                                   #      "uvx mcp-server-fetch"
+                                   #      "python -m mcp_server_github"
+                                   #      "mcp-server-github"
+
+# ── Shared optional fields (both provider types) ──────────────────────────────
+
+requirements:                      # pip packages installed before the server starts
+  - package-name
+  - package-name==1.2.3
+
+setup_commands:                    # shell commands run on every server startup
+  - npx playwright install chrome  # (e.g. browser binaries, npm global installs)
+  - echo "server ready"
 
 # ── Tool declarations (required) ──────────────────────────────────────────────
 
@@ -762,3 +802,7 @@ tools:
     auth:                          # optional — forwarded to context["auth"]
       any_key: any_value
 ```
+
+> **Legacy `npx:` key:** still accepted for backward compatibility. Existing configs
+> with `npx: {command: ...}` continue to work unchanged; saving through the UI rewrites
+> them to `package:` format.

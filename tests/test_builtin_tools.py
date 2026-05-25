@@ -145,6 +145,79 @@ class TestListFiles:
         assert result["ok"] is True
         assert result["entries"] == []
 
+    @pytest.mark.asyncio
+    async def test_recursive_lists_nested_entries(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "top.txt").write_text("x")
+        (base / "sub").mkdir()
+        (base / "sub" / "a.txt").write_text("a")
+        (base / "sub" / "deep").mkdir()
+        (base / "sub" / "deep" / "b.txt").write_text("b")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files
+        result = await list_files(_ctx(), recursive=True)
+        assert result["ok"] is True
+        paths = {e["path"] for e in result["entries"]}
+        assert paths == {"top.txt", "sub", "sub/a.txt", "sub/deep", "sub/deep/b.txt"}
+
+    @pytest.mark.asyncio
+    async def test_recursive_default_is_recursive(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "sub").mkdir()
+        (base / "sub" / "a.txt").write_text("a")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files
+        result = await list_files(_ctx())
+        paths = {e["path"] for e in result["entries"]}
+        assert paths == {"sub", "sub/a.txt"}
+
+    @pytest.mark.asyncio
+    async def test_recursive_false_is_shallow(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "sub").mkdir()
+        (base / "sub" / "a.txt").write_text("a")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files
+        result = await list_files(_ctx(), recursive=False)
+        paths = {e["path"] for e in result["entries"]}
+        assert paths == {"sub"}
+
+    @pytest.mark.asyncio
+    async def test_recursive_max_depth(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "sub").mkdir()
+        (base / "sub" / "a.txt").write_text("a")
+        (base / "sub" / "deep").mkdir()
+        (base / "sub" / "deep" / "b.txt").write_text("b")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files
+        result = await list_files(_ctx(), recursive=True, max_depth=2)
+        paths = {e["path"] for e in result["entries"]}
+        assert paths == {"sub", "sub/a.txt", "sub/deep"}
+
+    @pytest.mark.asyncio
+    async def test_recursive_does_not_follow_dir_symlinks(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "real").mkdir()
+        (base / "real" / "x.txt").write_text("x")
+        try:
+            (base / "link").symlink_to(base / "real", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import list_files
+        result = await list_files(_ctx(), recursive=True)
+        paths = {e["path"] for e in result["entries"]}
+        assert "real/x.txt" in paths
+        assert "link/x.txt" not in paths
+        link_entry = next(e for e in result["entries"] if e["path"] == "link")
+        assert link_entry["type"] == "file"
+
 
 # ---------------------------------------------------------------------------
 # get_file

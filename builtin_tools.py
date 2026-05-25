@@ -2,8 +2,8 @@
 Built-in mcpproxy utility tools — registered automatically at startup,
 no YAML config file required.
 
-  mcpproxy-listfiles   List files/directories inside the mcpproxy files dir.
-  mcpproxy-getfile     Read a file from the mcpproxy files dir (text or base64).
+  mcpproxy__listfiles   List files/directories inside the mcpproxy files dir.
+  mcpproxy__getfile     Read a file from the mcpproxy files dir (text or base64).
 
 The *base directory* defaults to ``.playwright-mcp`` (relative to the server's
 working directory) and can be overridden at runtime with the

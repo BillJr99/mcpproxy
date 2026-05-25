@@ -18,10 +18,23 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 runs `setup_commands`, then registers each tool automatically — no Python files to
 maintain separately, no changes to `server.py` needed when adding new tools.
 
-Two **built-in tools** (`mcpproxy-listfiles` and `mcpproxy-getfile`) are always registered
+Two **built-in tools** (`mcpproxy__listfiles` and `mcpproxy__getfile`) are always registered
 without any YAML config.  They give LLMs read-only access to a configurable directory
 (default: `.playwright-mcp`) — useful for retrieving screenshots and snapshots produced
 by package providers such as Playwright MCP.
+
+## Tool names advertised to the LLM
+
+Every tool is advertised to MCP clients as **`<provider>__<tool>`** — the provider
+name (the YAML filename without the `.yaml` extension, normalized to `[a-zA-Z0-9-]`)
+joined to the tool's own `name` by a double underscore. For example, a YAML file
+`tools/playwright.yaml` declaring a tool `browser_navigate` is exposed to the LLM
+as `playwright__browser_navigate`. This guarantees that tools from different
+providers cannot collide, even if they happen to share a name.
+
+The two built-in tools follow the same convention: `mcpproxy__listfiles` and
+`mcpproxy__getfile`. The `name:` field in your YAML stays unprefixed — the prefix
+is added automatically when the tool is registered.
 
 ## Ports
 
@@ -43,7 +56,7 @@ by package providers such as Playwright MCP.
 ├── server.py
 ├── config.py                       ← shared env-var config (imported by all modules)
 ├── process_runner.py               ← spawns & proxies any stdio MCP subprocess
-├── builtin_tools.py                ← built-in mcpproxy-listfiles / mcpproxy-getfile tools
+├── builtin_tools.py                ← built-in mcpproxy__listfiles / mcpproxy__getfile tools
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -72,6 +85,16 @@ Open **`http://localhost:8889`** in your browser after starting the server.
 - Click any provider to open its fields in a form editor
 - Edit documentation, code, and per-tool fields (name, description, parameters)
 - Add or remove tools with the **+ Add Tool** / **✕** buttons
+- **Enable / disable** individual tools with the switch in each tool card's header.
+  A disabled tool is kept in YAML (as `enabled: false`) but not registered with MCP
+  and not shown to the LLM — toggle it back on later without re-typing the schema.
+- **Function / Tool-name menu** — when mcpproxy can discover the legal set of names
+  (`async def` symbols in your code, or `tools/list` returned by a package's
+  stdio server), the field becomes a dropdown plus an **Other…** option so you can
+  pick from the menu or type a custom value. Discovery runs automatically when you
+  open a provider, when the code changes, and when the package command field loses
+  focus; the **↻ Re-scan** button forces a refresh. Failure is silent — the
+  dropdown just falls back to "Other…" so you can always free-type.
 - **Save** — write the file; restart MCP server to reload
 - **🔑 Secrets** — manage `.env` values for secrets declared in this provider
 - **Delete** — remove the provider YAML
@@ -82,8 +105,8 @@ Click **+ New Provider** and choose a provider type:
 
 | Type | Description |
 |---|---|
-| **Python code** | Write `async def` functions; declare tools that reference them |
-| **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary); the UI auto-introspects tools — no code needed |
+| **Python code** | Write `async def` functions; the UI lists the ones it finds as you type. Each becomes a tool entry. |
+| **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary). When you click **Next**, mcpproxy auto-introspects the command and pre-populates the tool list; if introspection fails you can still proceed and add tools by hand. |
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
@@ -592,9 +615,10 @@ tools:
 ```
 
 ```bash
+# The provider file is tools/ping.yaml, so the advertised tool name is "ping__ping".
 curl -s -X POST http://localhost:8888/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping","arguments":{"message":"world"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping__ping","arguments":{"message":"world"}}}'
 ```
 
 ---
@@ -652,8 +676,8 @@ setup_commands:
   - npx playwright install chrome   # installs browser on every startup
 
 tools:
-  # Populated automatically by the UI's Introspect button — or fill manually
-  - name: browser_navigate
+  # Populated automatically when the wizard introspects the command — or fill manually
+  - name: browser_navigate                # advertised as playwright__browser_navigate
     description: Navigate to a URL in a browser.
     input_schema:
       type: object
@@ -669,7 +693,7 @@ tools:
 package:
   command: uvx mcp-server-fetch
 
-tools: []   # auto-populated by Introspect
+tools: []   # auto-populated by the wizard's introspection step
 ```
 
 ```yaml
@@ -766,8 +790,8 @@ config file required:
 
 | Tool | Description |
 |---|---|
-| `mcpproxy-listfiles` | List files and subdirectories inside the files base directory |
-| `mcpproxy-getfile` | Read a file from the files base directory (UTF-8 text or base64) |
+| `mcpproxy__listfiles` | List files and subdirectories inside the files base directory |
+| `mcpproxy__getfile` | Read a file from the files base directory (UTF-8 text or base64) |
 
 **Default base directory:** `.playwright-mcp` relative to the server's working directory
 (i.e. `/app/.playwright-mcp` inside Docker). Override with the `MCPPROXY_FILES_DIR`
@@ -780,11 +804,11 @@ Only files **inside** the base directory are accessible — path-traversal attem
 
 1. Ask the LLM to navigate to a page and take a screenshot via the Playwright MCP provider.
 2. Playwright writes `screenshot.png` to `.playwright-mcp/`.
-3. Ask the LLM to call `mcpproxy-listfiles` — it returns the file list.
-4. Ask the LLM to call `mcpproxy-getfile` with `path="screenshot.png"` — it returns the
+3. Ask the LLM to call `mcpproxy__listfiles` — it returns the file list.
+4. Ask the LLM to call `mcpproxy__getfile` with `path="screenshot.png"` — it returns the
    PNG as a base64 string that the LLM can describe or pass to a vision model.
 
-#### `mcpproxy-listfiles` parameters
+#### `mcpproxy__listfiles` parameters
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -792,7 +816,7 @@ Only files **inside** the base directory are accessible — path-traversal attem
 
 Returns an object with `ok`, `base_dir`, `path`, and `entries` (list of `{name, type, size}`).
 
-#### `mcpproxy-getfile` parameters
+#### `mcpproxy__getfile` parameters
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -850,9 +874,12 @@ setup_commands:                    # shell commands run on every server startup
 # ── Tool declarations (required) ──────────────────────────────────────────────
 
 tools:
-  - name: string                   # unique MCP tool name
+  - name: string                   # tool name as written here; the LLM sees
+                                   # "<provider>__<name>" (e.g. playwright__browser_navigate)
     function: string               # async function name from code block (code providers only)
     description: string            # shown to the LLM
+    enabled: true                  # optional (default true); set false to keep the tool
+                                   # in YAML but not advertise / register it
     documentation: string          # optional per-tool notes shown in the web UI
     input_schema:                  # JSON Schema
       type: object

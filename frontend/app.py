@@ -140,6 +140,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
             "function": t.get("function", ""),
             "description": t.get("description", ""),
             "documentation": t.get("documentation", ""),
+            "enabled": False if t.get("enabled") is False else True,
             "parameters": params,
             "secrets": secrets,
         })
@@ -207,6 +208,7 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         tool_entry: dict[str, Any] = {
             "name": t["name"],
             "description": t.get("description", ""),
+            "enabled": False if t.get("enabled") is False else True,
             "input_schema": {"type": "object", "properties": props, "required": required},
         }
         if ptype == "code":
@@ -572,6 +574,18 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 .req-no{background:#45475a;color:#cdd6f4}
 .badge-warn{background:var(--yellow);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-err{background:var(--red);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-disabled{background:#45475a;color:var(--muted);font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.tool-card.disabled .tool-card-body{opacity:.55;filter:saturate(.6)}
+.tool-card.disabled .tool-card-header{background:#1f1f2c}
+.fn-pick-row{display:flex;gap:6px;align-items:stretch}
+.fn-pick-row .form-select{max-width:220px;flex:0 0 auto}
+.fn-pick-row .form-control{flex:1 1 auto;min-width:0}
+.fn-status{font-size:.75em;color:var(--muted);margin-top:4px}
+.fn-status.error{color:var(--red)}
+.fn-status.ok{color:var(--green)}
+.fn-status.busy{color:var(--accent)}
+.form-check-input{background-color:#1e1e2e;border-color:#45475a}
+.form-check-input:checked{background-color:var(--accent);border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -658,7 +672,8 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div class="section-title">📦 Package Command</div>
           <input id="f-command" class="form-control font-monospace"
             placeholder="npx @playwright/mcp@latest --isolated  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github  ·  mcp-server-github"
-            style="font-size:.875em">
+            style="font-size:.875em"
+            onblur="discoverFunctions().catch(() => {})">
           <div class="mt-2 text-muted" style="font-size:.8em">Any command that spawns a stdio MCP server: <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or an installed binary. The process is started on demand and kept alive between calls.</div>
         </div>
 
@@ -692,9 +707,13 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
         <!-- Tools box -->
         <div class="section-box">
           <div class="section-title">
-            🔧 Tools
-            <button class="btn btn-sm btn-outline-secondary py-0" onclick="addTool()">+ Add Tool</button>
+            <span>🔧 Tools</span>
+            <div class="d-flex gap-2 align-items-center">
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="discoverFunctions().catch(() => {})" title="Re-run function discovery">↻ Re-scan</button>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="addTool()">+ Add Tool</button>
+            </div>
           </div>
+          <div id="fn-discovery-status" class="fn-status"></div>
           <div id="tools-container">
             <div class="empty-state" style="padding:16px">No tools yet — click <b>+ Add Tool</b>.</div>
           </div>
@@ -785,7 +804,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddSetupCmd()">+ Add command</button>
             <div class="text-muted mt-1" style="font-size:.8em">Shell commands run on every server startup (e.g. <code>npx playwright install chrome</code>).</div>
           </div>
-          <button class="btn btn-sm btn-outline-info" id="wz-introspect-btn" onclick="wzIntrospect()">🔍 Introspect Tools</button>
+          <div class="text-muted" style="font-size:.8em">When you click <b>Next</b> the command is introspected automatically; tools it advertises become the dropdown options in the editor. If introspection fails you can still proceed and add tools by hand.</div>
           <div id="wz-introspect-result" class="mt-2"></div>
         </div>
 
@@ -810,7 +829,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <div id="wz-code-cmds-container"></div>
             <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddCodeSetupCmd()">+ Add command</button>
           </div>
-          <button class="btn btn-sm btn-outline-info" onclick="wzAnalyze()">🔍 Analyze Functions</button>
+          <div class="text-muted" style="font-size:.8em">Functions are detected automatically as you type. Each <code>async def fn(context, …)</code> becomes a tool entry.</div>
           <div id="wz-analyze-result" class="mt-2" style="font-size:.85em"></div>
         </div>
 
@@ -847,6 +866,13 @@ let wzType = null;            // 'code' | 'package'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
 let providersMeta = {};       // name → {missing_secrets, validation_errors}
+let knownFunctions = [];      // names available in the current provider:
+                              //   code provider    → async def names in the code block
+                              //   package provider → tool names from upstream introspection
+let knownFnStatus = 'idle';   // 'idle' | 'busy' | 'ok' | 'error'
+let knownFnMessage = '';      // human-readable status text
+let _analyzeDebounce = null;
+let _wzAnalyzeDebounce = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Boot
@@ -856,8 +882,18 @@ window.addEventListener('DOMContentLoaded', () => {
     mode: 'python', theme: 'dracula', lineNumbers: true,
     indentWithTabs: false, indentUnit: 4, tabSize: 4,
   });
+  codeEditor.on('change', () => {
+    if (!currentProvider || currentProvider.type !== 'code') return;
+    clearTimeout(_analyzeDebounce);
+    _analyzeDebounce = setTimeout(() => discoverFunctions().catch(() => {}), 300);
+  });
   secretsModal = new bootstrap.Modal('#secrets-modal');
   wizModal     = new bootstrap.Modal('#wizard-modal');
+  // Wizard: live function detection as the user types into the code textarea
+  document.getElementById('wz-code-input').addEventListener('input', () => {
+    clearTimeout(_wzAnalyzeDebounce);
+    _wzAnalyzeDebounce = setTimeout(() => wzAnalyze().catch(() => {}), 300);
+  });
   loadList();
 });
 
@@ -944,6 +980,9 @@ async function openProvider(name) {
     const p = await api('GET', `/api/tools/${name}`);
     currentName = name;
     currentProvider = p;
+    knownFunctions = [];
+    knownFnStatus = 'idle';
+    knownFnMessage = '';
     renderProvider(p);
     document.getElementById('empty-panel').style.display = 'none';
     document.getElementById('editor-panel').style.display = 'block';
@@ -953,7 +992,81 @@ async function openProvider(name) {
     document.querySelectorAll('.provider-item').forEach(el => {
       el.classList.toggle('active', el.querySelector('.fw-semibold')?.textContent === name);
     });
+    // Kick off auto-discovery in the background — silent on failure.
+    discoverFunctions().catch(() => {});
   } catch(e) { toast(e.message, false); }
+}
+
+// Auto-discover the set of legal function/tool names for the current provider.
+// Code providers: parse the code for async def names.
+// Package providers: spawn the command and ask it for tools/list.
+// Failure (or absence of input) is silent — the editor falls back to free-form text.
+async function discoverFunctions() {
+  if (!currentProvider) return;
+  const isPkg = currentProvider.type === 'package';
+  knownFnStatus = 'busy';
+  knownFnMessage = isPkg ? 'Introspecting package…' : 'Analyzing code…';
+  _renderKnownFnStatus();
+  try {
+    if (isPkg) {
+      const cmd = (document.getElementById('f-command').value || '').trim();
+      if (!cmd) {
+        knownFunctions = []; knownFnStatus = 'idle'; knownFnMessage = '';
+        _renderKnownFnStatus(); _refreshToolDropdowns(); return;
+      }
+      const r = await api('POST', '/api/introspect', {
+        command: cmd,
+        requirements: currentProvider.requirements || [],
+        setup_commands: currentProvider.setup_commands || [],
+      });
+      if (!r.ok) throw new Error(r.error || 'introspection failed');
+      knownFunctions = (r.tools || []).map(t => t.name).filter(Boolean);
+      knownFnStatus = 'ok';
+      knownFnMessage = `Found ${knownFunctions.length} tool${knownFunctions.length === 1 ? '' : 's'}`;
+    } else {
+      const code = codeEditor.getValue();
+      const r = await api('POST', '/api/extract-functions', {code});
+      if (!r.ok) throw new Error(r.error || 'parse error');
+      knownFunctions = (r.functions || []).map(f => f.name).filter(Boolean);
+      knownFnStatus = 'ok';
+      knownFnMessage = `Found ${knownFunctions.length} function${knownFunctions.length === 1 ? '' : 's'}`;
+    }
+  } catch(e) {
+    knownFunctions = [];
+    knownFnStatus = 'error';
+    knownFnMessage = e.message || 'discovery failed';
+  }
+  _renderKnownFnStatus();
+  _refreshToolDropdowns();
+}
+
+function _renderKnownFnStatus() {
+  const el = document.getElementById('fn-discovery-status');
+  if (!el) return;
+  el.className = `fn-status ${knownFnStatus}`;
+  el.textContent = knownFnMessage || '';
+}
+
+// Re-render every tool dropdown without rebuilding the entire form (which would
+// reset focus / scroll position).  Each dropdown's inner option list is replaced.
+function _refreshToolDropdowns() {
+  if (!currentProvider) return;
+  const isPkg = currentProvider.type === 'package';
+  const field = isPkg ? 'name' : 'function';
+  (currentProvider.tools || []).forEach((t, i) => {
+    const sel = document.getElementById(`fn-pick-${i}`);
+    if (!sel) return;
+    sel.innerHTML = _fnPickOptionsHtml(t[field] || '');
+  });
+}
+
+function _fnPickOptionsHtml(currentValue) {
+  const opts = [`<option value="">— pick from menu —</option>`];
+  for (const fn of knownFunctions) {
+    opts.push(`<option value="${esc(fn)}" ${fn===currentValue?'selected':''}>${esc(fn)}</option>`);
+  }
+  opts.push(`<option value="__other__">Other…</option>`);
+  return opts.join('');
 }
 
 function _refreshEditorBars(name) {
@@ -1074,6 +1187,7 @@ function renderTools(tools, isPkg) {
 }
 
 function renderToolCard(t, i, isPkg) {
+  const enabled = t.enabled !== false;
   const params = (t.parameters || []).map((p, j) => `
     <div class="param-row" id="param-${i}-${j}">
       <input class="form-control form-control-sm" placeholder="name" value="${esc(p.name)}"
@@ -1102,11 +1216,37 @@ function renderToolCard(t, i, isPkg) {
       <button class="btn-icon" onclick="removeSecret(${i},${k})" title="Remove">✕</button>
     </div>`).join('');
 
+  // Function/name picker: a dropdown of known names + "Other…" alongside the
+  // text input.  Picking a menu option fills the input; the input is the
+  // source of truth so users can always free-type when "Other…" is chosen
+  // or the upstream list is unknown.
+  const nameField = `
+    <div class="mb-2">
+      <label class="form-label">Tool name${isPkg ? ' <span class="text-muted fw-normal" style="text-transform:none">— must match upstream</span>' : ''}</label>
+      <div class="fn-pick-row">
+        ${isPkg ? `
+          <select class="form-select form-select-sm" id="fn-pick-${i}"
+            onchange="onFnPick(${i}, 'name', this.value)">
+            ${_fnPickOptionsHtml(t.name || '')}
+          </select>` : ''}
+        <input class="form-control form-control-sm font-monospace" id="tool-name-input-${i}"
+          placeholder="my_tool" value="${esc(t.name||'')}"
+          oninput="updateTool(${i},'name',this.value);_syncFnPick(${i},'name',this.value);document.getElementById('tool-label-${i}').textContent=this.value||'(unnamed)'">
+      </div>
+    </div>`;
+
   const fnField = isPkg ? '' : `
     <div class="mb-2">
       <label class="form-label">Function name</label>
-      <input class="form-control form-control-sm font-monospace" placeholder="my_function" value="${esc(t.function||'')}"
-        oninput="updateTool(${i},'function',this.value)">
+      <div class="fn-pick-row">
+        <select class="form-select form-select-sm" id="fn-pick-${i}"
+          onchange="onFnPick(${i}, 'function', this.value)">
+          ${_fnPickOptionsHtml(t.function || '')}
+        </select>
+        <input class="form-control form-control-sm font-monospace" id="tool-function-input-${i}"
+          placeholder="my_function" value="${esc(t.function||'')}"
+          oninput="updateTool(${i},'function',this.value);_syncFnPick(${i},'function',this.value)">
+      </div>
     </div>`;
 
   const docField = `
@@ -1117,9 +1257,16 @@ function renderToolCard(t, i, isPkg) {
     </div>`;
 
   return `
-  <div class="tool-card" id="tool-card-${i}">
+  <div class="tool-card ${enabled ? '' : 'disabled'}" id="tool-card-${i}">
     <div class="tool-card-header" onclick="toggleToolCard(${i})">
-      <span class="fw-semibold" id="tool-label-${i}">${esc(t.name||'(unnamed)')}</span>
+      <div class="d-flex gap-2 align-items-center" style="min-width:0">
+        <label class="form-check form-switch m-0" onclick="event.stopPropagation()" title="When unchecked the tool is kept in YAML but not advertised to the LLM.">
+          <input class="form-check-input" type="checkbox" ${enabled?'checked':''}
+            onchange="setToolEnabled(${i}, this.checked)">
+        </label>
+        <span class="fw-semibold" id="tool-label-${i}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name||'(unnamed)')}</span>
+        <span class="badge-disabled" id="tool-disabled-badge-${i}" style="${enabled?'display:none':''}">disabled</span>
+      </div>
       <div class="d-flex gap-2 align-items-center" onclick="event.stopPropagation()">
         <button class="btn btn-sm btn-outline-danger py-0 px-2" onclick="removeTool(${i})">Remove</button>
         <span style="color:var(--muted)">▾</span>
@@ -1128,9 +1275,7 @@ function renderToolCard(t, i, isPkg) {
     <div class="tool-card-body" id="tool-body-${i}">
       <div class="row g-2 mb-2">
         <div class="col-md-5">
-          <label class="form-label">Tool name</label>
-          <input class="form-control form-control-sm font-monospace" placeholder="my_tool" value="${esc(t.name||'')}"
-            oninput="updateTool(${i},'name',this.value);document.getElementById('tool-label-${i}').textContent=this.value||'(unnamed)'">
+          ${nameField}
         </div>
         <div class="col-md-7">
           <label class="form-label">Description <span style="color:var(--red)">*</span></label>
@@ -1148,6 +1293,44 @@ function renderToolCard(t, i, isPkg) {
       <div id="secrets-${i}">${secrets || '<div class="text-muted" style="font-size:.8em;padding:4px">No secrets.</div>'}</div>
     </div>
   </div>`;
+}
+
+// Dropdown picked — fill the matching text input.  An empty value ("— pick
+// from menu —") leaves the input alone; "__other__" clears it and focuses it.
+function onFnPick(i, field, value) {
+  ensureProvider();
+  if (value === '') return;
+  if (value === '__other__') {
+    const input = document.getElementById(`tool-${field}-input-${i}`);
+    if (input) { input.value = ''; input.focus(); }
+    updateTool(i, field, '');
+    if (field === 'name') document.getElementById(`tool-label-${i}`).textContent = '(unnamed)';
+    return;
+  }
+  const input = document.getElementById(`tool-${field}-input-${i}`);
+  if (input) input.value = value;
+  updateTool(i, field, value);
+  if (field === 'name') document.getElementById(`tool-label-${i}`).textContent = value;
+}
+
+// Keep the dropdown's selection in sync when the user types in the input.
+function _syncFnPick(i, field, value) {
+  const sel = document.getElementById(`fn-pick-${i}`);
+  if (!sel) return;
+  if (knownFunctions.includes(value)) {
+    sel.value = value;
+  } else {
+    sel.value = '';  // "— pick from menu —"
+  }
+}
+
+function setToolEnabled(i, enabled) {
+  ensureProvider();
+  currentProvider.tools[i].enabled = !!enabled;
+  const card = document.getElementById(`tool-card-${i}`);
+  if (card) card.classList.toggle('disabled', !enabled);
+  const badge = document.getElementById(`tool-disabled-badge-${i}`);
+  if (badge) badge.style.display = enabled ? 'none' : '';
 }
 
 function toggleToolCard(i) {
@@ -1196,7 +1379,7 @@ function addTool() {
   const isPkg = currentProvider.type === 'package';
   currentProvider.tools.push({
     name: '', function: '', description: '', documentation: '',
-    parameters: [], secrets: [],
+    enabled: true, parameters: [], secrets: [],
   });
   renderTools(currentProvider.tools, isPkg);
 }
@@ -1385,7 +1568,18 @@ async function wzNext() {
     const cmd  = document.getElementById('wz-pkg-cmd').value.trim();
     if (!name) { errEl.textContent = 'Provider name is required.'; return; }
     if (!cmd)  { errEl.textContent = 'Command is required.'; return; }
-    if (!wzIntrospectedTools.length) { errEl.textContent = 'Click "Introspect Tools" first.'; return; }
+    // Auto-introspect now (silent fallback on failure — the user can still
+    // proceed and add tools by hand in the editor).
+    const nextBtn = document.getElementById('wz-next-btn');
+    nextBtn.disabled = true;
+    const origText = nextBtn.textContent;
+    nextBtn.textContent = '⏳ Introspecting…';
+    try {
+      await wzIntrospect();
+    } finally {
+      nextBtn.disabled = false;
+      nextBtn.textContent = origText;
+    }
     const requirements   = _wzGetListValues('wz-pkg-reqs-container');
     const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
     const provider = {
@@ -1396,6 +1590,7 @@ async function wzNext() {
         function: '',
         description: t.description || '',
         documentation: '',
+        enabled: true,
         parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
         secrets: [],
       })),
@@ -1424,6 +1619,7 @@ async function wzNext() {
         name: fn.name, function: fn.name,
         description: `TODO — describe what ${fn.name} does`,
         documentation: '',
+        enabled: true,
         parameters: fn.params.map(p => ({name:p.name,type:p.type||'string',description:'',required:true,default:null})),
         secrets: [],
       })),
@@ -1450,34 +1646,39 @@ function wzBack() {
 async function wzIntrospect() {
   const cmd  = document.getElementById('wz-pkg-cmd').value.trim();
   const el   = document.getElementById('wz-introspect-result');
-  const btn  = document.getElementById('wz-introspect-btn');
-  if (!cmd) { el.innerHTML = '<span class="text-danger">Enter a command first.</span>'; return; }
+  if (!cmd) {
+    wzIntrospectedTools = [];
+    el.innerHTML = '';
+    return;
+  }
   const requirements   = _wzGetListValues('wz-pkg-reqs-container');
   const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
-  btn.disabled = true; btn.textContent = '⏳ Introspecting…';
-  el.innerHTML = '<span class="text-muted">Running — this may take a moment on first use…</span>';
+  el.innerHTML = '<span class="text-muted" style="font-size:.875em">Introspecting — this may take a moment on first use…</span>';
   try {
     const r = await api('POST', '/api/introspect', {command: cmd, requirements, setup_commands});
     if (!r.ok) throw new Error(r.error || 'Introspection failed');
     wzIntrospectedTools = r.tools || [];
-    el.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s): <b>${wzIntrospectedTools.map(t=>t.name).join(', ')}</b></div>`;
+    if (wzIntrospectedTools.length) {
+      el.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s): <b>${esc(wzIntrospectedTools.map(t=>t.name).join(', '))}</b></div>`;
+    } else {
+      el.innerHTML = `<div class="text-muted" style="font-size:.875em">No tools advertised by this command — you can still add tools manually in the editor.</div>`;
+    }
   } catch(e) {
     wzIntrospectedTools = [];
-    el.innerHTML = `<div class="text-danger" style="font-size:.875em">✗ ${e.message}</div>`;
-  } finally {
-    btn.disabled = false; btn.textContent = '🔍 Introspect Tools';
+    el.innerHTML = `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(e.message)}). Continuing without auto-detected tools — add them manually in the editor.</div>`;
   }
 }
 
 async function wzAnalyze() {
   const code = document.getElementById('wz-code-input').value;
   const el   = document.getElementById('wz-analyze-result');
+  if (!code.trim()) { el.innerHTML = ''; return; }
   try {
     const r = await api('POST', '/api/extract-functions', {code});
-    if (!r.ok) { el.innerHTML = `<span class="text-danger">${r.error}</span>`; return; }
-    if (!r.functions.length) { el.innerHTML = '<span class="text-warning">No <code>async def fn(context, …)</code> found.</span>'; return; }
-    el.innerHTML = `<span style="color:var(--green)">✓ Found: <b>${r.functions.map(f=>f.name).join(', ')}</b></span>`;
-  } catch(e) { el.innerHTML = `<span class="text-danger">${e.message}</span>`; }
+    if (!r.ok) { el.innerHTML = `<span class="text-warning">⚠ ${esc(r.error)}</span>`; return; }
+    if (!r.functions.length) { el.innerHTML = '<span class="text-muted">No <code>async def fn(context, …)</code> found yet.</span>'; return; }
+    el.innerHTML = `<span style="color:var(--green)">✓ Found: <b>${esc(r.functions.map(f=>f.name).join(', '))}</b></span>`;
+  } catch(e) { el.innerHTML = `<span class="text-warning">⚠ ${esc(e.message)}</span>`; }
 }
 
 async function _analyzeFns(code) {

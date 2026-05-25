@@ -6,7 +6,7 @@ CONFIG_DIR = Path(os.environ.get("MCP_TOOL_CONFIG_DIR", "/app/tools"))
 ENV_FILE = Path(os.environ.get("MCP_ENV_FILE", ".env"))
 SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "local-config-driven-mcp")
 
-# Base directory exposed by the built-in mcpproxy-listfiles / mcpproxy-getfile tools.
+# Base directory exposed by the built-in mcpproxy__listfiles / mcpproxy__getfile tools.
 # Defaults to .playwright-mcp (relative to the server's working directory) so that
 # screenshots and snapshots produced by the Playwright MCP package provider are
 # immediately accessible.  Override with MCPPROXY_FILES_DIR.

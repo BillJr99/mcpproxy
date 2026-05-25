@@ -27,6 +27,8 @@ COPY handlers/ ./handlers/
 
 ENV MCP_TOOL_CONFIG_DIR=/app/tools
 ENV MCP_ENV_FILE=/app/.env
+ENV MCPPROXY_FILES_DIR=/app/files
+ENV MCPPROXY_REPOS_DIR=/app/repos
 
 EXPOSE 8888 8889
 

@@ -1,7 +1,7 @@
 """Tests for builtin_tools.py — mcpproxy__listfiles and mcpproxy__getfile.
 
 These tests monkeypatch MCPPROXY_FILES_DIR to a fresh temp directory so
-they never touch the real .playwright-mcp directory.
+they never touch the real files directory (default /app/files in Docker).
 """
 import base64
 import os
@@ -325,3 +325,24 @@ class TestBuiltinToolsRegistered:
     def test_builtin_tools_exported(self):
         from builtin_tools import get_file, list_files, _base_dir, _safe_resolve
         assert all(callable(f) for f in (get_file, list_files, _base_dir, _safe_resolve))
+
+
+# ---------------------------------------------------------------------------
+# Default base directory (/app/files)
+# ---------------------------------------------------------------------------
+
+class TestDefaultBaseDir:
+    """Verify the default files directory is /app/files (mountable as a Docker volume)."""
+
+    def test_default_is_app_files(self, monkeypatch):
+        monkeypatch.delenv("MCPPROXY_FILES_DIR", raising=False)
+        from builtin_tools import _base_dir
+        assert _base_dir() == Path("/app/files").resolve()
+
+    def test_config_default_matches(self, monkeypatch):
+        """config.FILES_DIR is re-imported under the same default."""
+        monkeypatch.delenv("MCPPROXY_FILES_DIR", raising=False)
+        import importlib
+        import config
+        importlib.reload(config)
+        assert config.FILES_DIR == Path("/app/files")

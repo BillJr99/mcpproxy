@@ -512,7 +512,7 @@ def register_builtin_tools() -> None:
     """Register the mcpproxy__listfiles and mcpproxy__getfile utility tools.
 
     These tools expose read-only access to the files directory (default:
-    ``.playwright-mcp``, override with ``MCPPROXY_FILES_DIR``).  They are
+    ``/app/files``, override with ``MCPPROXY_FILES_DIR``).  They are
     always registered regardless of what YAML providers are loaded, giving
     LLMs a way to retrieve screenshots, JSON snapshots, and other files
     produced by package providers such as the Playwright MCP server.
@@ -525,7 +525,7 @@ def register_builtin_tools() -> None:
                 "name": "mcpproxy__listfiles",
                 "description": (
                     "List files and directories inside the mcpproxy files directory "
-                    "(default: .playwright-mcp, override with MCPPROXY_FILES_DIR). "
+                    "(default: /app/files, override with MCPPROXY_FILES_DIR). "
                     "Use this to discover screenshots, JSON snapshots, and other files "
                     "produced by package providers such as the Playwright MCP server. "
                     "Pass a subdirectory path to drill down."
@@ -553,7 +553,7 @@ def register_builtin_tools() -> None:
                 "name": "mcpproxy__getfile",
                 "description": (
                     "Read the contents of a file from the mcpproxy files directory "
-                    "(default: .playwright-mcp). "
+                    "(default: /app/files). "
                     "Returns UTF-8 text for text files (JSON, HTML, Markdown, …) or "
                     "base64-encoded bytes for binary files (PNG screenshots, …). "
                     "Use mcpproxy__listfiles first to discover available file paths."

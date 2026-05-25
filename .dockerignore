@@ -17,5 +17,7 @@ __pycache__/
 .github/
 *.md
 
-# Playwright MCP browser data
+# Volume bind-mount targets — never copy into the build context
+files/
+repos/
 .playwright-mcp/

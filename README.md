@@ -22,8 +22,8 @@ maintain separately, no changes to `server.py` needed when adding new tools.
 
 Two **built-in tools** (`mcpproxy__listfiles` and `mcpproxy__getfile`) are always registered
 without any YAML config.  They give LLMs read-only access to a configurable directory
-(default: `.playwright-mcp`) — useful for retrieving screenshots and snapshots produced
-by package providers such as Playwright MCP.
+(default: `/app/files`, mountable as a Docker volume) — useful for retrieving screenshots
+and snapshots produced by package providers such as Playwright MCP.
 
 ## Tool names advertised to the LLM
 
@@ -208,6 +208,27 @@ docker run -d --rm \
   ghcr.io/billjr99/mcpproxy:latest
 ```
 
+**Run with persistent caches and artefacts** — add named volumes so cloned repos,
+package caches, and provider output files survive container restarts:
+
+```bash
+docker run -d --rm \
+  -p 8888:8888 -p 8889:8889 \
+  --env-file .env \
+  -v "$(pwd)/tools":/app/tools \
+  -v mcpproxy-files:/app/files \
+  -v mcpproxy-repos:/app/repos \
+  -v mcpproxy-cache:/root/.cache \
+  -v mcpproxy-npm:/root/.npm \
+  -v mcpproxy-uv-tools:/root/.local/share/uv \
+  --name mcpproxy \
+  ghcr.io/billjr99/mcpproxy:latest
+```
+
+Every volume above is optional — omit any subset and that path falls back to the
+container's ephemeral writable layer. See **[Volumes & caching](#volumes--caching)**
+below for what each one covers and the cold-start speedup it provides.
+
 MCP endpoint: **`http://localhost:8888/mcp`**  
 Web UI & OpenAI-compatible tools endpoint: **`http://localhost:8889`**
 
@@ -311,6 +332,29 @@ Docker Compose reads `.env` via `env_file:`. The file is never copied into the i
 ```bash
 MCP_HOST_PORT=9000 UI_HOST_PORT=9001 docker compose up
 ```
+
+### Volumes & caching
+
+`docker-compose.yml` declares six named volumes. Only the first is required —
+the rest persist caches and artefacts that would otherwise be re-downloaded
+or re-built on every fresh container.
+
+| Container path | Volume | Holds | Without it (cold start) |
+|---|---|---|---|
+| `/app/tools` | `mcpproxy-tools` | Provider YAML configs | **Required** — the proxy has nothing to serve. |
+| `/app/files` | `mcpproxy-files` | Provider output artefacts (Playwright screenshots, snapshots, …) surfaced via `mcpproxy__listfiles` / `mcpproxy__getfile` | Files vanish on container removal. |
+| `/app/repos` | `mcpproxy-repos` | Cloned git workdirs + their build artefacts (`node_modules`, `dist`, …) for repository-mode providers | Re-clones and re-runs every `build_commands` on each start (seconds to several minutes per repo). |
+| `/root/.cache` | `mcpproxy-cache` | XDG caches: pip wheels, uv wheels, Playwright browser binaries (`ms-playwright`) | pip/uvx re-download wheels; `npx playwright install chrome` re-fetches ~150 MB. |
+| `/root/.npm` | `mcpproxy-npm` | npm/npx package cache | npx re-downloads packages from the npm registry on first call. |
+| `/root/.local/share/uv` | `mcpproxy-uv-tools` | uvx per-tool venvs | uvx re-creates per-tool venvs from cached wheels. |
+
+In dev (`docker-compose.override.yml`), `mcpproxy-tools`, `mcpproxy-files`, and
+`mcpproxy-repos` are replaced with bind mounts (`./tools`, `./files`, `./repos`) so
+you can inspect or edit them from the host. The three cache volumes remain named
+volumes even in dev — they're opaque package-manager state, not files you read.
+
+For ephemeral / CI runs, drop any subset of volumes — the proxy still works,
+just slower on the first tool call after each cold start.
 
 ---
 
@@ -673,10 +717,13 @@ installed binary:
 ```yaml
 # ── npx (Node.js, no install needed) ─────────────────────────────────────────
 package:
-  command: npx @playwright/mcp@latest --headless --isolated
+  command: npx @playwright/mcp@latest --headless --isolated --output-dir /app/files/playwright
 
 setup_commands:
   - npx playwright install chrome   # installs browser on every startup
+                                    # (cached in /root/.cache/ms-playwright via the
+                                    #  mcpproxy-cache volume — only re-downloads on
+                                    #  a fresh, unmounted container)
 
 tools:
   # Populated automatically when the wizard introspects the command — or fill manually
@@ -849,16 +896,13 @@ commands, and the auto-discovered env keys list.
 |---|---|---|
 | `MCPPROXY_REPOS_DIR` | `/app/repos` | Base directory for cloned repos. |
 
-For persistent build caches across container restarts, mount this directory as a
-volume:
+The default `docker-compose.yml` mounts the `mcpproxy-repos` named volume here
+(or `./repos` in dev via the override file) so cloned trees and their build
+artefacts (`node_modules`, `dist`, …) survive container restarts. See
+[Volumes & caching](#volumes--caching) for the full list.
 
-```yaml
-volumes:
-  - mcpproxy-repos:/app/repos
-```
-
-Without a mount, every container start re-clones and re-builds — exactly what's wanted
-for an ephemeral / disposable container.
+Drop the volume entry for ephemeral / disposable containers — every container
+start will re-clone and re-build into the container's writable layer.
 
 #### Lifecycle on container restart
 
@@ -955,9 +999,22 @@ config file required:
 | `mcpproxy__listfiles` | List files and subdirectories inside the files base directory |
 | `mcpproxy__getfile` | Read a file from the files base directory (UTF-8 text or base64) |
 
-**Default base directory:** `.playwright-mcp` relative to the server's working directory
-(i.e. `/app/.playwright-mcp` inside Docker). Override with the `MCPPROXY_FILES_DIR`
-environment variable.
+**Default base directory:** `/app/files` inside Docker (mounted as the
+`mcpproxy-files` named volume, or `./files` in dev — see
+[Volumes & caching](#volumes--caching)). Override with the `MCPPROXY_FILES_DIR`
+environment variable. `run_local.sh` automatically sets it to `./files` under the
+repo root when running outside Docker.
+
+Each package provider should write its artefacts under its own subdirectory of
+the base — e.g. Playwright is launched with
+`npx @playwright/mcp@latest … --output-dir /app/files/playwright` so screenshots
+land at `/app/files/playwright/screenshot.png`.
+
+> **Note (migrating from earlier versions):** the default was previously
+> `.playwright-mcp` (relative to the cwd, i.e. `/app/.playwright-mcp` inside
+> Docker). If you have a custom `tools/playwright.yaml`, either add the
+> `--output-dir /app/files/playwright` flag to its spawn command, or set
+> `MCPPROXY_FILES_DIR=/app/.playwright-mcp` to keep the old layout.
 
 Only files **inside** the base directory are accessible — path-traversal attempts
 (`../`) are rejected.
@@ -965,10 +1022,11 @@ Only files **inside** the base directory are accessible — path-traversal attem
 #### Example workflow with Playwright
 
 1. Ask the LLM to navigate to a page and take a screenshot via the Playwright MCP provider.
-2. Playwright writes `screenshot.png` to `.playwright-mcp/`.
-3. Ask the LLM to call `mcpproxy__listfiles` — it returns the file list.
-4. Ask the LLM to call `mcpproxy__getfile` with `path="screenshot.png"` — it returns the
-   PNG as a base64 string that the LLM can describe or pass to a vision model.
+2. Playwright writes `screenshot.png` to `/app/files/playwright/` (because its spawn
+   command includes `--output-dir /app/files/playwright`).
+3. Ask the LLM to call `mcpproxy__listfiles` with `path="playwright"` — it returns the file list.
+4. Ask the LLM to call `mcpproxy__getfile` with `path="playwright/screenshot.png"` — it returns
+   the PNG as a base64 string that the LLM can describe or pass to a vision model.
 
 #### `mcpproxy__listfiles` parameters
 
@@ -994,12 +1052,15 @@ Returns an object with `ok`, `path`, `size`, `content`, and `encoding`.
 MCPPROXY_FILES_DIR=/app/data
 ```
 
-Or mount a volume at the target path so files persist across container restarts:
+Or mount a different volume / host directory at the target path:
 
 ```yaml
 volumes:
-  - ./playwright-output:/app/.playwright-mcp
+  - ./playwright-output:/app/files   # bind-mount host dir at the default location
 ```
+
+By default `docker-compose.yml` mounts the named volume `mcpproxy-files` at
+`/app/files`, and `docker-compose.override.yml` swaps that for `./files` in dev.
 
 ---
 
@@ -1018,7 +1079,7 @@ code: |                            # Python source — executed once at startup
 # Supports any command: npx, uvx, python -m, or an installed binary.
 
 package:
-  command: string                  # e.g. "npx @playwright/mcp@latest --isolated"
+  command: string                  # e.g. "npx @playwright/mcp@latest --isolated --output-dir /app/files/playwright"
                                    #      "uvx mcp-server-fetch"
                                    #      "python -m mcp_server_github"
                                    #      "mcp-server-github"

@@ -1,4 +1,6 @@
 """Tests for process_runner.py — cwd threading and session keying."""
+import pytest
+
 import process_runner
 
 
@@ -75,3 +77,30 @@ class TestBuildEnv:
         s = process_runner.ProcessSession("echo hi")
         env = s._build_env()  # must not raise
         assert isinstance(env, dict)
+
+
+class TestIntrospectStderrCapture:
+    """When the subprocess crashes during the handshake, the error message
+    should include stderr so the user can see the cause."""
+
+    @pytest.mark.asyncio
+    async def test_eof_error_includes_stderr_tail(self):
+        class FakeStdout:
+            async def readline(self):
+                return b""
+        class FakeStderr:
+            def __init__(self, data):
+                self._data = data
+            async def read(self, n):
+                d, self._data = self._data[:n], self._data[n:]
+                return d
+
+        session = process_runner.ProcessSession("does-not-matter")
+        class _Proc:
+            stdout = FakeStdout()
+            stderr = FakeStderr(b"Environment validation failed: KEY: Required\n")
+        session._proc = _Proc()
+
+        with pytest.raises(EOFError) as exc_info:
+            await session._recv(timeout=1.0)
+        assert "Environment validation failed" in str(exc_info.value)

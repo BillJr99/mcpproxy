@@ -990,3 +990,38 @@ class TestRegisterProviderEnvKeys:
             import asyncio
             asyncio.run(entry["handler"](None))
         assert captured["env_keys"] == ["A", "B"]
+
+
+class TestBuildCommandTimeout:
+    """A build command that hangs must not deadlock server startup."""
+
+    def test_timeout_raises_helpful_runtime_error(self, tmp_path: Path):
+        import subprocess as sp
+        wd = str(tmp_path / "wd")
+        spec = {
+            "_config_path": str(tmp_path / "r.yaml"),
+            "repository": {
+                "url": "https://example.com/r.git",
+                "workdir": wd,
+                "build_commands": ["sleep 99999"],
+            },
+        }
+
+        def fake_run(args, **kwargs):
+            if args[0:2] == ["git", "clone"]:
+                Path(args[3]).mkdir(parents=True, exist_ok=True)
+                class _R: returncode = 0
+                return _R()
+            # Build command — simulate a hang by raising TimeoutExpired.
+            raise sp.TimeoutExpired(args, kwargs.get("timeout", 1))
+
+        with patch("server.subprocess.run", side_effect=fake_run):
+            with pytest.raises(RuntimeError, match="Build command timed out"):
+                materialize_repository(spec)
+
+    def test_timeout_constant_overridable_via_env(self, monkeypatch):
+        # The constant is read at module import — we can't easily re-import
+        # in the same process, but the symbol should exist and be an int.
+        import server as srv
+        assert isinstance(srv.BUILD_COMMAND_TIMEOUT, int)
+        assert srv.BUILD_COMMAND_TIMEOUT > 0

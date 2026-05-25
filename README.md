@@ -764,6 +764,10 @@ repository:
   build_commands:
     - npm install
     - npm run build
+  env_keys:                            # auto-discovered from .env.example
+    - LINKEDIN_EMAIL                   # values live in MCP_ENV_FILE
+    - LINKEDIN_PASSWORD                # (the proxy's .env) and are written
+    - LINKEDIN_LI_AT                   # into <workdir>/.env on every build / spawn
 tools:
   - name: search_jobs                 # advertised as linkedin__search_jobs
     description: Search LinkedIn job postings.
@@ -777,13 +781,56 @@ tools:
 The `package.command` is what spawns the MCP server (just like a regular package provider).
 The new `repository:` block tells the server **how to materialize the workdir on startup**.
 
+#### Secrets from `.env.example`
+
+If the cloned repo contains a `.env.example` (or `.env.sample` / `.env.template`)
+at its root, mcpproxy parses it after the clone step and surfaces every
+`KEY=` line in two places:
+
+1. The wizard's **Secrets** step (so you can fill in values immediately).
+2. The provider's `repository.env_keys` list in YAML (editable in the
+   **📂 Repository** editor box).
+
+Values themselves live in `MCP_ENV_FILE` (the proxy's `.env`) — the same
+storage every other secret uses. At spawn time and on every restart, the
+server:
+
+1. Reads the current values from `MCP_ENV_FILE` and the process environment.
+2. Writes a `.env` file inside `<workdir>` containing only the keys that
+   are actually set (empty / unset keys are skipped).
+3. Passes the same values as environment variables to the spawned MCP
+   subprocess.
+
+This covers both server styles: code that calls `dotenv.config()` /
+`tsx --env-file=.env` reads the on-disk file, while code that reads
+`process.env.X` / `os.environ[X]` sees the env vars directly.
+
+#### Build failures while secrets are missing
+
+A common failure mode: a build command like `npm install` triggers a
+`postinstall` script that requires secrets, but the user hasn't filled
+them in yet. mcpproxy's wizard handles this gracefully:
+
+- The clone step runs first, then `.env.example` is parsed.
+- If a build command then fails, the wizard surfaces the error inline
+  and **still** continues to the Secrets step with the discovered keys.
+- After you fill in the secrets and save, `materialize_repository`
+  re-runs the build on the next server start — with `<workdir>/.env`
+  now populated — and the build succeeds.
+
 #### Editing a repository provider
 
-The editor shows a **📂 Repository** box with the git URL, ref, and build commands.
-- **↻ Re-clone & build** — re-runs `git pull` (or `git clone` on a fresh container)
-  and the build commands, then re-introspects the spawn command.
-- After saving, click **Restart MCP Server** to apply changes — on startup the server
-  walks every repository provider and re-runs clone/build before registering tools.
+The editor shows a **📂 Repository** box with the git URL, ref, build
+commands, and the auto-discovered env keys list.
+- **↻ Re-clone & build** — re-runs `git pull` (or `git clone` on a fresh
+  container) and the build commands, then re-introspects the spawn
+  command. Newly-discovered env keys are merged into the list.
+- **↻ Re-scan** on the env keys row — re-parses `.env.example` without
+  re-running the build (useful if you've just pulled a new commit
+  that adds variables).
+- After saving, click **Restart MCP Server** to apply changes — on
+  startup the server walks every repository provider, re-clones / pulls
+  / re-builds, writes `<workdir>/.env`, then registers tools.
 
 #### Environment variables
 
@@ -976,6 +1023,10 @@ repository:
   build_commands:                  # shell commands run in <workdir> before spawn
     - npm install
     - npm run build
+  env_keys:                        # optional — KEY names whose values live
+    - MY_API_KEY                   # in MCP_ENV_FILE.  A .env file is written
+    - SECRET_TOKEN                 # into <workdir> before every build / spawn.
+                                   # Auto-discovered from .env.example.
 
 # ── Shared optional fields (all provider types) ───────────────────────────────
 

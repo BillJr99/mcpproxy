@@ -10,11 +10,13 @@ from frontend.app import (
     _detect_package_manager,
     _extract_functions,
     _extract_secret_env_keys,
+    _parse_env_example,
     _provider_to_structured,
     _read_env_file,
     _structured_to_yaml,
     _validate_provider,
     _write_env_file,
+    _write_workdir_env_file,
     create_app,
 )
 
@@ -411,7 +413,12 @@ class TestHTML:
         assert "mode/yaml" not in r.text
 
     def test_no_discover_tab(self, client):
-        assert "Discover" not in client.get("/").text
+        # The legacy "Discover" tab and its modal must not appear in the UI.
+        # (Substring "Discover" is allowed e.g. in "Discovered N env keys"
+        # toast text introduced for repository providers.)
+        text = client.get("/").text
+        assert "id=\"discover-tab\"" not in text
+        assert "Discover Tools" not in text
 
     def test_contains_api_calls(self, client):
         assert "/api/tools" in client.get("/").text
@@ -877,7 +884,7 @@ class TestIntrospectCwd:
     def test_cwd_passed_through(self, client):
         captured = {}
 
-        async def fake_introspect(command, cwd=None):
+        async def fake_introspect(command, cwd=None, env_keys=None):
             captured["command"] = command
             captured["cwd"] = cwd
             return []
@@ -893,10 +900,187 @@ class TestIntrospectCwd:
     def test_no_cwd_when_omitted(self, client):
         captured = {}
 
-        async def fake_introspect(command, cwd=None):
+        async def fake_introspect(command, cwd=None, env_keys=None):
             captured["cwd"] = cwd
             return []
 
         with patch("process_runner.introspect", new=fake_introspect):
             client.post("/api/introspect", json={"command": "echo hi"})
         assert captured["cwd"] is None
+
+
+# ---------------------------------------------------------------------------
+# .env.example parsing + workdir .env writing
+# ---------------------------------------------------------------------------
+
+class TestParseEnvExample:
+    def test_returns_keys_in_order(self, tmp_path):
+        (tmp_path / ".env.example").write_text(
+            "# comment line\n"
+            "\n"
+            "FOO=bar\n"
+            "BAZ=\n"
+            'QUOTED="value with spaces"\n'
+        )
+        assert _parse_env_example(tmp_path) == ["FOO", "BAZ", "QUOTED"]
+
+    def test_empty_when_no_file(self, tmp_path):
+        assert _parse_env_example(tmp_path) == []
+
+    def test_falls_back_to_env_sample(self, tmp_path):
+        (tmp_path / ".env.sample").write_text("MY_KEY=x\n")
+        assert _parse_env_example(tmp_path) == ["MY_KEY"]
+
+    def test_falls_back_to_env_template(self, tmp_path):
+        (tmp_path / ".env.template").write_text("TEMPLATE_KEY=x\n")
+        assert _parse_env_example(tmp_path) == ["TEMPLATE_KEY"]
+
+    def test_env_example_wins_over_sample(self, tmp_path):
+        (tmp_path / ".env.example").write_text("A=1\n")
+        (tmp_path / ".env.sample").write_text("B=2\n")
+        assert _parse_env_example(tmp_path) == ["A"]
+
+
+class TestWriteWorkdirEnvFile:
+    def test_writes_only_set_keys(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MY_FOO", "fooval")
+        monkeypatch.delenv("MY_BAR", raising=False)
+        target = _write_workdir_env_file(tmp_path, ["MY_FOO", "MY_BAR"])
+        text = target.read_text()
+        assert "MY_FOO=fooval" in text
+        assert "MY_BAR" not in text
+
+    def test_creates_workdir_if_missing(self, tmp_path, monkeypatch):
+        wd = tmp_path / "sub" / "wd"
+        monkeypatch.setenv("X", "1")
+        _write_workdir_env_file(wd, ["X"])
+        assert (wd / ".env").exists()
+
+    def test_empty_file_when_no_keys_set(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("UNSET_KEY", raising=False)
+        target = _write_workdir_env_file(tmp_path, ["UNSET_KEY"])
+        assert target.read_text() == ""
+
+
+class TestExtractSecretEnvKeysIncludesRepo:
+    def test_repo_env_keys_added(self):
+        spec = {
+            "tools": [{"secrets": {"env": {"a": "TOOL_KEY"}}}],
+            "repository": {"env_keys": ["REPO_A", "REPO_B"]},
+        }
+        keys = _extract_secret_env_keys(spec)
+        assert keys == ["TOOL_KEY", "REPO_A", "REPO_B"]
+
+    def test_dedup_across_tool_and_repo(self):
+        spec = {
+            "tools": [{"secrets": {"env": {"a": "SHARED"}}}],
+            "repository": {"env_keys": ["SHARED", "EXTRA"]},
+        }
+        keys = _extract_secret_env_keys(spec)
+        assert keys == ["SHARED", "EXTRA"]
+
+
+class TestRepositoryRoundTripEnvKeys:
+    def test_round_trip_with_env_keys(self):
+        provider = {**REPOSITORY_PROVIDER, "repo_env_keys": ["LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"]}
+        yaml_str = _structured_to_yaml(provider)
+        spec = yaml.safe_load(yaml_str)
+        assert spec["repository"]["env_keys"] == ["LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"]
+        structured = _provider_to_structured("linkedin", spec)
+        assert structured["repo_env_keys"] == ["LINKEDIN_EMAIL", "LINKEDIN_PASSWORD"]
+
+    def test_empty_env_keys_omitted_from_yaml(self):
+        yaml_str = _structured_to_yaml(REPOSITORY_PROVIDER)  # repo_env_keys not set
+        spec = yaml.safe_load(yaml_str)
+        assert "env_keys" not in spec.get("repository", {})
+
+
+class TestCloneAndBuildEnvKeys:
+    def _patch_repos_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("frontend.app.REPOS_DIR", tmp_path)
+
+    def test_returns_env_keys_from_dot_env_example(self, client, tmp_path, monkeypatch):
+        self._patch_repos_dir(monkeypatch, tmp_path)
+
+        # Fake git clone: when called with "git clone <url> <wd>", write a
+        # .env.example into <wd> as if the repo contained it.
+        def fake_run(args, **kwargs):
+            if len(args) >= 4 and args[0:2] == ["git", "clone"]:
+                wd = Path(args[3])
+                wd.mkdir(parents=True, exist_ok=True)
+                (wd / ".env.example").write_text("API_KEY=\nUSERNAME=\n")
+            class _R: returncode = 0
+            return _R()
+
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "linkedin",
+                "repo_url": "https://e.com/r.git",
+                "build_commands": [],
+            })
+        assert r.json()["ok"] is True
+        assert r.json()["env_keys"] == ["API_KEY", "USERNAME"]
+
+    def test_returns_env_keys_even_when_build_fails(self, client, tmp_path, monkeypatch):
+        import subprocess as sp
+        self._patch_repos_dir(monkeypatch, tmp_path)
+
+        def fake_run(args, **kwargs):
+            if args[0:2] == ["git", "clone"]:
+                wd = Path(args[3])
+                wd.mkdir(parents=True, exist_ok=True)
+                (wd / ".env.example").write_text("NEED_ME=\n")
+                class _R: returncode = 0
+                return _R()
+            if "npm" in args:
+                # build fails because the .env doesn't have the needed value
+                raise sp.CalledProcessError(9, args)
+            class _R: returncode = 0
+            return _R()
+
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "linkedin",
+                "repo_url": "https://e.com/r.git",
+                "build_commands": ["npm install", "npm run build"],
+            })
+        data = r.json()
+        assert data["ok"] is False
+        # Crucially: env_keys still returned so the wizard can populate Secrets
+        assert data["env_keys"] == ["NEED_ME"]
+        assert data["failed_command"] == "npm install"
+
+    def test_writes_env_file_before_build(self, client, tmp_path, monkeypatch):
+        self._patch_repos_dir(monkeypatch, tmp_path)
+        monkeypatch.setenv("NEED_ME", "supplied")
+
+        def fake_run(args, **kwargs):
+            if args[0:2] == ["git", "clone"]:
+                wd = Path(args[3])
+                wd.mkdir(parents=True, exist_ok=True)
+                (wd / ".env.example").write_text("NEED_ME=\n")
+            class _R: returncode = 0
+            return _R()
+
+        with patch("frontend.app.subprocess.run", side_effect=fake_run):
+            r = client.post("/api/clone-and-build", json={
+                "name": "linkedin",
+                "repo_url": "https://e.com/r.git",
+                "build_commands": ["npm install"],
+            })
+        wd = Path(r.json()["workdir"])
+        env_file = wd / ".env"
+        assert env_file.exists()
+        assert "NEED_ME=supplied" in env_file.read_text()
+
+
+class TestScanEnvExampleEndpoint:
+    def test_returns_keys_for_existing_workdir(self, client, tmp_path):
+        (tmp_path / ".env.example").write_text("A=\nB=\n")
+        r = client.post("/api/scan-env-example", json={"workdir": str(tmp_path)})
+        assert r.json()["ok"] is True
+        assert r.json()["env_keys"] == ["A", "B"]
+
+    def test_missing_workdir_400(self, client):
+        r = client.post("/api/scan-env-example", json={})
+        assert r.status_code == 400

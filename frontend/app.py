@@ -86,7 +86,46 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
         for key in (tool.get("secrets") or {}).get("env", {}).values():
             if key not in keys:
                 keys.append(key)
+    # Repository providers may declare extra env keys (auto-discovered from
+    # the cloned repo's .env.example) that drive the underlying server.
+    for key in (spec.get("repository") or {}).get("env_keys") or []:
+        if key and key not in keys:
+            keys.append(key)
     return keys
+
+
+_ENV_EXAMPLE_CANDIDATES = (".env.example", ".env.sample", ".env.template")
+
+
+def _write_workdir_env_file(workdir: str | Path, env_keys: list[str]) -> Path:
+    """Write a ``.env`` file inside ``workdir`` populated from ``os.environ``.
+
+    Only keys with a non-empty value in the current process environment are
+    written.  This lets dotenv-style loaders inside the cloned repo (such as
+    ``tsx --env-file=.env``) pick up secrets supplied via the proxy's
+    Secrets UI without leaking unset placeholders.  Returns the written path.
+    """
+    target = Path(workdir) / ".env"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            lines.append(f"{key}={val}")
+    target.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return target
+
+
+def _parse_env_example(workdir: str | Path) -> list[str]:
+    """Return the ordered list of KEY names from the first .env.example-style
+    file found in ``workdir``.  Returns ``[]`` when no candidate exists.
+    """
+    wd = Path(workdir)
+    for name in _ENV_EXAMPLE_CANDIDATES:
+        candidate = wd / name
+        if candidate.exists():
+            return list(_read_env_file(candidate).keys())
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +213,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         repo_ref = (repo_sub.get("ref") or "").strip()
         build_commands = list(repo_sub.get("build_commands") or [])
         workdir = _repository_workdir(name, repo_sub.get("workdir"))
+        repo_env_keys = list(repo_sub.get("env_keys") or [])
     elif pkg_sub is not None:
         ptype = "package"
         command = (pkg_sub.get("command") or "").strip()
@@ -181,6 +221,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         repo_ref = ""
         build_commands = []
         workdir = ""
+        repo_env_keys = []
     else:
         ptype = "code"
         command = ""
@@ -188,6 +229,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         repo_ref = ""
         build_commands = []
         workdir = ""
+        repo_env_keys = []
 
     return {
         "name": name,
@@ -200,6 +242,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "repo_url": repo_url,
         "repo_ref": repo_ref,
         "build_commands": build_commands,
+        "repo_env_keys": repo_env_keys,
         "workdir": workdir,
         "tools": tools_out,
     }
@@ -231,6 +274,9 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         build_commands = [c for c in (provider.get("build_commands") or []) if c]
         if build_commands:
             repo_block["build_commands"] = build_commands
+        env_keys = [k for k in (provider.get("repo_env_keys") or []) if k]
+        if env_keys:
+            repo_block["env_keys"] = env_keys
         spec["repository"] = repo_block
     else:
         code = (provider.get("code") or "").strip()
@@ -484,6 +530,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         requirements: list[str] = body.get("requirements") or []
         setup_commands: list[str] = body.get("setup_commands") or []
         cwd = (body.get("cwd") or "").strip() or None
+        env_keys = list(body.get("env_keys") or []) or None
         if not command:
             raise HTTPException(400, "command is required")
 
@@ -507,7 +554,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
 
             # 3. Introspect the MCP server
             from process_runner import introspect
-            tools = await introspect(command, cwd=cwd)
+            tools = await introspect(command, cwd=cwd, env_keys=env_keys)
             return {"ok": True, "tools": tools, "package_manager": pm}
         except Exception as exc:
             traceback.print_exc()
@@ -543,25 +590,70 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
 
         workdir = _repository_workdir(name, explicit_workdir)
 
+        # The clone step is required — if that fails we have nothing useful
+        # to return.  Build-command failures are tolerated: they're often
+        # caused by missing .env values, and the user needs the discovered
+        # env_keys back so they can populate secrets and retry on next
+        # restart (when materialize_repository writes .env first).
         try:
             Path(workdir).parent.mkdir(parents=True, exist_ok=True)
             if (Path(workdir) / ".git").exists():
                 subprocess.run(["git", "-C", workdir, "pull", "--ff-only"], check=True)
             else:
                 subprocess.run(["git", "clone", url, workdir], check=True)
-
             if ref:
                 subprocess.run(["git", "-C", workdir, "checkout", ref], check=True)
-
-            for cmd in build_commands:
-                if not cmd:
-                    continue
-                subprocess.run(shlex.split(cmd), check=True, cwd=workdir)
-
-            return {"ok": True, "workdir": workdir}
         except Exception as exc:
             traceback.print_exc()
-            return {"ok": False, "error": str(exc), "workdir": workdir}
+            return {
+                "ok": False,
+                "error": str(exc),
+                "workdir": workdir,
+                "env_keys": [],
+            }
+
+        # Parse .env.example BEFORE running build commands so the user
+        # gets the secret list back even if a build command fails.
+        env_keys = _parse_env_example(workdir)
+
+        # Write a best-effort .env from currently-set environment values so
+        # build commands that already invoke dotenv loaders (e.g.
+        # `tsx --env-file=.env`) succeed when secrets are present.
+        if env_keys:
+            try:
+                _write_workdir_env_file(workdir, env_keys)
+            except Exception:
+                traceback.print_exc()
+
+        for cmd in build_commands:
+            if not cmd:
+                continue
+            try:
+                subprocess.run(shlex.split(cmd), check=True, cwd=workdir)
+            except Exception as exc:
+                traceback.print_exc()
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "failed_command": cmd,
+                    "workdir": workdir,
+                    "env_keys": env_keys,
+                }
+
+        return {"ok": True, "workdir": workdir, "env_keys": env_keys}
+
+    @app.post("/api/scan-env-example")
+    async def scan_env_example(request: Request) -> dict:
+        """Re-scan ``<workdir>/.env.example`` (or sibling) and return KEY names."""
+        body = await request.json()
+        workdir = (body.get("workdir") or "").strip()
+        if not workdir:
+            raise HTTPException(400, "workdir is required")
+        try:
+            return {"ok": True, "env_keys": _parse_env_example(workdir)}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "env_keys": []}
 
     # ── Function extractor (code providers) ──────────────────────────────────
 
@@ -933,7 +1025,18 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
               <button class="btn btn-sm btn-outline-secondary py-0" onclick="addBuildCommand()">+ Add</button>
             </label>
             <div id="build-commands-container"></div>
-            <div class="text-muted" style="font-size:.8em">Shell commands run inside the workdir before the MCP server is spawned. Re-runs on every server start.</div>
+            <div class="text-muted" style="font-size:.8em">Shell commands run inside the workdir before the MCP server is spawned. Re-runs on every server start. Don't put long-running server start commands here.</div>
+          </div>
+          <div class="mb-2">
+            <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Env keys <span class="text-muted fw-normal" style="text-transform:none">— discovered from .env.example; values live in Secrets</span></span>
+              <span class="d-flex gap-2">
+                <button class="btn btn-sm btn-outline-secondary py-0" onclick="rescanEnvExample()" title="Re-scan .env.example in the workdir">↻ Re-scan</button>
+                <button class="btn btn-sm btn-outline-secondary py-0" onclick="addEnvKey()">+ Add</button>
+              </span>
+            </label>
+            <div id="env-keys-container"></div>
+            <div class="text-muted" style="font-size:.8em">A <code>.env</code> file is written into the workdir from your secrets before every build / spawn — so dotenv loaders (<code>tsx --env-file=.env</code>, etc.) pick them up.</div>
           </div>
           <div class="text-muted" style="font-size:.8em">Workdir: <code id="f-repo-workdir">(auto)</code></div>
           <div id="rebuild-status" class="mt-2 fn-status"></div>
@@ -1095,18 +1198,18 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <input class="form-control font-monospace" id="wz-repo-ref" placeholder="main">
           </div>
           <div class="mb-3">
-            <label class="form-label">Build commands <span class="text-muted fw-normal" style="text-transform:none">run inside the cloned workdir, in order</span></label>
+            <label class="form-label">Build commands <span class="text-muted fw-normal" style="text-transform:none">run inside the cloned workdir, in order — must terminate</span></label>
             <div id="wz-repo-builds-container"></div>
             <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzAddRepoBuild()">+ Add command</button>
-            <div class="text-muted mt-1" style="font-size:.8em">e.g. <code>npm install</code>, <code>npm run build</code>. Re-runs on every server start so ephemeral containers rebuild.</div>
+            <div class="text-muted mt-1" style="font-size:.8em">e.g. <code>npm install</code>, <code>npm run build</code>. <b>Do not</b> put the long-running server start here (e.g. <code>npm run start:dev</code>) — that goes in <b>Spawn command</b>. Build commands re-run on every server start so ephemeral containers rebuild.</div>
           </div>
           <div class="mb-3">
             <label class="form-label">Spawn command *</label>
             <input class="form-control font-monospace" id="wz-repo-cmd"
               placeholder="node dist/main.js">
-            <div class="text-muted mt-1" style="font-size:.8em">The command used to launch the stdio MCP server, run from inside the workdir after the build commands complete.</div>
+            <div class="text-muted mt-1" style="font-size:.8em">The long-running command that launches the stdio MCP server, run from inside the workdir after the build commands complete.</div>
           </div>
-          <div class="text-muted" style="font-size:.8em">Clicking <b>Next</b> clones the repo, runs the build commands, then introspects the spawn command to populate the tool list. All settings are saved to YAML so the server can re-build on container restart.</div>
+          <div class="text-muted" style="font-size:.8em">Clicking <b>Next</b> clones the repo, parses <code>.env.example</code> (so its keys appear as secrets on the next step), runs the build commands, then introspects the spawn command to populate the tool list. If the build fails because secrets aren't set yet, you can still continue — the next server restart will re-build with the secrets in place.</div>
           <div id="wz-repo-result" class="mt-2"></div>
         </div>
 
@@ -1327,6 +1430,7 @@ async function discoverFunctions() {
         requirements: currentProvider.requirements || [],
         setup_commands: currentProvider.setup_commands || [],
         cwd: isRepo ? (currentProvider.workdir || '') : '',
+        env_keys: isRepo ? (currentProvider.repo_env_keys || []) : [],
       });
       if (!r.ok) throw new Error(r.error || 'introspection failed');
       knownFunctions = (r.tools || []).map(t => t.name).filter(Boolean);
@@ -1422,6 +1526,7 @@ function renderProvider(p) {
     document.getElementById('f-repo-ref').value = p.repo_ref || '';
     document.getElementById('f-repo-workdir').textContent = p.workdir || '(auto)';
     renderBuildCommands(p.build_commands || []);
+    renderEnvKeys(p.repo_env_keys || []);
   }
   if (isCode) {
     codeEditor.setValue(p.code || '');
@@ -1468,6 +1573,52 @@ function updateRepoField(key, val) {
   currentProvider[key] = val;
 }
 
+// Env keys list (repository providers)
+function renderEnvKeys(keys) {
+  const c = document.getElementById('env-keys-container');
+  if (!keys.length) { c.innerHTML = '<div class="text-muted" style="font-size:.8em">(none discovered — no .env.example in the repo, or repo not built yet)</div>'; return; }
+  c.innerHTML = keys.map((k, i) => `
+    <div class="list-row" id="ek-row-${i}">
+      <input class="form-control form-control-sm font-monospace" placeholder="MY_API_KEY"
+        value="${esc(k)}" oninput="updateEnvKey(${i},this.value)">
+      <button class="btn-icon" onclick="removeEnvKey(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function addEnvKey() {
+  ensureProvider();
+  currentProvider.repo_env_keys = currentProvider.repo_env_keys || [];
+  currentProvider.repo_env_keys.push('');
+  renderEnvKeys(currentProvider.repo_env_keys);
+}
+
+function removeEnvKey(i) {
+  ensureProvider();
+  currentProvider.repo_env_keys.splice(i, 1);
+  renderEnvKeys(currentProvider.repo_env_keys);
+}
+
+function updateEnvKey(i, val) {
+  ensureProvider();
+  currentProvider.repo_env_keys[i] = val.trim();
+}
+
+async function rescanEnvExample() {
+  if (!currentProvider || currentProvider.type !== 'repository') return;
+  const wd = currentProvider.workdir;
+  if (!wd) { toast('No workdir — click Re-clone & build first', false); return; }
+  try {
+    const r = await api('POST', '/api/scan-env-example', {workdir: wd});
+    if (!r.ok) throw new Error(r.error || 'scan failed');
+    // Merge: preserve any keys the user typed manually, add new ones from .env.example
+    const existing = new Set(currentProvider.repo_env_keys || []);
+    (r.env_keys || []).forEach(k => existing.add(k));
+    currentProvider.repo_env_keys = Array.from(existing);
+    renderEnvKeys(currentProvider.repo_env_keys);
+    toast(`Discovered ${r.env_keys.length} env key(s)`);
+  } catch (e) { toast(e.message, false); }
+}
+
 async function rebuildRepository() {
   if (!currentProvider || currentProvider.type !== 'repository') return;
   const el = document.getElementById('rebuild-status');
@@ -1481,9 +1632,20 @@ async function rebuildRepository() {
       build_commands: currentProvider.build_commands || [],
       workdir: currentProvider.workdir || '',
     });
-    if (!r.ok) throw new Error(r.error || 'build failed');
-    currentProvider.workdir = r.workdir;
-    document.getElementById('f-repo-workdir').textContent = r.workdir;
+    currentProvider.workdir = r.workdir || currentProvider.workdir;
+    document.getElementById('f-repo-workdir').textContent = currentProvider.workdir;
+    // Merge discovered env_keys with whatever the user already has
+    if (r.env_keys && r.env_keys.length) {
+      const existing = new Set(currentProvider.repo_env_keys || []);
+      r.env_keys.forEach(k => existing.add(k));
+      currentProvider.repo_env_keys = Array.from(existing);
+      renderEnvKeys(currentProvider.repo_env_keys);
+    }
+    if (!r.ok) {
+      el.className = 'fn-status error';
+      el.textContent = (r.error || 'build failed') + (r.failed_command ? ` (running ${r.failed_command})` : '');
+      return;
+    }
     el.className = 'fn-status ok';
     el.textContent = `Built ✓ (workdir: ${r.workdir})`;
     discoverFunctions().catch(() => {});
@@ -1733,6 +1895,7 @@ function collectProvider() {
     p.repo_url = document.getElementById('f-repo-url').value.trim();
     p.repo_ref = document.getElementById('f-repo-ref').value.trim();
     p.build_commands = (currentProvider.build_commands || []).filter(c => c.trim());
+    p.repo_env_keys = (currentProvider.repo_env_keys || []).filter(k => k.trim());
   } else if (p.type === 'package') {
     p.command = document.getElementById('f-command').value.trim();
   } else {
@@ -2010,26 +2173,37 @@ async function wzNext() {
     nextBtn.disabled = true;
     const origText = nextBtn.textContent;
     const resultEl = document.getElementById('wz-repo-result');
-    let workdir = '';
+    let workdir = '', env_keys = [], buildFailed = false;
     try {
       nextBtn.textContent = '⏳ Cloning & building…';
       resultEl.innerHTML = '<span class="text-muted" style="font-size:.875em">Cloning repo and running build commands — this may take a while…</span>';
       const cb = await api('POST', '/api/clone-and-build', {
         name, repo_url: url, ref, build_commands,
       });
-      if (!cb.ok) throw new Error(cb.error || 'clone/build failed');
-      workdir = cb.workdir;
-      resultEl.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Built in <code>${esc(workdir)}</code></div>`;
-      nextBtn.textContent = '⏳ Introspecting…';
-      const ir = await api('POST', '/api/introspect', {
-        command: cmd, cwd: workdir,
-      });
-      if (!ir.ok) {
-        resultEl.innerHTML += `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(ir.error||'')}). Continuing — add tools manually in the editor.</div>`;
-        wzIntrospectedTools = [];
+      workdir = cb.workdir || '';
+      env_keys = cb.env_keys || [];
+      if (!cb.ok) {
+        // Build failure is tolerated — we still have a workdir and the
+        // env_keys discovered from .env.example.  Surface the error and
+        // let the user continue to the Secrets step.
+        buildFailed = true;
+        resultEl.innerHTML = `<div class="text-warning" style="font-size:.875em">⚠ Build failed: ${esc(cb.error || '')}${cb.failed_command ? ` (running <code>${esc(cb.failed_command)}</code>)` : ''}.</div>`;
+        if (env_keys.length) {
+          resultEl.innerHTML += `<div style="font-size:.875em;color:var(--yellow)">Discovered ${env_keys.length} env key(s) from .env.example. Fill them in on the next step and the build will run again on the next server restart.</div>`;
+        }
       } else {
-        wzIntrospectedTools = ir.tools || [];
-        resultEl.innerHTML += `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s)</div>`;
+        resultEl.innerHTML = `<div style="color:var(--green);font-size:.875em">✓ Built in <code>${esc(workdir)}</code>${env_keys.length ? ` · Discovered ${env_keys.length} env key(s) from .env.example` : ''}</div>`;
+        nextBtn.textContent = '⏳ Introspecting…';
+        const ir = await api('POST', '/api/introspect', {
+          command: cmd, cwd: workdir, env_keys,
+        });
+        if (!ir.ok) {
+          resultEl.innerHTML += `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(ir.error||'')}). Continuing — add tools manually in the editor.</div>`;
+          wzIntrospectedTools = [];
+        } else {
+          wzIntrospectedTools = ir.tools || [];
+          resultEl.innerHTML += `<div style="color:var(--green);font-size:.875em">✓ Found ${wzIntrospectedTools.length} tool(s)</div>`;
+        }
       }
     } catch (e) {
       errEl.textContent = e.message;
@@ -2041,12 +2215,13 @@ async function wzNext() {
       nextBtn.disabled = false;
       nextBtn.textContent = origText;
     }
-    const provider = {
-      name, type: 'repository', command: cmd, documentation: '', code: '',
-      repo_url: url, repo_ref: ref, workdir,
-      build_commands,
-      requirements: [], setup_commands: [],
-      tools: wzIntrospectedTools.map(t => ({
+    // Repository providers with a build failure may have no tools yet —
+    // add a placeholder so the create-provider validation passes.  Users
+    // can replace it once secrets are populated and the next restart
+    // builds successfully.
+    let tools;
+    if (wzIntrospectedTools.length) {
+      tools = wzIntrospectedTools.map(t => ({
         name: t.name,
         function: '',
         description: t.description || '',
@@ -2054,13 +2229,27 @@ async function wzNext() {
         enabled: true,
         parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
         secrets: [],
-      })),
+      }));
+    } else {
+      tools = [{
+        name: '_placeholder', function: '',
+        description: 'Placeholder — re-introspect after the next successful build.',
+        documentation: '', enabled: false, parameters: [], secrets: [],
+      }];
+    }
+    const provider = {
+      name, type: 'repository', command: cmd, documentation: '', code: '',
+      repo_url: url, repo_ref: ref, workdir,
+      build_commands,
+      repo_env_keys: env_keys,
+      requirements: [], setup_commands: [],
+      tools,
     };
     try {
       const r = await api('POST', '/api/tools', {name, provider});
       currentName = name; currentProvider = provider;
       loadList();
-      await wzGoSecrets(r.secret_keys || []);
+      await wzGoSecrets(r.secret_keys || env_keys);
     } catch(e) { errEl.textContent = e.message; }
     return;
   }

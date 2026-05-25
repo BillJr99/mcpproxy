@@ -16,3 +16,6 @@ __pycache__/
 .git/
 .github/
 *.md
+
+# Playwright MCP browser data
+.playwright-mcp/

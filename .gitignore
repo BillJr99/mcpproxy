@@ -30,3 +30,6 @@ dist/
 
 # Local tool configs (not committed — mount into Docker at runtime)
 tools/
+
+# Playwright MCP browser data
+.playwright-mcp/

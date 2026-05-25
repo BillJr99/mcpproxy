@@ -477,6 +477,121 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         _write_env_file(_env_file, updates)
         return {"ok": True, "written": list(updates.keys())}
 
+    # ── OpenAI-compatible tool endpoints ─────────────────────────────────────
+    #
+    # These endpoints let OpenAI-style callers (e.g. OpenWebUI tool servers)
+    # list and invoke the same tools exposed over MCP on port 8888 — without
+    # speaking the MCP protocol.  They are a pure addition: the /mcp endpoint
+    # and all /api/* endpoints are completely unaffected.
+    #
+    # GET  /v1/tools                    — list tools in OpenAI function-calling format
+    # POST /v1/tools/{tool_name}/invoke — call a tool with {"arguments": {...}}
+
+    @app.get("/v1/tools")
+    async def list_openai_tools() -> dict:
+        """Return all registered tools in OpenAI function-calling schema format.
+
+        Response shape::
+
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "playwright__browser_navigate",
+                            "description": "...",
+                            "parameters": { <JSON Schema> }
+                        }
+                    },
+                    ...
+                ]
+            }
+        """
+        import tool_registry
+        tools_out = []
+        for name, entry in tool_registry.get_all().items():
+            spec = entry["spec"]
+            input_schema = spec.get("input_schema") or {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+            tools_out.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": spec.get("description", ""),
+                    "parameters": input_schema,
+                },
+            })
+        return {"tools": tools_out}
+
+    @app.post("/v1/tools/{tool_name}/invoke")
+    async def invoke_openai_tool(tool_name: str, request: Request) -> dict:
+        """Invoke a registered tool by name with caller-supplied arguments.
+
+        Request body::
+
+            {"arguments": {"param1": "value1", ...}}
+
+        Success response::
+
+            {
+                "type": "tool_result",
+                "content": [{"type": "text", "text": "..."}],
+                "is_error": false
+            }
+
+        Error response (tool not found → HTTP 404; handler exception → HTTP 200 with
+        ``is_error: true`` so that LLM callers can see the error message as a tool
+        result rather than receiving a 5xx)::
+
+            {
+                "type": "tool_result",
+                "content": [{"type": "text", "text": "<error message>"}],
+                "is_error": true
+            }
+        """
+        import tool_registry
+        entry = tool_registry.get(tool_name)
+        if entry is None:
+            raise HTTPException(404, f"Tool '{tool_name}' not found")
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        arguments: dict[str, Any] = (body.get("arguments") if isinstance(body, dict) else None) or {}
+        handler = entry["handler"]
+
+        try:
+            # dynamic_tool signature: (ctx: Context, **kwargs).
+            # Passing ctx=None is safe — build_runtime_context stores it as
+            # {"mcp_context": None} and tool handlers that don't use MCP
+            # context features won't notice.
+            result = await handler(None, **arguments)
+
+            # Normalise the result to a content array so callers always get a
+            # consistent shape regardless of what the underlying handler returns.
+            if isinstance(result, str):
+                content = [{"type": "text", "text": result}]
+            elif isinstance(result, dict) and "content" in result:
+                content = result["content"]
+            elif isinstance(result, list):
+                content = result
+            else:
+                content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
+
+            return {"type": "tool_result", "content": content, "is_error": False}
+
+        except Exception as exc:
+            traceback.print_exc()
+            return {
+                "type": "tool_result",
+                "content": [{"type": "text", "text": str(exc)}],
+                "is_error": True,
+            }
+
     # ── Restart ───────────────────────────────────────────────────────────────
 
     @app.post("/api/restart")

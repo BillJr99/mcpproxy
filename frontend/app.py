@@ -544,6 +544,8 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         workdir = _repository_workdir(name, explicit_workdir)
 
         try:
+            from server import _ensure_git_installed
+            _ensure_git_installed()
             Path(workdir).parent.mkdir(parents=True, exist_ok=True)
             if (Path(workdir) / ".git").exists():
                 subprocess.run(["git", "-C", workdir, "pull", "--ff-only"], check=True)

@@ -640,7 +640,7 @@ Use the **+ New Provider → npx package** wizard in the web UI, or create the Y
 
 ```yaml
 npx:
-  command: npx @playwright/mcp@latest --isolated
+  command: npx @playwright/mcp@latest --headless --isolated
 
 tools:
   # Populated automatically by the UI's Introspect button — or fill manually
@@ -654,6 +654,10 @@ tools:
           description: The URL to navigate to.
       required: [url]
 ```
+
+> **`--headless`** runs Chromium without a visible window — required inside Docker or any
+> headless server environment. Remove it if you want to watch the browser on a desktop.
+> **`--isolated`** gives each session its own browser context (no shared cookies/storage).
 
 The server spawns the `npx` process, performs the MCP handshake once, then forwards
 every tool call to it. The process is reused across calls (and started lazily on the

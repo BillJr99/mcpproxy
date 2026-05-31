@@ -250,7 +250,9 @@ Follow logs with `docker logs -f mcpproxy`; stop the container with `docker stop
 > `handlers/` is part of the image — no mount required.
 
 **Run from a persistent home directory** — store tools and secrets in `~/.mcpproxy` so
-you can run the image from any working directory and the web UI can read and write `.env`:
+you can run the image from any working directory and the web UI can read and write `.env`.
+This is the recommended day-to-day command — it combines the persistent home directory
+with the named cache volumes:
 
 ```bash
 # First time only — create the directory and an empty .env
@@ -263,13 +265,42 @@ docker run -d \
   -e MCP_ENV_FILE=/app/.env \
   -v "$HOME/.mcpproxy/tools:/app/tools" \
   -v "$HOME/.mcpproxy/.env:/app/.env" \
+  -v mcpproxy-files:/app/files \
+  -v mcpproxy-repos:/app/repos \
+  -v mcpproxy-cache:/root/.cache \
+  -v mcpproxy-npm:/root/.npm \
+  -v mcpproxy-uv-tools:/root/.local/share/uv \
+  -v mcpproxy-mcp-auth:/app/.mcp-auth \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
 
-Two things differ from the minimal command:
-- `--env-file` injects secrets as environment variables at startup; Docker does **not** expand `~` inside double quotes, so `$HOME` is used instead.
-- `-v "$HOME/.mcpproxy/.env:/app/.env"` + `-e MCP_ENV_FILE=/app/.env` also mount the file itself into the container so the web UI's **🔑 Secrets** panel can read and write values without leaving the browser.
+#### `.env`: the two flags it needs, and why
+
+The `.env` file is referenced **twice** above, and each reference does a different job —
+both point at the **same local file** on your host:
+
+| Flag | Local path → target | What it does |
+| ---- | ------------------- | ------------ |
+| `--env-file "$HOME/.mcpproxy/.env"` | host file, parsed by Docker | Reads the file and injects each `KEY=value` line as an **environment variable** in the container at startup. |
+| `-v "$HOME/.mcpproxy/.env:/app/.env"` | host file → `/app/.env` | Bind-**mounts the file itself** into the container so the proxy can read it directly (via `MCP_ENV_FILE`, which the image defaults to `/app/.env`) and pass values to the MCP tool subprocesses it spawns. It also lets the web UI's **🔑 Secrets** panel read and write values live. |
+
+Notes:
+- In **both** flags, the path is your **local** `.env` on the host — `--env-file` takes the
+  host path directly, and the **left** side of `-v host:container` is the host path while
+  the **right** side (`/app/.env`) is where it appears inside the container.
+- The file must already exist (hence the `touch` above). If it's missing, `--env-file`
+  errors that the file isn't found, and the `-v` mount would create a *directory* named
+  `.env` instead.
+- Docker does **not** expand `~` inside double quotes, so use `$HOME` instead.
+- `-e MCP_ENV_FILE=/app/.env` is shown for clarity, but it's optional — the image already
+  defaults `MCP_ENV_FILE` to `/app/.env`. You only *need* it if you mount the file somewhere
+  else.
+
+The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
+providers (e.g. the official Asana MCP); persist it and you authorize once. Map the OAuth
+callback port (`-p 3334:3334`) the first time you authorize. Omit any volume you don't need
+— each falls back to the container's ephemeral writable layer.
 
 Available tags:
 

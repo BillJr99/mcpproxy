@@ -259,7 +259,7 @@ with the named cache volumes:
 mkdir -p ~/.mcpproxy/tools
 touch ~/.mcpproxy/.env
 
-docker run -d --rm \
+docker run -d \
   -p 8888:8888 -p 8889:8889 \
   --env-file "$HOME/.mcpproxy/.env" \
   -v "$HOME/.mcpproxy/tools:/app/tools" \

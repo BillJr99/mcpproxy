@@ -224,9 +224,17 @@ docker run -d --rm \
   -v mcpproxy-cache:/root/.cache \
   -v mcpproxy-npm:/root/.npm \
   -v mcpproxy-uv-tools:/root/.local/share/uv \
+  -v mcpproxy-mcp-auth:/app/.mcp-auth \
+  -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
+
+The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
+providers (e.g. the official Asana MCP). Persist it and you authorize once, then the
+token refreshes silently; drop it and you re-authorize on every fresh container. Also
+map the OAuth callback port (`-p 3334:3334`) the first time you authorize. Omit both if
+you have no OAuth-bridge providers.
 
 Every volume above is optional — omit any subset and that path falls back to the
 container's ephemeral writable layer. See **[Volumes & caching](#volumes--caching)**
@@ -338,9 +346,9 @@ MCP_HOST_PORT=9000 UI_HOST_PORT=9001 docker compose up
 
 ### Volumes & caching
 
-`docker-compose.yml` declares six named volumes. Only the first is required —
-the rest persist caches and artefacts that would otherwise be re-downloaded
-or re-built on every fresh container.
+`docker-compose.yml` declares seven named volumes. Only the first is required —
+the rest persist caches, artefacts, and OAuth tokens that would otherwise be
+re-downloaded, re-built, or re-authorized on every fresh container.
 
 | Container path | Volume | Holds | Without it (cold start) |
 |---|---|---|---|
@@ -350,11 +358,13 @@ or re-built on every fresh container.
 | `/root/.cache` | `mcpproxy-cache` | XDG caches: pip wheels, uv wheels, Playwright browser binaries (`ms-playwright`) | pip/uvx re-download wheels; `npx playwright install chrome` re-fetches ~150 MB. |
 | `/root/.npm` | `mcpproxy-npm` | npm/npx package cache | npx re-downloads packages from the npm registry on first call. |
 | `/root/.local/share/uv` | `mcpproxy-uv-tools` | uvx per-tool venvs | uvx re-creates per-tool venvs from cached wheels. |
+| `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens aren't exposed via `mcpproxy__getfile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
 
-In dev (`docker-compose.override.yml`), `mcpproxy-tools`, `mcpproxy-files`, and
-`mcpproxy-repos` are replaced with bind mounts (`./tools`, `./files`, `./repos`) so
-you can inspect or edit them from the host. The three cache volumes remain named
-volumes even in dev — they're opaque package-manager state, not files you read.
+In dev (`docker-compose.override.yml`), `mcpproxy-tools`, `mcpproxy-files`,
+`mcpproxy-repos`, and `mcpproxy-mcp-auth` are replaced with bind mounts (`./tools`,
+`./files`, `./repos`, `./.mcp-auth`) so you can inspect or edit them from the host
+(`./.mcp-auth` is gitignored — it holds live tokens). The three cache volumes remain
+named volumes even in dev — they're opaque package-manager state, not files you read.
 
 For ephemeral / CI runs, drop any subset of volumes — the proxy still works,
 just slower on the first tool call after each cold start.

@@ -19,6 +19,12 @@
 #                                               Playwright browser binaries, …)
 # mcpproxy-npm      /root/.npm                — npm/npx package cache
 # mcpproxy-uv-tools /root/.local/share/uv     — uvx per-tool venvs
+# mcpproxy-mcp-auth /app/.mcp-auth            — OAuth token cache for mcp-remote
+#                                               bridges (e.g. the Asana provider).
+#                                               PERSIST THIS: it holds the refresh
+#                                               token, so you only authorize once.
+#                                               Kept out of /app/files so tokens are
+#                                               never exposed via mcpproxy__getfile.
 #
 # Every cache/artefact volume is optional in spirit — remove the entry and the
 # container falls back to ephemeral storage on its writable layer (re-clones,
@@ -32,6 +38,9 @@ services:
     ports:
       - "${MCP_HOST_PORT:-8888}:8888"
       - "${UI_HOST_PORT:-8889}:8889"
+      # OAuth callback for mcp-remote bridges (e.g. Asana). Only needed while
+      # authorizing in a browser the first time; harmless to leave mapped.
+      - "${MCP_OAUTH_CALLBACK_PORT:-3334}:3334"
     env_file:
       - ./.env
     environment:
@@ -39,6 +48,9 @@ services:
       MCP_ENV_FILE: "/app/.env"
       MCPPROXY_FILES_DIR: "/app/files"
       MCPPROXY_REPOS_DIR: "/app/repos"
+      # Where mcp-remote caches OAuth tokens (access + refresh). Persisted via
+      # the mcpproxy-mcp-auth volume so you authorize once and refresh silently.
+      MCP_REMOTE_CONFIG_DIR: "/app/.mcp-auth"
     volumes:
       - mcpproxy-tools:/app/tools
       - mcpproxy-files:/app/files
@@ -46,6 +58,7 @@ services:
       - mcpproxy-cache:/root/.cache
       - mcpproxy-npm:/root/.npm
       - mcpproxy-uv-tools:/root/.local/share/uv
+      - mcpproxy-mcp-auth:/app/.mcp-auth
       - ./.env:/app/.env
 
 volumes:
@@ -55,3 +68,4 @@ volumes:
   mcpproxy-cache:
   mcpproxy-npm:
   mcpproxy-uv-tools:
+  mcpproxy-mcp-auth:

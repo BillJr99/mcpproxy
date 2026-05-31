@@ -35,5 +35,8 @@ tools/
 files/
 repos/
 
+# OAuth token cache for mcp-remote bridges (contains live access/refresh tokens)
+.mcp-auth/
+
 # Legacy Playwright MCP output directory (replaced by ./files in docker-compose)
 .playwright-mcp/

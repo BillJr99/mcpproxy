@@ -17,7 +17,8 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
   spawn the resulting stdio MCP server — useful for servers distributed only as source
 - Or a `package:` block running the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote)
   bridge to reach a **remote, OAuth-protected** server (e.g. the official Asana MCP) — the
-  bridge walks you through the OAuth flow and refreshes the token automatically
+  bridge walks you through the OAuth flow and refreshes the token automatically. The web UI's
+  **Remote MCP Server** wizard option builds this for you from just the server URL.
 
 `server.py` loads every YAML at startup, installs declared `requirements` (pip packages),
 runs `setup_commands`, then registers each tool automatically — no Python files to
@@ -828,10 +829,16 @@ endpoints**. The official Asana server is one: it lives at `https://mcp.asana.co
 (Streamable HTTP) and is reached through an OAuth 2.1 authorization-code (PKCE) flow — there's
 no static API key. mcpproxy speaks stdio to its upstreams, so these are bridged with the
 community [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) adapter, which is itself just
-a `package:` command:
+a `package:` command.
+
+The easiest way to add one is the web UI's **+ New Provider → 🌐 Remote MCP Server** option:
+paste the server URL (e.g. `https://mcp.asana.com/v2/mcp`) and mcpproxy builds the
+`npx -y mcp-remote <url>` command, introspects the tool list, and walks you through the OAuth
+flow. The equivalent YAML it produces (which you can also write by hand) is:
 
 ```yaml
-# examples/asana.yaml — copy into your tools/ config dir (or use the wizard)
+# Paste into your tools/ config dir, or use the wizard's "Remote MCP Server"
+# option (just paste the URL — it builds this command for you).
 package:
   command: npx -y mcp-remote https://mcp.asana.com/v2/mcp
 
@@ -846,8 +853,8 @@ itself stays a thin stdio proxy:
 
 - **First run** (or after the refresh token expires / is revoked): `mcp-remote` prints an
   authorization URL and blocks the MCP handshake until you authorize. When you introspect the
-  command in the **+ New Provider → Package** wizard, mcpproxy scrapes that URL from stderr and
-  shows a clickable **🔐 Authorize** link (it's also logged as
+  server in the **+ New Provider → Remote MCP Server** (or **Package**) wizard, mcpproxy scrapes
+  that URL from stderr and shows a clickable **🔐 Authorize** link (it's also logged as
   `authorization required … visit:`). Open it, approve access in Asana, and the localhost
   callback (`:3334`) completes the flow — introspection then continues automatically and the
   tool list populates.

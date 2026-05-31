@@ -211,6 +211,18 @@ class TestCreateTool:
         assert "package" in spec
         assert "npx" not in spec
 
+    def test_remote_provider_saved_as_package(self, client, tools_dir):
+        """The wizard's Remote MCP Server option produces a package provider
+        whose YAML bridges the URL via mcp-remote (matching the Asana example)."""
+        provider = {
+            **PACKAGE_PROVIDER,
+            "command": "npx -y mcp-remote https://mcp.asana.com/v2/mcp",
+        }
+        client.post("/api/tools", json={"name": "asana", "provider": provider})
+        spec = yaml.safe_load((tools_dir / "asana.yaml").read_text())
+        assert "package" in spec
+        assert spec["package"]["command"] == "npx -y mcp-remote https://mcp.asana.com/v2/mcp"
+
     def test_requirements_saved_to_yaml(self, client, tools_dir):
         provider = {**CODE_PROVIDER, "requirements": ["httpx"]}
         client.post("/api/tools", json={"name": "myprovider", "provider": provider})

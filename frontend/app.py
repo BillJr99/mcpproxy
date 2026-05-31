@@ -1142,25 +1142,25 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
         <div id="wz-type" class="wizard-step active">
           <p class="text-muted mb-4">How do you want to create this provider?</p>
           <div class="row g-3">
-            <div class="col-md-4">
-              <div class="card wizard-choice h-100" onclick="wzSelectType('code')">
+            <div class="col-md-3">
+              <div class="card wizard-choice h-100" onclick="wzSelectType('remote')">
                 <div class="card-body text-center p-4">
-                  <div style="font-size:2.5em">🐍</div>
-                  <h6 class="mt-2">Python Code</h6>
-                  <small class="text-muted">Write <code>async def</code> functions — each one becomes an MCP tool</small>
+                  <div style="font-size:2.5em">🌐</div>
+                  <h6 class="mt-2">Remote MCP Server</h6>
+                  <small class="text-muted">Bridge a remote, OAuth-protected MCP server — just paste its URL (e.g. the official Asana server). Tools &amp; auth are handled automatically.</small>
                 </div>
               </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
               <div class="card wizard-choice h-100" onclick="wzSelectType('package')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">📦</div>
                   <h6 class="mt-2">Package</h6>
-                  <small class="text-muted">Run an existing MCP server via <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or any command — tools are auto-detected</small>
+                  <small class="text-muted">Run an existing MCP server via <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or any command — or bridge a remote server with <code>npx -y mcp-remote &lt;url&gt;</code>. Tools are auto-detected.</small>
                 </div>
               </div>
             </div>
-            <div class="col-md-4">
+            <div class="col-md-3">
               <div class="card wizard-choice h-100" onclick="wzSelectType('repository')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">📂</div>
@@ -1169,7 +1169,32 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                 </div>
               </div>
             </div>
+            <div class="col-md-3">
+              <div class="card wizard-choice h-100" onclick="wzSelectType('code')">
+                <div class="card-body text-center p-4">
+                  <div style="font-size:2.5em">🐍</div>
+                  <h6 class="mt-2">Python Code</h6>
+                  <small class="text-muted">Write <code>async def</code> functions — each one becomes an MCP tool</small>
+                </div>
+              </div>
+            </div>
           </div>
+        </div>
+
+        <!-- Step: remote MCP server (URL → mcp-remote bridge) -->
+        <div id="wz-remote" class="wizard-step">
+          <div class="mb-3">
+            <label class="form-label">Provider name</label>
+            <input class="form-control" id="wz-remote-name" placeholder="asana">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Server URL *</label>
+            <input class="form-control font-monospace" id="wz-remote-url"
+              placeholder="https://mcp.asana.com/v2/mcp">
+            <div class="text-muted mt-1" style="font-size:.8em">The remote MCP server endpoint. mcpproxy bridges it with <code>npx -y mcp-remote &lt;url&gt;</code> — transport is auto-detected.</div>
+          </div>
+          <div class="text-muted" style="font-size:.8em">When you click <b>Next</b> the server is introspected automatically; its tools become the dropdown options in the editor. If the server is OAuth-protected, a clickable <b>🔐 Authorize</b> link appears — complete the browser flow and introspection continues. The token is cached and refreshed automatically afterwards.</div>
+          <div id="wz-remote-result" class="mt-2"></div>
         </div>
 
         <!-- Step: package command -->
@@ -1182,7 +1207,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <label class="form-label">Command *</label>
             <input class="form-control font-monospace" id="wz-pkg-cmd"
               placeholder="npx @playwright/mcp@latest  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github">
-            <div class="text-muted mt-1" style="font-size:.8em">Any command that spawns a stdio MCP server (npx, uvx, python -m, or an installed binary).</div>
+            <div class="text-muted mt-1" style="font-size:.8em">Any command that spawns a stdio MCP server (npx, uvx, python -m, or an installed binary). To bridge a remote, OAuth-protected MCP server, use <code>npx -y mcp-remote &lt;url&gt;</code> (or pick the <b>Remote MCP Server</b> option, which builds this for you).</div>
           </div>
           <div class="mb-3">
             <label class="form-label">pip Requirements <span class="text-muted fw-normal" style="text-transform:none">optional</span></label>
@@ -1290,7 +1315,7 @@ let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null;
-let wzType = null;            // 'code' | 'package' | 'repository'
+let wzType = null;            // 'code' | 'package' | 'repository' | 'remote'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
 let wzRepoCtx = null;         // repository-wizard state carried across steps
@@ -2076,7 +2101,7 @@ async function saveSecrets() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Wizard
 // ─────────────────────────────────────────────────────────────────────────────
-const WZ_STEPS = ['type','package','repository','code','secrets'];
+const WZ_STEPS = ['type','remote','package','repository','code','secrets'];
 
 function wzShowStep(step) {
   WZ_STEPS.forEach(s => {
@@ -2107,6 +2132,9 @@ function openWizard() {
   document.getElementById('wz-repo-cmd').value = '';
   document.getElementById('wz-repo-builds-container').innerHTML = '';
   document.getElementById('wz-repo-result').innerHTML = '';
+  document.getElementById('wz-remote-name').value = '';
+  document.getElementById('wz-remote-url').value = '';
+  document.getElementById('wz-remote-result').innerHTML = '';
   wzShowStep('type');
   wizModal.show();
 }
@@ -2161,6 +2189,48 @@ async function wzNext() {
   errEl.textContent = '';
 
   if (wzStep === 'type') return;
+
+  if (wzStep === 'remote') {
+    const name = document.getElementById('wz-remote-name').value.trim();
+    const url  = document.getElementById('wz-remote-url').value.trim();
+    if (!name) { errEl.textContent = 'Provider name is required.'; return; }
+    if (!/^https?:\/\//i.test(url)) { errEl.textContent = 'A server URL starting with http:// or https:// is required.'; return; }
+    // Bridge the remote server through mcp-remote, exactly like the Asana
+    // example. The OAuth/token flow is handled by the shared introspect helper.
+    const cmd = 'npx -y mcp-remote ' + url;
+    const nextBtn = document.getElementById('wz-next-btn');
+    nextBtn.disabled = true;
+    const origText = nextBtn.textContent;
+    nextBtn.textContent = '⏳ Introspecting…';
+    try {
+      await _wzIntrospectCommand(cmd, {resultEl: document.getElementById('wz-remote-result')});
+    } finally {
+      nextBtn.disabled = false;
+      nextBtn.textContent = origText;
+    }
+    const provider = {
+      name, type: 'package', command: cmd,
+      documentation: 'Remote MCP server bridged via `mcp-remote` (' + url + '). ' +
+        'Authentication (OAuth/token) is handled by mcp-remote and refreshed automatically.',
+      code: '', requirements: [], setup_commands: [],
+      tools: wzIntrospectedTools.map(t => ({
+        name: t.name,
+        function: '',
+        description: t.description || '',
+        documentation: '',
+        enabled: true,
+        parameters: _schemaToParams(t.inputSchema || t.input_schema || {}),
+        secrets: [],
+      })),
+    };
+    try {
+      const r = await api('POST', '/api/tools', {name, provider});
+      currentName = name; currentProvider = provider;
+      loadList();
+      await wzGoSecrets(r.secret_keys || []);
+    } catch(e) { errEl.textContent = e.message; }
+    return;
+  }
 
   if (wzStep === 'package') {
     const name = document.getElementById('wz-pkg-name').value.trim();
@@ -2300,7 +2370,7 @@ async function wzNext() {
 }
 
 function wzBack() {
-  const map = {package:'type', repository:'type', code:'type', secrets: wzType||'type'};
+  const map = {remote:'type', package:'type', repository:'type', code:'type', secrets: wzType||'type'};
   wzShowStep(map[wzStep] || 'type');
 }
 
@@ -2314,6 +2384,15 @@ async function wzIntrospect() {
   }
   const requirements   = _wzGetListValues('wz-pkg-reqs-container');
   const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
+  await _wzIntrospectCommand(cmd, {requirements, setup_commands, resultEl: el});
+}
+
+// Shared introspection routine used by both the Package and Remote steps.
+// Polls /api/pending-auth so OAuth-protected servers (bridged via mcp-remote)
+// surface a clickable "Authorize" link while the handshake is blocked, then
+// runs /api/introspect and stores the result in wzIntrospectedTools.
+async function _wzIntrospectCommand(cmd, {requirements = [], setup_commands = [], resultEl} = {}) {
+  const el = resultEl;
   el.innerHTML = '<span class="text-muted" style="font-size:.875em">Introspecting — this may take a moment on first use…</span>';
   // Remote OAuth servers (bridged via mcp-remote) block introspection until the
   // user authorizes in a browser.  Poll for the authorization URL meanwhile and

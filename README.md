@@ -262,6 +262,7 @@ touch ~/.mcpproxy/.env
 docker run -d \
   -p 8888:8888 -p 8889:8889 \
   --env-file "$HOME/.mcpproxy/.env" \
+  -e MCP_ENV_FILE=/app/.env \
   -v "$HOME/.mcpproxy/tools:/app/tools" \
   -v "$HOME/.mcpproxy/.env:/app/.env" \
   -v mcpproxy-files:/app/files \
@@ -292,8 +293,9 @@ Notes:
   errors that the file isn't found, and the `-v` mount would create a *directory* named
   `.env` instead.
 - Docker does **not** expand `~` inside double quotes, so use `$HOME` instead.
-- You don't need `-e MCP_ENV_FILE=/app/.env` — the image already defaults `MCP_ENV_FILE`
-  to `/app/.env`. Pass it explicitly only if you mount the file somewhere else.
+- `-e MCP_ENV_FILE=/app/.env` is shown for clarity, but it's optional — the image already
+  defaults `MCP_ENV_FILE` to `/app/.env`. You only *need* it if you mount the file somewhere
+  else.
 
 The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
 providers (e.g. the official Asana MCP); persist it and you authorize once. Map the OAuth

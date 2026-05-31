@@ -15,6 +15,9 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
   via `npx`, `uvx`, `python -m`, or any installed binary
 - Or a `package:` + `repository:` pair to clone a git repo, run build commands, and
   spawn the resulting stdio MCP server — useful for servers distributed only as source
+- Or a `package:` block running the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote)
+  bridge to reach a **remote, OAuth-protected** server (e.g. the official Asana MCP) — the
+  bridge walks you through the OAuth flow and refreshes the token automatically
 
 `server.py` loads every YAML at startup, installs declared `requirements` (pip packages),
 runs `setup_commands`, then registers each tool automatically — no Python files to
@@ -774,6 +777,65 @@ tools: []
 
 The server spawns the process, performs the MCP handshake once, then forwards every tool
 call to it. The process is reused across calls (started lazily on the first tool call).
+
+---
+
+### Part 3.25 — a remote, OAuth-protected server (e.g. the official Asana MCP)
+
+Some MCP servers aren't stdio packages at all — they're **remote, OAuth-protected HTTP
+endpoints**. The official Asana server is one: it lives at `https://mcp.asana.com/v2/mcp`
+(Streamable HTTP) and is reached through an OAuth 2.1 authorization-code (PKCE) flow — there's
+no static API key. mcpproxy speaks stdio to its upstreams, so these are bridged with the
+community [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) adapter, which is itself just
+a `package:` command:
+
+```yaml
+# examples/asana.yaml — copy into your tools/ config dir (or use the wizard)
+package:
+  command: npx -y mcp-remote https://mcp.asana.com/v2/mcp
+
+tools:
+  - name: get_me      # advertised as asana__get_me; the rest are auto-introspected
+    description: Return the Asana user that the authorized token belongs to.
+    input_schema: { type: object, properties: {} }
+```
+
+**`mcp-remote` performs the OAuth walkthrough and refreshes the token for you** — mcpproxy
+itself stays a thin stdio proxy:
+
+- **First run** (or after the refresh token expires / is revoked): `mcp-remote` prints an
+  authorization URL and blocks the MCP handshake until you authorize. When you introspect the
+  command in the **+ New Provider → Package** wizard, mcpproxy scrapes that URL from stderr and
+  shows a clickable **🔐 Authorize** link (it's also logged as
+  `authorization required … visit:`). Open it, approve access in Asana, and the localhost
+  callback (`:3334`) completes the flow — introspection then continues automatically and the
+  tool list populates.
+- **Afterwards** the OAuth token cache is written under `MCP_REMOTE_CONFIG_DIR` and **the access
+  token is refreshed silently** on every expiry. You don't authorize again until the refresh
+  token itself lapses.
+
+#### Persisting the token cache (so you authorize once)
+
+`docker-compose.yml` wires this up: it sets `MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth`, mounts the
+`mcpproxy-mcp-auth` volume there (kept **out** of `/app/files` so tokens are never exposed via
+`mcpproxy__getfile`), and maps the OAuth callback port `3334`. Keep that volume and the refresh
+token survives restarts. In dev, `docker-compose.override.yml` bind-mounts `./.mcp-auth`
+(gitignored).
+
+#### Headless / one-time bootstrap
+
+The OAuth redirect targets `localhost:3334`. Either authorize via the wizard link with port
+`3334` mapped (the default), **or** run the flow once on the host to pre-populate the cache,
+then start the proxy with the same dir mounted:
+
+```bash
+MCP_REMOTE_CONFIG_DIR=./.mcp-auth npx -y mcp-remote https://mcp.asana.com/v2/mcp
+# authorize in the browser, then `docker compose up` — tools work with no further prompts
+```
+
+> **Pin the bridge** for reproducible builds once you've settled on a version, e.g.
+> `npx -y mcp-remote@<version> …`. Add `--debug` to write a detailed auth/refresh log under
+> `MCP_REMOTE_CONFIG_DIR`.
 
 ---
 

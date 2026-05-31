@@ -560,6 +560,24 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "tools": [], "package_manager": pm}
 
+    @app.get("/api/pending-auth")
+    async def pending_auth(command: str = "") -> dict:
+        """Return the OAuth authorization URL a spawn is currently waiting on.
+
+        Remote OAuth-protected MCP servers reached via the `mcp-remote` bridge
+        print an authorization URL to stderr and block the MCP handshake until
+        the user authorizes in a browser.  `process_runner` scrapes that URL;
+        the wizard polls this endpoint (while an introspect call is blocked) to
+        show a clickable "Authorize" link.  Once a valid token cache exists the
+        bridge refreshes silently and this stays empty.
+
+        With no `command`, returns every pending URL keyed by spawn command.
+        """
+        from process_runner import pending_auth_urls
+        if command:
+            return {"ok": True, "auth_url": pending_auth_urls.get(command.strip())}
+        return {"ok": True, "pending": dict(pending_auth_urls)}
+
     # ── Repository clone-and-build ───────────────────────────────────────────
 
     @app.post("/api/clone-and-build")
@@ -2297,6 +2315,19 @@ async function wzIntrospect() {
   const requirements   = _wzGetListValues('wz-pkg-reqs-container');
   const setup_commands = _wzGetListValues('wz-pkg-cmds-container');
   el.innerHTML = '<span class="text-muted" style="font-size:.875em">Introspecting — this may take a moment on first use…</span>';
+  // Remote OAuth servers (bridged via mcp-remote) block introspection until the
+  // user authorizes in a browser.  Poll for the authorization URL meanwhile and
+  // surface it as a clickable link so the wizard can walk the user through it.
+  const authPoll = setInterval(async () => {
+    try {
+      const a = await api('GET', '/api/pending-auth?command=' + encodeURIComponent(cmd));
+      if (a && a.auth_url) {
+        el.innerHTML = `<div class="text-warning" style="font-size:.875em">🔐 Authorization required — `
+          + `<a href="${esc(a.auth_url)}" target="_blank" rel="noopener">click here to authorize</a>, `
+          + `then complete the browser flow. Introspection continues automatically once you finish.</div>`;
+      }
+    } catch {}
+  }, 1500);
   try {
     const r = await api('POST', '/api/introspect', {command: cmd, requirements, setup_commands});
     if (!r.ok) throw new Error(r.error || 'Introspection failed');
@@ -2309,6 +2340,8 @@ async function wzIntrospect() {
   } catch(e) {
     wzIntrospectedTools = [];
     el.innerHTML = `<div class="text-warning" style="font-size:.875em">⚠ Introspection failed (${esc(e.message)}). Continuing without auto-detected tools — add them manually in the editor.</div>`;
+  } finally {
+    clearInterval(authPoll);
   }
 }
 

@@ -18,9 +18,52 @@ Two use-cases
 import asyncio
 import json
 import os
+import re
 import shlex
 import traceback
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# OAuth-bridge (mcp-remote) support
+# ---------------------------------------------------------------------------
+#
+# Remote, OAuth-protected MCP servers (e.g. the official Asana server at
+# https://mcp.asana.com/v2/mcp) are reached through the community `mcp-remote`
+# bridge, spawned exactly like any other stdio package provider.  On first run —
+# or whenever the cached refresh token has expired or been revoked — mcp-remote
+# prints an authorization URL to *stderr* and blocks the MCP `initialize`
+# handshake until the user completes the browser OAuth flow.
+#
+# We scrape that URL out of stderr so the UI can surface a clickable
+# "Authorize" link, and we give the handshake a longer, configurable timeout
+# so a human has time to finish authorizing.  Once a valid token cache exists
+# mcp-remote refreshes silently and none of this is exercised.
+
+# How long (seconds) to wait for the `initialize` response.  Generous by
+# default so a first-time interactive OAuth flow can complete; override with
+# MCPPROXY_AUTH_INIT_TIMEOUT.
+AUTH_INIT_TIMEOUT = float(os.environ.get("MCPPROXY_AUTH_INIT_TIMEOUT", "300"))
+
+# Latest pending authorization URL per spawn command, populated from stderr.
+# The UI (same process — the frontend runs as a daemon thread inside the MCP
+# server) polls this so it can show the link while a spawn is blocked on auth.
+pending_auth_urls: dict[str, str] = {}
+
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+# Lines that hint mcp-remote (or a similar bridge) is asking the user to
+# authorize.  Matched case-insensitively against each stderr line.
+_AUTH_HINT_RE = re.compile(
+    r"authoriz|oauth|visit (?:this|the following)|open (?:this|the following)",
+    re.IGNORECASE,
+)
+
+
+def _extract_auth_url(line: str) -> str | None:
+    """Return an authorization URL from *line* if it looks like an auth prompt."""
+    if not _AUTH_HINT_RE.search(line):
+        return None
+    m = _URL_RE.search(line)
+    return m.group(0) if m else None
 
 
 class ProcessSession:
@@ -39,6 +82,13 @@ class ProcessSession:
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._next_id = 0
+        # stderr is consumed by a background reader (see _consume_stderr) so we
+        # can scrape OAuth authorization URLs in real time; the reader keeps a
+        # bounded tail buffer that _drain_stderr_tail reports on failure.
+        self._stderr_tail: list[str] = []
+        self._stderr_task: asyncio.Task | None = None
+        # Authorization URL most recently printed by the subprocess, if any.
+        self.pending_auth_url: str | None = None
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -64,17 +114,49 @@ class ProcessSession:
             raise EOFError(f"MCP process closed stdout{suffix}")
         return json.loads(line)
 
-    async def _drain_stderr_tail(self, max_bytes: int = 4096) -> str:
-        """Return up to ``max_bytes`` of buffered stderr from the subprocess."""
-        if not self._proc or not self._proc.stderr:
-            return ""
+    async def _consume_stderr(self) -> None:
+        """Continuously read subprocess stderr.
+
+        Keeps a bounded tail (for crash diagnostics) and scrapes any OAuth
+        authorization URL so the UI can surface a clickable "Authorize" link
+        while the spawn is blocked on the user completing the browser flow.
+        """
+        assert self._proc and self._proc.stderr
         try:
-            data = await asyncio.wait_for(
-                self._proc.stderr.read(max_bytes), timeout=2.0
-            )
-        except (asyncio.TimeoutError, Exception):
-            return ""
-        return data.decode(errors="replace").strip()
+            while True:
+                raw = await self._proc.stderr.readline()
+                if not raw:
+                    break
+                line = raw.decode(errors="replace").rstrip("\n")
+                self._stderr_tail.append(line)
+                if len(self._stderr_tail) > 50:
+                    del self._stderr_tail[:-50]
+                url = _extract_auth_url(line)
+                if url:
+                    self.pending_auth_url = url
+                    pending_auth_urls[self.command] = url
+                    print(
+                        f"[mcpproxy] authorization required for "
+                        f"'{self.command}' — visit: {url}",
+                        flush=True,
+                    )
+        except Exception:
+            traceback.print_exc()
+
+    def _start_stderr_reader(self) -> None:
+        if self._stderr_task is None or self._stderr_task.done():
+            self._stderr_task = asyncio.ensure_future(self._consume_stderr())
+
+    def _clear_pending_auth(self) -> None:
+        self.pending_auth_url = None
+        pending_auth_urls.pop(self.command, None)
+
+    async def _drain_stderr_tail(self, max_bytes: int = 4096) -> str:
+        """Return the buffered tail of subprocess stderr (best-effort)."""
+        # Give the background reader a moment to flush any final lines.
+        await asyncio.sleep(0.1)
+        text = "\n".join(self._stderr_tail).strip()
+        return text[-max_bytes:]
 
     async def _start(self) -> None:
         env = self._build_env()
@@ -86,6 +168,10 @@ class ProcessSession:
             cwd=self.cwd,
             env=env,
         )
+        # Begin scraping stderr immediately so an OAuth authorization URL is
+        # captured even though the initialize response below blocks until the
+        # user finishes authorizing.
+        self._start_stderr_reader()
         # initialize handshake
         rid = self._new_id()
         await self._send({
@@ -96,7 +182,12 @@ class ProcessSession:
                 "clientInfo": {"name": "mcpproxy", "version": "1.0"},
             },
         })
-        await self._recv(timeout=60)   # initialize response
+        # A generous timeout: an OAuth bridge (mcp-remote) holds the handshake
+        # open until the interactive browser authorization completes.  With a
+        # valid cached token this returns immediately.
+        await self._recv(timeout=AUTH_INIT_TIMEOUT)   # initialize response
+        # Handshake completed → any pending authorization is resolved.
+        self._clear_pending_auth()
         # notifications/initialized (no response expected)
         await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -177,6 +268,10 @@ class ProcessSession:
         return {"ok": True, "result": parts[0] if len(parts) == 1 else parts}
 
     async def close(self) -> None:
+        self._clear_pending_auth()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         if self._proc:
             try:
                 self._proc.stdin.close()  # type: ignore[union-attr]

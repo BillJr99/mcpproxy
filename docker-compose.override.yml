@@ -20,4 +20,8 @@ services:
       - ./tools:/app/tools
       - ./files:/app/files
       - ./repos:/app/repos
+      # OAuth token cache for mcp-remote bridges (Asana, …). Bind-mounted so the
+      # refresh token survives `docker compose down` and you authorize only once.
+      # Gitignored — never commit it (it contains live OAuth tokens).
+      - ./.mcp-auth:/app/.mcp-auth
       - ./.env:/app/.env

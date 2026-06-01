@@ -15,17 +15,24 @@ POST /api/extract-functions     — parse Python code for async functions
 GET  /api/env                   — list .env vars (values masked)
 POST /api/env                   — upsert vars into .env  {vars: {KEY: VALUE}}
 POST /api/restart               — send SIGTERM to restart server
+GET  /api/config                — UI feature flags (e.g. web_terminal)
+WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
 """
 
 import ast
 import asyncio
+import fcntl
 import json
 import os
+import pty
 import re
 import shlex
+import shutil
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import textwrap
 import threading
 import traceback
@@ -33,10 +40,27 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from config import CONFIG_DIR, ENV_FILE, REPOS_DIR
+
+
+# ---------------------------------------------------------------------------
+# Web terminal feature gate
+# ---------------------------------------------------------------------------
+#
+# The /ws/terminal endpoint streams a real PTY to the browser so the mcp-remote
+# OAuth bootstrap (and any other command) can be driven from the UI without a
+# host shell or `docker exec`.  This is arbitrary command execution over HTTP —
+# consistent with what the proxy already does (introspect spawns arbitrary
+# commands; code providers exec() Python) and intended for a trusted,
+# single-user/local admin UI.  It can be switched off with MCPPROXY_WEB_TERMINAL=0.
+
+def _web_terminal_enabled() -> bool:
+    return os.environ.get("MCPPROXY_WEB_TERMINAL", "1").strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +855,108 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         threading.Thread(target=_send, daemon=True).start()
         return {"ok": True}
 
+    # ── Client config (feature flags) ──────────────────────────────────────────
+
+    @app.get("/api/config")
+    async def client_config() -> dict:
+        """Expose UI feature flags so the front end can hide disabled features."""
+        return {"ok": True, "web_terminal": _web_terminal_enabled()}
+
+    # ── Interactive web terminal (PTY over WebSocket) ──────────────────────────
+
+    @app.websocket("/ws/terminal")
+    async def terminal_ws(ws: WebSocket) -> None:
+        """Bridge a browser xterm.js session to a PTY-backed subprocess.
+
+        With an optional ``?cmd=`` query the given command is run (used by the
+        wizard / Re-authorize buttons to launch ``npx -y mcp-remote <url>`` so
+        the OAuth bootstrap can be completed entirely from the browser); with no
+        ``cmd`` an interactive login shell is started.  The subprocess inherits
+        the proxy's environment, so MCP_REMOTE_CONFIG_DIR (set by compose) points
+        the token cache at the persisted volume automatically.
+        """
+        await ws.accept()
+        if not _web_terminal_enabled():
+            await ws.send_text("\r\n[web terminal disabled — set MCPPROXY_WEB_TERMINAL=1 to enable]\r\n")
+            await ws.close(code=1008)
+            return
+
+        cmd = (ws.query_params.get("cmd") or "").strip()
+        shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+        argv = [shell, "-lc", cmd] if cmd else [shell, "-il"]
+
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            # Child: exec the shell/command with the PTY as its controlling tty.
+            try:
+                os.execvpe(argv[0], argv, os.environ.copy())
+            except Exception:
+                os._exit(127)
+
+        loop = asyncio.get_running_loop()
+
+        def _set_winsize(rows: int, cols: int) -> None:
+            try:
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", max(rows, 1), max(cols, 1), 0, 0))
+            except OSError:
+                pass
+
+        async def pty_to_ws() -> None:
+            while True:
+                try:
+                    data = await loop.run_in_executor(None, os.read, master_fd, 65536)
+                except OSError:
+                    data = b""  # PTY closed (child exited) → EIO on Linux
+                if not data:
+                    break
+                await ws.send_bytes(data)
+
+        async def ws_to_pty() -> None:
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                text = msg.get("text")
+                if text is not None:
+                    try:
+                        ctrl = json.loads(text)
+                    except (ValueError, TypeError):
+                        ctrl = None
+                    if isinstance(ctrl, dict) and "resize" in ctrl:
+                        cols, rows = ctrl["resize"]
+                        _set_winsize(int(rows), int(cols))
+                        continue
+                    if isinstance(ctrl, dict) and "input" in ctrl:
+                        os.write(master_fd, str(ctrl["input"]).encode())
+                        continue
+                    os.write(master_fd, text.encode())
+                elif msg.get("bytes") is not None:
+                    os.write(master_fd, msg["bytes"])
+
+        reader = asyncio.ensure_future(pty_to_ws())
+        writer = asyncio.ensure_future(ws_to_pty())
+        try:
+            await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for task in (reader, writer):
+                task.cancel()
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            try:
+                await ws.close()
+            except RuntimeError:
+                pass
+
     # ── HTML UI ───────────────────────────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -853,6 +979,7 @@ _HTML = r"""<!DOCTYPE html>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" rel="stylesheet">
 <link href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" rel="stylesheet">
 <style>
 :root{--bg:#1e1e2e;--surface:#181825;--border:#313244;--muted:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--red:#f38ba8;--yellow:#f9e2af;--teal:#94e2d5}
 *{box-sizing:border-box}
@@ -937,9 +1064,17 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   <span class="navbar-brand">⚡ mcpproxy</span>
   <div class="d-flex gap-2 ms-3">
     <button class="btn btn-sm btn-success" onclick="openWizard()">+ New Provider</button>
+    <button class="btn btn-sm btn-outline-light" id="terminal-btn" style="display:none"
+      onclick="openTerminal()" title="Open an interactive shell in the server container">🖥 Terminal</button>
   </div>
   <span class="ms-auto text-muted" style="font-size:.75em">MCP :8888 &nbsp;|&nbsp; UI :8889</span>
 </nav>
+
+<!-- Pending OAuth authorization banner (surfaced by the startup warm-up) -->
+<div id="auth-banner" class="restart-bar" style="display:none;background:#2a2518;border-color:#f9e2af60;border-radius:0;margin:0">
+  <span style="color:var(--yellow)">🔐</span>
+  <span id="auth-banner-msg" style="color:#cdd6f4;font-size:.875em"></span>
+</div>
 
 <!-- Toast -->
 <div class="toast-container position-fixed top-0 end-0 p-3" style="z-index:9999">
@@ -1011,7 +1146,12 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 
         <!-- Package command box -->
         <div class="section-box" id="package-box" style="display:none">
-          <div class="section-title">📦 Package Command</div>
+          <div class="section-title">
+            📦 Package Command
+            <button class="btn btn-sm btn-outline-warning py-0" id="reauth-btn" style="display:none"
+              onclick="reauthorizeProvider()"
+              title="Re-run the mcp-remote OAuth flow in a terminal to refresh a lapsed token">🔐 Re-authorize</button>
+          </div>
           <input id="f-command" class="form-control font-monospace"
             placeholder="npx @playwright/mcp@latest --isolated  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github  ·  mcp-server-github"
             style="font-size:.875em"
@@ -1194,6 +1334,11 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <div class="text-muted mt-1" style="font-size:.8em">The remote MCP server endpoint. mcpproxy bridges it with <code>npx -y mcp-remote &lt;url&gt;</code> — transport is auto-detected.</div>
           </div>
           <div class="text-muted" style="font-size:.8em">When you click <b>Next</b> the server is introspected automatically; its tools become the dropdown options in the editor. If the server is OAuth-protected, a clickable <b>🔐 Authorize</b> link appears — complete the browser flow and introspection continues. The token is cached and refreshed automatically afterwards.</div>
+          <div class="mt-2" id="wz-remote-bootstrap-wrap" style="display:none">
+            <button class="btn btn-sm btn-outline-warning py-0" onclick="wzBootstrapRemote()"
+              title="Run npx -y mcp-remote <url> in a terminal and complete the OAuth flow before introspecting">🖥 Bootstrap / Authorize in terminal</button>
+            <span class="text-muted ms-2" style="font-size:.8em">Headless option: watch the live <code>mcp-remote</code> output, click the auth link, and pre-populate the token cache.</span>
+          </div>
           <div id="wz-remote-result" class="mt-2"></div>
         </div>
 
@@ -1304,9 +1449,32 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Terminal modal -->
+<div class="modal fade" id="terminal-modal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">🖥 <span id="terminal-title">Terminal</span></h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="terminal-host" style="height:60vh;background:#000;border:1px solid var(--border);border-radius:6px;padding:6px"></div>
+        <div class="text-muted mt-2" style="font-size:.8em">
+          A live shell inside the server container. For an OAuth bootstrap, watch for the
+          <code>authorization required … visit:</code> line, open it, and complete the browser
+          flow — the token cache is written under <code>MCP_REMOTE_CONFIG_DIR</code>. Press
+          <code>Ctrl-C</code> to stop a running command.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <script>
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -1314,7 +1482,9 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
-let secretsModal = null, wizModal = null;
+let secretsModal = null, wizModal = null, termModal = null;
+let webTerminalEnabled = false;
+let term = null, termFit = null, termSock = null;  // xterm.js terminal state
 let wzType = null;            // 'code' | 'package' | 'repository' | 'remote'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
@@ -1346,13 +1516,46 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   secretsModal = new bootstrap.Modal('#secrets-modal');
   wizModal     = new bootstrap.Modal('#wizard-modal');
+  termModal    = new bootstrap.Modal('#terminal-modal');
+  document.getElementById('terminal-modal').addEventListener('hidden.bs.modal', closeTerminal);
   // Wizard: live function detection as the user types into the code textarea
   document.getElementById('wz-code-input').addEventListener('input', () => {
     clearTimeout(_wzAnalyzeDebounce);
     _wzAnalyzeDebounce = setTimeout(() => wzAnalyze().catch(() => {}), 300);
   });
+  loadConfig();
+  pollPendingAuth();
+  setInterval(pollPendingAuth, 5000);
   loadList();
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client config + pending-auth banner
+// ─────────────────────────────────────────────────────────────────────────────
+async function loadConfig() {
+  try {
+    const c = await api('GET', '/api/config');
+    webTerminalEnabled = !!c.web_terminal;
+  } catch { webTerminalEnabled = false; }
+  document.getElementById('terminal-btn').style.display = webTerminalEnabled ? '' : 'none';
+}
+
+async function pollPendingAuth() {
+  let pending = {};
+  try {
+    const r = await api('GET', '/api/pending-auth');
+    pending = (r && r.pending) || {};
+  } catch { return; }
+  const cmds = Object.keys(pending);
+  const banner = document.getElementById('auth-banner');
+  if (!cmds.length) { banner.style.display = 'none'; return; }
+  const links = cmds.map(cmd =>
+    `<a href="${esc(pending[cmd])}" target="_blank" rel="noopener">authorize ${esc(cmd.replace(/^.*mcp-remote\s+/, '') || cmd)}</a>`
+  ).join(' · ');
+  document.getElementById('auth-banner-msg').innerHTML =
+    `Authorization required for ${cmds.length} remote provider(s): ${links} — complete the browser flow; the token refreshes automatically afterwards.`;
+  banner.style.display = '';
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API
@@ -1572,6 +1775,9 @@ function renderProvider(p) {
 
   if (isPkg) {
     document.getElementById('f-command').value = p.command || '';
+    const isRemote = /\bmcp-remote\b/.test(p.command || '');
+    document.getElementById('reauth-btn').style.display =
+      (isRemote && webTerminalEnabled) ? '' : 'none';
   }
   if (isRepo) {
     document.getElementById('f-repo-url').value = p.repo_url || '';
@@ -2048,6 +2254,75 @@ async function restartServer() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Interactive web terminal (xterm.js ↔ /ws/terminal PTY bridge)
+// ─────────────────────────────────────────────────────────────────────────────
+function openTerminal(cmd, title) {
+  if (!webTerminalEnabled) { toast('Web terminal is disabled (MCPPROXY_WEB_TERMINAL=0)', false); return; }
+  document.getElementById('terminal-title').textContent = title || 'Terminal';
+  termModal.show();
+  // Defer until the modal is laid out so fit() measures real dimensions.
+  setTimeout(() => startTerminal(cmd), 250);
+}
+
+function startTerminal(cmd) {
+  closeTerminal();
+  const host = document.getElementById('terminal-host');
+  host.innerHTML = '';
+  term = new Terminal({fontSize: 13, fontFamily: "'JetBrains Mono',Consolas,monospace",
+    theme: {background: '#000000'}, cursorBlink: true, convertEol: true});
+  termFit = new FitAddon.FitAddon();
+  term.loadAddon(termFit);
+  term.open(host);
+  try { termFit.fit(); } catch {}
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let url = `${proto}://${location.host}/ws/terminal`;
+  if (cmd) url += '?cmd=' + encodeURIComponent(cmd);
+  termSock = new WebSocket(url);
+  termSock.binaryType = 'arraybuffer';
+  const dec = new TextDecoder();
+  termSock.onopen = () => sendResize();
+  termSock.onmessage = ev => {
+    term.write(typeof ev.data === 'string' ? ev.data : dec.decode(new Uint8Array(ev.data)));
+  };
+  termSock.onclose = () => { if (term) term.write('\r\n\x1b[33m[session ended]\x1b[0m\r\n'); };
+  term.onData(d => { if (termSock && termSock.readyState === 1) termSock.send(JSON.stringify({input: d})); });
+  term.onResize(() => sendResize());
+  window.addEventListener('resize', _termResize);
+}
+
+function sendResize() {
+  if (!term || !termSock || termSock.readyState !== 1) return;
+  try { termFit.fit(); } catch {}
+  termSock.send(JSON.stringify({resize: [term.cols, term.rows]}));
+}
+function _termResize() { try { termFit && termFit.fit(); sendResize(); } catch {} }
+
+function closeTerminal() {
+  window.removeEventListener('resize', _termResize);
+  if (termSock) { try { termSock.close(); } catch {} termSock = null; }
+  if (term) { try { term.dispose(); } catch {} term = null; }
+  termFit = null;
+  pollPendingAuth();  // the bootstrap may have just cleared a pending auth
+}
+
+// Re-run the mcp-remote OAuth flow for the currently-open provider.
+function reauthorizeProvider() {
+  const cmd = (document.getElementById('f-command').value || '').trim();
+  if (!cmd) { toast('No command to re-authorize', false); return; }
+  openTerminal(cmd, `Re-authorize ${currentName || ''}`);
+}
+
+// Wizard: bootstrap the remote provider's token cache from a terminal.
+function wzBootstrapRemote() {
+  const url = (document.getElementById('wz-remote-url').value || '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    document.getElementById('wz-error').textContent = 'Enter a server URL first.'; return;
+  }
+  openTerminal('npx -y mcp-remote ' + url, 'Bootstrap ' + url);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Secrets modal
 // ─────────────────────────────────────────────────────────────────────────────
 async function openSecretsModal() {
@@ -2112,6 +2387,10 @@ function wzShowStep(step) {
   document.getElementById('wz-back-btn').style.display = step === 'type' ? 'none' : '';
   document.getElementById('wz-next-btn').textContent = step === 'secrets' ? 'Finish' : 'Next →';
   document.getElementById('wz-error').textContent = '';
+  // The terminal-bootstrap shortcut only makes sense on the remote step when
+  // the web terminal feature is enabled.
+  const bootstrapWrap = document.getElementById('wz-remote-bootstrap-wrap');
+  if (bootstrapWrap) bootstrapWrap.style.display = (step === 'remote' && webTerminalEnabled) ? '' : 'none';
 }
 
 function openWizard() {

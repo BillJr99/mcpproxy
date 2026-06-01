@@ -641,6 +641,65 @@ for provider_spec in load_provider_specs(CONFIG_DIR):
 
 
 # ---------------------------------------------------------------------------
+# Remote OAuth-bridge warm-up
+# ---------------------------------------------------------------------------
+
+def _remote_bridge_commands() -> list[str]:
+    """Return every package command that bridges a remote server via mcp-remote.
+
+    These are the providers whose OAuth token cache benefits from being warmed
+    on startup so the access token refreshes silently (and any needed
+    re-authorization is surfaced) before the first tool call.
+    """
+    commands: list[str] = []
+    for spec in load_provider_specs(CONFIG_DIR):
+        command = _get_package_command(spec)
+        if command and "mcp-remote" in command:
+            commands.append(command)
+    return commands
+
+
+def _warm_remote_providers() -> None:
+    """Introspect each mcp-remote bridge once at startup.
+
+    A throwaway introspect spawns the bridge, which — with a valid cache —
+    refreshes the on-disk OAuth token silently (the real, lazily-created session
+    then picks it up on first call).  When re-authorization is required the
+    bridge prints an authorization URL that ``process_runner`` scrapes into
+    ``pending_auth_urls`` and logs, so the UI banner can surface it instead of
+    the user discovering it only on the first failed tool call.  Disable with
+    MCPPROXY_WARM_REMOTE=0.
+    """
+    commands = _remote_bridge_commands()
+    if not commands:
+        return
+    import asyncio
+
+    from process_runner import introspect
+
+    async def _warm_all() -> None:
+        for command in commands:
+            print(f"[mcpproxy] warming mcp-remote bridge: {command}")
+            try:
+                await introspect(command)
+                print(f"[mcpproxy] token cache ready for: {command}")
+            except Exception as exc:  # noqa: BLE001 — best-effort warm-up
+                print(f"[mcpproxy] warm-up for '{command}' did not complete: {exc}")
+
+    try:
+        asyncio.run(_warm_all())
+    except Exception as exc:  # noqa: BLE001
+        print(f"_warm_remote_providers error: {exc}")
+        traceback.print_exc()
+
+
+def _warm_remote_enabled() -> bool:
+    return os.environ.get("MCPPROXY_WARM_REMOTE", "1").strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -659,6 +718,11 @@ if __name__ == "__main__":
         ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
         ui_thread.start()
         print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")
+        if _warm_remote_enabled():
+            warm_thread = threading.Thread(
+                target=_warm_remote_providers, daemon=True, name="remote-warmup"
+            )
+            warm_thread.start()
         mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
     except Exception as exc:
         print(f"main error: {exc}")

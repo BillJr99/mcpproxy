@@ -872,12 +872,33 @@ token survives restarts. In dev, `docker-compose.override.yml` bind-mounts `./.m
 
 #### Headless / one-time bootstrap
 
-The OAuth redirect targets `localhost:3334`. Either authorize via the wizard link with port
-`3334` mapped (the default), **or** run the flow once on the host to pre-populate the cache,
-then start the proxy with the same dir mounted:
+The OAuth redirect targets `localhost:3334`, so that port must be reachable from the
+machine running your browser (the default `docker-compose.yml` maps it). The **first**
+grant always needs a human in a browser once — there's no static key — but mcpproxy
+automates everything around it so you rarely touch a host shell:
+
+**1. Automatic refresh on restart.** On startup the proxy *warms* every `mcp-remote`
+bridge it finds in your configs: with a valid cache the token refreshes silently before
+the first tool call; if re-authorization is needed, the authorization URL is logged and
+surfaced as a banner in the UI. Disable with `MCPPROXY_WARM_REMOTE=0`.
+
+**2. Bootstrap from the browser (no host shell / `docker exec`).** The UI has a built-in
+terminal. In **+ New Provider → Remote MCP Server**, click **🖥 Bootstrap / Authorize in
+terminal** to run `npx -y mcp-remote <url>` live, watch its output, click the auth link,
+and complete the flow — the token cache is written under `MCP_REMOTE_CONFIG_DIR`. An
+existing provider whose refresh token has lapsed shows a **🔐 Re-authorize** button in its
+editor that does the same. The terminal is gated by `MCPPROXY_WEB_TERMINAL` (default on);
+set it to `0` to disable. *(It's a real shell in the container — keep the UI on a trusted
+network, as you already must for the secrets editor and command introspection.)*
+
+**3. Pre-populate on the host.** If you'd rather warm the cache before the container ever
+starts, run the flow once on the host (deriving URLs from your configs) and start the proxy
+with the same dir mounted:
 
 ```bash
-MCP_REMOTE_CONFIG_DIR=./.mcp-auth npx -y mcp-remote https://mcp.asana.com/v2/mcp
+./run_local.sh --bootstrap-auth                       # every configured mcp-remote provider
+./run_local.sh --bootstrap-auth https://mcp.asana.com/v2/mcp   # or an explicit URL
+# equivalently: MCP_REMOTE_CONFIG_DIR=./.mcp-auth python3 bootstrap_auth.py
 # authorize in the browser, then `docker compose up` — tools work with no further prompts
 ```
 

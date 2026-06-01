@@ -32,6 +32,19 @@ ok()   { printf '✓  %s\n' "$*"; }
 python3 --version >/dev/null 2>&1 || die "python3 is required but was not found in PATH."
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Optional: --bootstrap-auth — pre-populate the mcp-remote OAuth token cache on
+# the host, then exit.  Run this once before `docker compose up` so OAuth-bridge
+# providers (e.g. Asana) start with a warm cache and need no interactive prompts.
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--bootstrap-auth" ]]; then
+  shift
+  export MCP_TOOL_CONFIG_DIR="${MCP_TOOL_CONFIG_DIR:-$TOOLS_CONFIG_DIR}"
+  export MCP_REMOTE_CONFIG_DIR="${MCP_REMOTE_CONFIG_DIR:-$ROOT_DIR/.mcp-auth}"
+  info "Bootstrapping mcp-remote OAuth token cache → $MCP_REMOTE_CONFIG_DIR"
+  exec python3 "$ROOT_DIR/bootstrap_auth.py" "$@"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 1 — Generate .env.example if it doesn't exist
 # ─────────────────────────────────────────────────────────────────────────────
 

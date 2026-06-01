@@ -1109,3 +1109,34 @@ class TestScanEnvExampleEndpoint:
     def test_missing_workdir_400(self, client):
         r = client.post("/api/scan-env-example", json={})
         assert r.status_code == 400
+
+
+class TestClientConfig:
+    def test_web_terminal_enabled_by_default(self, client, monkeypatch):
+        monkeypatch.delenv("MCPPROXY_WEB_TERMINAL", raising=False)
+        body = client.get("/api/config").json()
+        assert body["ok"] is True
+        assert body["web_terminal"] is True
+
+    def test_web_terminal_disabled(self, client, monkeypatch):
+        monkeypatch.setenv("MCPPROXY_WEB_TERMINAL", "0")
+        assert client.get("/api/config").json()["web_terminal"] is False
+
+
+class TestWebTerminal:
+    def test_runs_command_and_streams_output(self, client, monkeypatch):
+        monkeypatch.setenv("MCPPROXY_WEB_TERMINAL", "1")
+        chunks: list[bytes] = []
+        with client.websocket_connect("/ws/terminal?cmd=echo+marker_7788") as ws:
+            try:
+                for _ in range(50):
+                    chunks.append(ws.receive_bytes())
+            except Exception:
+                pass  # disconnect once the command exits and the PTY closes
+        assert b"marker_7788" in b"".join(chunks)
+
+    def test_disabled_gate_closes_with_message(self, client, monkeypatch):
+        monkeypatch.setenv("MCPPROXY_WEB_TERMINAL", "0")
+        with client.websocket_connect("/ws/terminal") as ws:
+            msg = ws.receive_text()
+        assert "disabled" in msg.lower()

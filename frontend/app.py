@@ -1390,7 +1390,25 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <input id="f-rest-base-url" class="form-control form-control-sm font-monospace"
               placeholder="https://api.example.com/v1" oninput="updateRestBaseUrl(this.value)">
           </div>
-          <div class="text-muted" style="font-size:.8em">Auth: <code id="f-rest-auth-type">none</code> · Endpoints: <code id="f-rest-endpoint-count">0</code></div>
+          <div class="mb-2">
+            <label class="form-label">Authentication</label>
+            <select id="f-rest-auth-type" class="form-select form-select-sm" onchange="updateRestAuthType(this.value)">
+              <option value="none">None</option>
+              <option value="bearer">Bearer token (from env)</option>
+              <option value="api_key">API key header (from env)</option>
+              <option value="client_credentials">OAuth2 — client credentials</option>
+              <option value="authorization_code">OAuth2 — authorization code + PKCE</option>
+            </select>
+            <div id="f-rest-auth-fields" class="mt-2"></div>
+          </div>
+          <div class="mb-2">
+            <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Endpoints <span class="text-muted fw-normal" style="text-transform:none">— each maps 1:1 to a tool by name</span></span>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="addRestEndpoint()">+ Add endpoint</button>
+            </label>
+            <div id="rest-endpoints-container"></div>
+            <div class="text-muted mt-1" style="font-size:.8em">Path params use <code>{name}</code> in the path. List each param under the column that decides where it's sent (path / query / body). <b>⟳ Sync</b> regenerates the matching tool's input schema from these params.</div>
+          </div>
           <div id="rest-auth-status" class="mt-2 fn-status"></div>
         </div>
 
@@ -2100,13 +2118,7 @@ function renderProvider(p) {
     renderEnvKeys(p.repo_env_keys || []);
   }
   if (isRest) {
-    const rest = p.rest || {};
-    document.getElementById('f-rest-base-url').value = rest.base_url || '';
-    document.getElementById('f-rest-auth-type').textContent = (rest.auth || {}).type || 'none';
-    document.getElementById('f-rest-endpoint-count').textContent = (rest.endpoints || []).length;
-    document.getElementById('rest-authorize-btn').style.display =
-      ((rest.auth || {}).type === 'authorization_code') ? '' : 'none';
-    document.getElementById('rest-auth-status').textContent = '';
+    renderRestEditor(p);
   }
   if (isCode) {
     codeEditor.setValue(p.code || '');
@@ -2122,6 +2134,176 @@ function updateRestBaseUrl(val) {
   ensureProvider();
   if (!currentProvider.rest) currentProvider.rest = {};
   currentProvider.rest.base_url = val;
+}
+
+// ── REST editor: auth + endpoints (inline editing) ───────────────────────────
+
+function renderRestEditor(p) {
+  const rest = p.rest || (p.rest = {});
+  rest.auth = rest.auth || {type: 'none'};
+  rest.endpoints = rest.endpoints || [];
+  document.getElementById('f-rest-base-url').value = rest.base_url || '';
+  document.getElementById('f-rest-auth-type').value = rest.auth.type || 'none';
+  document.getElementById('rest-authorize-btn').style.display =
+    (rest.auth.type === 'authorization_code') ? '' : 'none';
+  document.getElementById('rest-auth-status').textContent = '';
+  renderRestAuthFields(rest.auth);
+  renderRestEndpoints(rest.endpoints);
+}
+
+function updateRestAuthType(val) {
+  ensureProvider();
+  const rest = currentProvider.rest || (currentProvider.rest = {});
+  rest.auth = rest.auth || {};
+  rest.auth.type = val;
+  document.getElementById('rest-authorize-btn').style.display =
+    (val === 'authorization_code') ? '' : 'none';
+  renderRestAuthFields(rest.auth);
+}
+
+function updateRestAuthField(key, val) {
+  ensureProvider();
+  const auth = currentProvider.rest.auth;
+  if (key === 'scopes') auth.scopes = val.split(/\s+/).filter(Boolean);
+  else auth[key] = val.trim();
+}
+
+function _restAuthRow(label, key, value, placeholder) {
+  return `<div class="mb-2">
+    <label class="form-label">${label}</label>
+    <input class="form-control form-control-sm font-monospace" value="${esc(value || '')}"
+      placeholder="${placeholder}" oninput="updateRestAuthField('${key}', this.value)">
+  </div>`;
+}
+
+function renderRestAuthFields(auth) {
+  const c = document.getElementById('f-rest-auth-fields');
+  const t = auth.type || 'none';
+  let html = '';
+  if (t === 'bearer') {
+    html = _restAuthRow('Token env var', 'token_env', auth.token_env, 'EXAMPLE_TOKEN');
+  } else if (t === 'api_key') {
+    html = _restAuthRow('Header name', 'header', auth.header, 'X-Api-Key')
+         + _restAuthRow('Value env var', 'value_env', auth.value_env, 'EXAMPLE_API_KEY');
+  } else if (t === 'client_credentials' || t === 'authorization_code') {
+    if (t === 'authorization_code')
+      html += _restAuthRow('Authorize URL', 'authorize_url', auth.authorize_url, 'https://auth.example.com/oauth/authorize');
+    html += _restAuthRow('Token URL', 'token_url', auth.token_url, 'https://auth.example.com/oauth/token');
+    html += _restAuthRow('Client ID env var', 'client_id_env', auth.client_id_env, 'EXAMPLE_CLIENT_ID');
+    const secretLabel = 'Client secret env var' + (t === 'authorization_code' ? ' (optional — PKCE)' : '');
+    html += _restAuthRow(secretLabel, 'client_secret_env', auth.client_secret_env, 'EXAMPLE_CLIENT_SECRET');
+    html += _restAuthRow('Scopes (space-separated)', 'scopes', (auth.scopes || []).join(' '), 'read write');
+    if (t === 'authorization_code')
+      html += `<div class="text-muted" style="font-size:.8em">Redirect URI to register with your OAuth provider: <code>${esc((window.location.origin || 'http://localhost:8889') + '/oauth/callback')}</code></div>`;
+  }
+  c.innerHTML = html;
+}
+
+function renderRestEndpoints(endpoints) {
+  const c = document.getElementById('rest-endpoints-container');
+  if (!endpoints.length) {
+    c.innerHTML = '<div class="text-muted" style="font-size:.8em">No endpoints yet — click <b>+ Add endpoint</b>.</div>';
+    return;
+  }
+  const methods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+  c.innerHTML = endpoints.map((ep, i) => `
+    <div class="border rounded p-2 mt-1">
+      <div class="row g-2">
+        <div class="col-4"><input class="form-control form-control-sm font-monospace" placeholder="get_user"
+            value="${esc(ep.name || '')}" oninput="updateRestEndpoint(${i},'name',this.value)"></div>
+        <div class="col-3">
+          <select class="form-select form-select-sm" onchange="updateRestEndpoint(${i},'method',this.value)">
+            ${methods.map(m => `<option ${(ep.method || 'GET') === m ? 'selected' : ''}>${m}</option>`).join('')}
+          </select>
+        </div>
+        <div class="col-4"><input class="form-control form-control-sm font-monospace" placeholder="/users/{user_id}"
+            value="${esc(ep.path || '')}" oninput="updateRestEndpoint(${i},'path',this.value)"></div>
+        <div class="col-1"><button class="btn-icon" onclick="removeRestEndpoint(${i})" title="Remove">✕</button></div>
+      </div>
+      <div class="row g-2 mt-1" style="font-size:.8em">
+        <div class="col"><input class="form-control form-control-sm font-monospace" placeholder="path params: user_id"
+            value="${esc((ep.path_params || []).join(', '))}" oninput="updateRestEndpointParams(${i},'path_params',this.value)"></div>
+        <div class="col"><input class="form-control form-control-sm font-monospace" placeholder="query params: include"
+            value="${esc((ep.query_params || []).join(', '))}" oninput="updateRestEndpointParams(${i},'query_params',this.value)"></div>
+        <div class="col"><input class="form-control form-control-sm font-monospace" placeholder="body params: title, body"
+            value="${esc((ep.body_params || []).join(', '))}" oninput="updateRestEndpointParams(${i},'body_params',this.value)"></div>
+      </div>
+      <div class="mt-1"><button class="btn btn-sm btn-outline-secondary py-0" onclick="syncRestEndpointToTool(${i})"
+          title="Create/refresh the matching tool's input schema from this endpoint's params">⟳ Sync params to tool schema</button></div>
+    </div>`).join('');
+}
+
+function _uniqueEndpointName() {
+  const used = new Set((currentProvider.rest.endpoints || []).map(e => e.name));
+  let n = (currentProvider.rest.endpoints || []).length + 1;
+  let name = `endpoint_${n}`;
+  while (used.has(name)) { n++; name = `endpoint_${n}`; }
+  return name;
+}
+
+function addRestEndpoint() {
+  ensureProvider();
+  const rest = currentProvider.rest || (currentProvider.rest = {});
+  rest.endpoints = rest.endpoints || [];
+  const name = _uniqueEndpointName();
+  rest.endpoints.push({name, method: 'GET', path: '/', path_params: [], query_params: [], body_params: []});
+  // Pair a tool with the same name so the 1:1 invariant holds and it shows in Tools.
+  currentProvider.tools = currentProvider.tools || [];
+  if (!currentProvider.tools.some(t => t.name === name)) {
+    currentProvider.tools.push({name, function: '', description: name, documentation: '', enabled: true, parameters: [], secrets: []});
+  }
+  renderRestEndpoints(rest.endpoints);
+  renderTools(currentProvider.tools, true);
+  discoverFunctions().catch(() => {});
+}
+
+function removeRestEndpoint(i) {
+  ensureProvider();
+  const ep = currentProvider.rest.endpoints[i];
+  currentProvider.rest.endpoints.splice(i, 1);
+  if (ep && ep.name) {
+    currentProvider.tools = (currentProvider.tools || []).filter(t => t.name !== ep.name);
+  }
+  renderRestEndpoints(currentProvider.rest.endpoints);
+  renderTools(currentProvider.tools, true);
+  discoverFunctions().catch(() => {});
+}
+
+function updateRestEndpoint(i, field, val) {
+  ensureProvider();
+  const ep = currentProvider.rest.endpoints[i];
+  if (field === 'name') {
+    const oldName = ep.name;
+    const newName = val.trim();
+    ep.name = newName;
+    // Keep the paired tool's name in sync so the endpoint↔tool link is preserved.
+    (currentProvider.tools || []).forEach(t => { if (t.name === oldName) t.name = newName; });
+    renderTools(currentProvider.tools, true);
+    discoverFunctions().catch(() => {});
+  } else {
+    ep[field] = val.trim();
+  }
+}
+
+function updateRestEndpointParams(i, field, val) {
+  ensureProvider();
+  currentProvider.rest.endpoints[i][field] = val.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// Regenerate the matching tool's parameters from an endpoint's param routing.
+// Preserves any existing param's type/description; path params default to required.
+function syncRestEndpointToTool(i) {
+  ensureProvider();
+  const ep = currentProvider.rest.endpoints[i];
+  const tool = (currentProvider.tools || []).find(t => t.name === ep.name);
+  if (!tool) { toast('No matching tool for this endpoint', false); return; }
+  const names = [...(ep.path_params || []), ...(ep.query_params || []), ...(ep.body_params || [])];
+  const pathSet = new Set(ep.path_params || []);
+  const existing = {};
+  (tool.parameters || []).forEach(p => { existing[p.name] = p; });
+  tool.parameters = names.map(n => existing[n] || {name: n, type: 'string', description: '', required: pathSet.has(n), default: null});
+  renderTools(currentProvider.tools, true);
+  toast(`Synced ${names.length} param(s) to ${ep.name}`);
 }
 
 async function authorizeRestProvider() {

@@ -156,6 +156,12 @@ OpenAPI 3.0 spec** (URL or file) to generate the endpoints and tools automatical
 enter endpoints by hand. OpenAPI specs are expanded into concrete endpoints when the
 provider is created, so startup stays fast and offline.
 
+After creation, the editor lets you **edit everything inline** — the base URL, the auth
+block, and the endpoint list (method, path, and which params go in the path / query /
+body). Adding or removing an endpoint keeps its paired tool in sync (endpoints map 1:1
+to tools by name), and **⟳ Sync params to tool schema** regenerates a tool's input
+schema from its endpoint's params.
+
 ### Authentication
 
 The `auth.type` field selects how requests are authenticated. Secrets are referenced by

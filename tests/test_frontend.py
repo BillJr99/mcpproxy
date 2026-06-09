@@ -1204,6 +1204,31 @@ class TestRestSpecConversion:
         assert structured["rest"]["auth"]["client_id_env"] == "WEATHER_CLIENT_ID"
         assert structured["rest"]["endpoints"][0]["path"] == "/forecast/{city}"
 
+    def test_editor_update_preserves_edited_endpoints(self, app, tools_dir):
+        """Simulate the inline editor saving a REST provider with an added
+        endpoint + renamed tool — auth and endpoints must survive the PUT."""
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        edited = {**REST_PROVIDER}
+        edited["rest"] = {
+            **REST_PROVIDER["rest"],
+            "base_url": "https://api.example.com/v2",
+            "endpoints": REST_PROVIDER["rest"]["endpoints"] + [
+                {"name": "list_alerts", "method": "GET", "path": "/alerts",
+                 "path_params": [], "query_params": ["region"], "body_params": []},
+            ],
+        }
+        edited["tools"] = REST_PROVIDER["tools"] + [
+            {"name": "list_alerts", "function": "", "description": "List alerts",
+             "documentation": "", "enabled": True, "parameters": [], "secrets": []},
+        ]
+        r = TestClient(app).put("/api/tools/weather", json={"provider": edited})
+        assert r.status_code == 200
+        spec = yaml.safe_load((tools_dir / "weather.yaml").read_text())
+        assert spec["rest"]["base_url"] == "https://api.example.com/v2"
+        names = {e["name"] for e in spec["rest"]["endpoints"]}
+        assert names == {"get_forecast", "list_alerts"}
+        assert spec["rest"]["auth"]["type"] == "authorization_code"
+
 
 class TestValidateRest:
     def test_valid_rest_provider_ok(self):

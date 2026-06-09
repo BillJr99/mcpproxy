@@ -269,6 +269,25 @@ class TestAuthCodeTokenStore:
         with pytest.raises(RuntimeError, match="Unknown or expired"):
             asyncio.run(AuthCodeTokenStore.complete_authorization("nope", "code"))
 
+    def test_stale_pending_flow_is_pruned(self, monkeypatch, rest_auth_dir):
+        monkeypatch.setenv("AC_ID", "id")
+        monkeypatch.setattr(rest_provider, "_FLOW_TTL", 100)
+        store = AuthCodeTokenStore("prov", AC_AUTH)
+        store.begin_authorization()
+        state = next(iter(AuthCodeTokenStore._pending_flows))
+        # Age the flow past the TTL; the next begin prunes it.
+        AuthCodeTokenStore._pending_flows[state]["created"] -= 200
+        AuthCodeTokenStore("prov2", AC_AUTH).begin_authorization()
+        assert state not in AuthCodeTokenStore._pending_flows
+
+    def test_fresh_pending_flow_survives_prune(self, monkeypatch, rest_auth_dir):
+        monkeypatch.setenv("AC_ID", "id")
+        store = AuthCodeTokenStore("prov", AC_AUTH)
+        store.begin_authorization()
+        first = next(iter(AuthCodeTokenStore._pending_flows))
+        AuthCodeTokenStore("prov2", AC_AUTH).begin_authorization()
+        assert first in AuthCodeTokenStore._pending_flows  # not stale → kept
+
     def test_get_token_returns_cached(self, monkeypatch, rest_auth_dir):
         monkeypatch.setenv("AC_ID", "id")
         rest_auth_dir.mkdir(parents=True)

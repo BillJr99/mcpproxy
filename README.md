@@ -229,8 +229,16 @@ tools:
 ```
 
 Each tool's `name` maps 1:1 to an endpoint's `name`. REST providers depend on `httpx`
-(installed by default). The relevant config knobs are `MCPPROXY_REST_AUTH_DIR`,
-`MCPPROXY_OAUTH_REDIRECT_BASE`, and `MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout).
+(installed by default).
+
+At startup, OAuth-backed REST providers are **warmed**: `client_credentials` tokens are
+fetched and cached, and `authorization_code` providers that have no usable token surface
+their **🔐 Authorize** link in the banner immediately, rather than only after the first
+failed tool call. (Disable with `MCPPROXY_WARM_REMOTE=0`.)
+
+Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
+`MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), and `MCPPROXY_OAUTH_FLOW_TTL`
+(seconds an in-flight authorization attempt stays valid; default 600).
 
 ## Secrets
 

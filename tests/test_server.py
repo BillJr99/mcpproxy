@@ -22,6 +22,7 @@ from server import (
     _build_typed_signature,
     _get_package_command,
     _get_rest_config,
+    _rest_oauth_providers,
     advertised_tool_name,
     build_runtime_context,
     exec_provider_code,
@@ -759,6 +760,48 @@ class TestRegisterProviderRest:
         spec = self._rest_spec(tmp_path)
         names = self._capture_registered(spec)
         assert names == ["weather__get_forecast"]
+
+
+class TestWarmRestProviders:
+    """_rest_oauth_providers — discovery of OAuth-backed REST providers."""
+
+    def _write(self, config_dir: Path, name: str, auth_type: str):
+        body = f"""
+rest:
+  base_url: https://api.example.com
+  auth:
+    type: {auth_type}
+    token_url: https://auth/token
+    authorize_url: https://auth/authorize
+    client_id_env: X_ID
+    client_secret_env: X_SECRET
+  endpoints:
+    - {{name: t, method: GET, path: /, path_params: [], query_params: [], body_params: []}}
+tools:
+  - name: t
+    description: d
+    input_schema: {{type: object, properties: {{}}, required: []}}
+"""
+        (config_dir / f"{name}.yaml").write_text(body)
+
+    def test_discovers_only_oauth_rest_providers(self, tmp_path: Path, monkeypatch):
+        import server
+        self._write(tmp_path, "cc", "client_credentials")
+        self._write(tmp_path, "ac", "authorization_code")
+        self._write(tmp_path, "plain", "none")
+        # a non-rest provider must be ignored
+        (tmp_path / "pkg.yaml").write_text(
+            "package: {command: echo hi}\ntools: []\n"
+        )
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        found = {name for name, _ in _rest_oauth_providers()}
+        assert found == {"cc", "ac"}
+
+    def test_empty_when_no_oauth_rest(self, tmp_path: Path, monkeypatch):
+        import server
+        self._write(tmp_path, "plain", "bearer")
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        assert _rest_oauth_providers() == []
 
 
 # ---------------------------------------------------------------------------

@@ -50,6 +50,10 @@ pending_rest_auth: dict[str, str] = {}
 # before the real expiry rather than racing it.
 _EXPIRY_SKEW = 30.0
 
+# How long an in-flight authorization_code attempt (state + PKCE verifier) stays
+# valid before it is pruned.  The user has this long to complete the browser flow.
+_FLOW_TTL = float(os.environ.get("MCPPROXY_OAUTH_FLOW_TTL", "600"))
+
 # Default timeout (seconds) for every outbound HTTP request.
 HTTP_TIMEOUT = float(os.environ.get("MCPPROXY_REST_TIMEOUT", "30"))
 
@@ -283,11 +287,13 @@ class AuthCodeTokenStore:
         if scopes:
             params["scope"] = " ".join(scopes)
         auth_url = f"{self.auth['authorize_url']}?{urlencode(params)}"
+        self._prune_flows()
         AuthCodeTokenStore._pending_flows[state] = {
             "provider": self.provider,
             "auth": self.auth,
             "code_verifier": code_verifier,
             "redirect_uri": redirect_uri,
+            "created": time.time(),
         }
         pending_rest_auth[self.provider] = auth_url
         print(
@@ -298,8 +304,17 @@ class AuthCodeTokenStore:
         return auth_url
 
     @classmethod
+    def _prune_flows(cls) -> None:
+        """Drop in-flight authorization attempts older than ``_FLOW_TTL``."""
+        cutoff = time.time() - _FLOW_TTL
+        stale = [s for s, f in cls._pending_flows.items() if f.get("created", 0) < cutoff]
+        for state in stale:
+            cls._pending_flows.pop(state, None)
+
+    @classmethod
     async def complete_authorization(cls, state: str, code: str) -> str:
         """Exchange ``code`` for tokens using the flow registered under ``state``."""
+        cls._prune_flows()
         flow = cls._pending_flows.pop(state, None)
         if flow is None:
             raise RuntimeError("Unknown or expired authorization state")

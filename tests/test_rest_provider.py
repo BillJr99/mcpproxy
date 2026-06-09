@@ -579,3 +579,49 @@ class TestIntrospectOpenAPI:
         path.write_text(json.dumps(doc))
         endpoints, _ = introspect_openapi(str(path))
         assert endpoints[0]["path_params"] == ["id"]
+
+    def test_swagger_2_body_and_query_params(self, tmp_path):
+        doc = {
+            "swagger": "2.0",
+            "definitions": {"NewItem": {
+                "type": "object", "required": ["title"],
+                "properties": {"title": {"type": "string"}, "qty": {"type": "integer"}}}},
+            "paths": {"/items/{id}": {"post": {
+                "operationId": "create_item",
+                "parameters": [
+                    {"name": "id", "in": "path", "required": True, "type": "string"},
+                    {"name": "verbose", "in": "query", "type": "boolean"},
+                    {"name": "body", "in": "body", "schema": {"$ref": "#/definitions/NewItem"}},
+                ],
+            }}},
+        }
+        path = tmp_path / "v2.json"
+        path.write_text(json.dumps(doc))
+        endpoints, tools = introspect_openapi(str(path))
+        ep = endpoints[0]
+        assert ep["path_params"] == ["id"]
+        assert ep["query_params"] == ["verbose"]
+        assert set(ep["body_params"]) == {"title", "qty"}
+        schema = tools[0]["input_schema"]
+        assert schema["properties"]["verbose"]["type"] == "boolean"
+        assert "title" in schema["required"]
+
+    def test_allof_merged_in_request_body(self, tmp_path):
+        doc = {
+            "openapi": "3.0.0",
+            "components": {"schemas": {
+                "Base": {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}}}},
+            "paths": {"/x": {"post": {
+                "operationId": "mk",
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Base"},
+                        {"type": "object", "properties": {"b": {"type": "integer"}}},
+                    ]}}}},
+            }}},
+        }
+        path = tmp_path / "allof.json"
+        path.write_text(json.dumps(doc))
+        endpoints, tools = introspect_openapi(str(path))
+        assert set(endpoints[0]["body_params"]) == {"a", "b"}
+        assert "a" in tools[0]["input_schema"]["required"]

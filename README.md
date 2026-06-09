@@ -152,7 +152,7 @@ block, and a set of endpoints; each endpoint becomes an MCP tool. mcpproxy build
 HTTP request (path/query/body), attaches authentication, and returns the JSON response.
 
 Create one through the **+ New Provider → REST / OAuth API** wizard. You can **import an
-OpenAPI 3.0 spec** (URL or file) to generate the endpoints and tools automatically, or
+OpenAPI spec** (URL or file — OpenAPI 3.x or Swagger 2.0) to generate the endpoints and tools automatically, or
 enter endpoints by hand. OpenAPI specs are expanded into concrete endpoints when the
 provider is created, so startup stays fast and offline.
 

@@ -541,6 +541,27 @@ def _param_schema_type(schema: dict[str, Any]) -> str:
     return _JSON_DEFAULT_TYPE
 
 
+def _object_props(doc: dict[str, Any], schema: Any) -> tuple[dict[str, Any], set[str]]:
+    """Resolve an object schema into (properties, required), merging ``allOf``.
+
+    Handles both OpenAPI 3.x (``#/components/...``) and Swagger 2.0
+    (``#/definitions/...``) refs via ``_resolve_ref``.
+    """
+    schema = _resolve_ref(doc, schema or {})
+    if not isinstance(schema, dict):
+        return {}, set()
+    props: dict[str, Any] = {}
+    required: set[str] = set()
+    for sub in schema.get("allOf") or []:
+        sub_props, sub_required = _object_props(doc, sub)
+        props.update(sub_props)
+        required |= sub_required
+    for pname, pschema in (schema.get("properties") or {}).items():
+        props[pname] = _resolve_ref(doc, pschema)
+    required |= set(schema.get("required") or [])
+    return props, required
+
+
 def introspect_openapi(
     source: str, base_url: str | None = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -623,34 +644,7 @@ def _build_endpoint_and_tool(
     properties: dict[str, Any] = {}
     required: list[str] = []
 
-    for raw_param in params:
-        param = _resolve_ref(doc, raw_param)
-        if not isinstance(param, dict):
-            continue
-        pname = param.get("name")
-        if not pname:
-            continue
-        location = param.get("in")
-        schema = _resolve_ref(doc, param.get("schema") or {})
-        properties[pname] = {
-            "type": _param_schema_type(schema),
-            "description": param.get("description", ""),
-        }
-        if param.get("required") or location == "path":
-            required.append(pname)
-        if location == "path":
-            path_params.append(pname)
-        elif location == "query":
-            query_params.append(pname)
-
-    # requestBody → body params (application/json schema).
-    request_body = _resolve_ref(doc, op.get("requestBody") or {})
-    if isinstance(request_body, dict):
-        content = request_body.get("content") or {}
-        json_media = content.get("application/json") or {}
-        body_schema = _resolve_ref(doc, json_media.get("schema") or {})
-        body_props = body_schema.get("properties") or {}
-        body_required = set(body_schema.get("required") or [])
+    def _add_body_props(body_props: dict[str, Any], body_required: set[str]) -> None:
         for bname, bschema in body_props.items():
             bschema = _resolve_ref(doc, bschema)
             properties[bname] = {
@@ -658,9 +652,39 @@ def _build_endpoint_and_tool(
                 "description": bschema.get("description", ""),
             }
             body_params.append(bname)
-            if bname in body_required or request_body.get("required"):
-                if bname in body_required:
-                    required.append(bname)
+            if bname in body_required:
+                required.append(bname)
+
+    for raw_param in params:
+        param = _resolve_ref(doc, raw_param)
+        if not isinstance(param, dict):
+            continue
+        location = param.get("in")
+        # Swagger 2.0 body parameter: its schema's properties become body params.
+        if location == "body":
+            bp, br = _object_props(doc, param.get("schema") or {})
+            _add_body_props(bp, br)
+            continue
+        pname = param.get("name")
+        if not pname:
+            continue
+        # Type lives on param.schema (OpenAPI 3.x) or directly on param (Swagger 2.0).
+        schema = _resolve_ref(doc, param.get("schema") or {})
+        ptype = _param_schema_type(schema) if schema else _param_schema_type(param)
+        properties[pname] = {"type": ptype, "description": param.get("description", "")}
+        if param.get("required") or location == "path":
+            required.append(pname)
+        if location == "path":
+            path_params.append(pname)
+        elif location in ("query", "formData"):
+            (body_params if location == "formData" else query_params).append(pname)
+
+    # OpenAPI 3.x requestBody → body params (application/json schema, allOf merged).
+    request_body = _resolve_ref(doc, op.get("requestBody") or {})
+    if isinstance(request_body, dict) and request_body.get("content"):
+        json_media = (request_body.get("content") or {}).get("application/json") or {}
+        body_props, body_required = _object_props(doc, json_media.get("schema") or {})
+        _add_body_props(body_props, body_required)
 
     endpoint = {
         "name": name,

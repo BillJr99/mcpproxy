@@ -51,6 +51,8 @@ services:
       # Where mcp-remote caches OAuth tokens (access + refresh). Persisted via
       # the mcpproxy-mcp-auth volume so you authorize once and refresh silently.
       MCP_REMOTE_CONFIG_DIR: "/app/.mcp-auth"
+      # Where REST providers cache OAuth tokens for the authorization_code flow.
+      MCPPROXY_REST_AUTH_DIR: "/app/.rest-auth"
     volumes:
       - mcpproxy-tools:/app/tools
       - mcpproxy-files:/app/files
@@ -59,6 +61,7 @@ services:
       - mcpproxy-npm:/root/.npm
       - mcpproxy-uv-tools:/root/.local/share/uv
       - mcpproxy-mcp-auth:/app/.mcp-auth
+      - mcpproxy-rest-auth:/app/.rest-auth
       - ./.env:/app/.env
 
 volumes:
@@ -69,3 +72,4 @@ volumes:
   mcpproxy-npm:
   mcpproxy-uv-tools:
   mcpproxy-mcp-auth:
+  mcpproxy-rest-auth:

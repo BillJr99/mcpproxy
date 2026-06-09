@@ -281,6 +281,11 @@ def _get_package_command(spec: dict[str, Any]) -> str | None:
     return None
 
 
+def _get_rest_config(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the ``rest:`` sub-dict for REST providers, or None otherwise."""
+    return spec.get("rest") or None
+
+
 def _make_process_handler(
     command: str,
     tool_name: str,
@@ -417,6 +422,7 @@ def register_provider(spec: dict[str, Any]) -> None:
     source_path = spec.get("_config_path", "<unknown>")
     provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
     try:
+        rest_config = _get_rest_config(spec)
         command = _get_package_command(spec)
         # Repository providers piggy-back on the package code path; the only
         # difference is that their subprocess is spawned with cwd=<workdir>
@@ -424,7 +430,35 @@ def register_provider(spec: dict[str, Any]) -> None:
         cwd = repository_workdir(provider_name, spec)
         env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
 
-        if command is not None:
+        if rest_config is not None:
+            # ── REST provider ─────────────────────────────────────────────────
+            # Each tool maps 1:1 to an endpoint (matched by name).  Endpoints are
+            # concrete by this point (OpenAPI specs are expanded into endpoints at
+            # create time by the frontend), so registration is network-free.
+            from rest_provider import _make_rest_handler
+
+            endpoints = {
+                e.get("name"): e for e in (rest_config.get("endpoints") or [])
+            }
+            for tool_spec in spec.get("tools", []):
+                tool_name = tool_spec.get("name", "<unnamed>")
+                if not tool_is_enabled(tool_spec):
+                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                    continue
+                endpoint_spec = endpoints.get(tool_name)
+                if endpoint_spec is None:
+                    raise ValueError(
+                        f"REST tool '{tool_name}' in {source_path} has no matching "
+                        f"endpoint (rest.endpoints[].name must equal the tool name)"
+                    )
+                handler = _make_rest_handler(endpoint_spec, rest_config, provider_name)
+                register_tool(
+                    tool_spec,
+                    handler,
+                    advertised_name=advertised_tool_name(provider_name, tool_name),
+                )
+
+        elif command is not None:
             # ── package provider (npx / uvx / python -m / any binary) ──────────
             for tool_spec in spec.get("tools", []):
                 tool_name = tool_spec.get("name", "<unnamed>")
@@ -699,6 +733,55 @@ def _warm_remote_enabled() -> bool:
     )
 
 
+def _rest_oauth_providers() -> list[tuple[str, dict[str, Any]]]:
+    """Return (provider_name, rest_config) for every OAuth-backed REST provider."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for spec in load_provider_specs(CONFIG_DIR):
+        rest_config = _get_rest_config(spec)
+        if not rest_config:
+            continue
+        auth_type = ((rest_config.get("auth") or {}).get("type") or "none").strip()
+        if auth_type in ("client_credentials", "authorization_code"):
+            name = Path(spec.get("_config_path", "")).stem or "rest"
+            out.append((name, rest_config))
+    return out
+
+
+def _warm_rest_providers() -> None:
+    """Warm OAuth tokens for REST providers once at startup.
+
+    For ``client_credentials`` this fetches and caches the token (validating the
+    client id/secret early).  For ``authorization_code`` it checks the on-disk
+    cache and, when no usable token exists, surfaces the authorization URL via
+    ``pending_rest_auth`` (so the UI banner shows it before the first failed tool
+    call) instead of raising.  Disable with MCPPROXY_WARM_REMOTE=0.
+    """
+    providers = _rest_oauth_providers()
+    if not providers:
+        return
+    import asyncio
+
+    from rest_provider import NeedsAuthorization, resolve_rest_auth
+
+    async def _warm_all() -> None:
+        for name, rest_config in providers:
+            print(f"[mcpproxy] warming REST OAuth provider: {name}")
+            try:
+                resolver = resolve_rest_auth(name, rest_config)
+                await resolver.apply({})  # fetch/refresh the token (or publish auth URL)
+                print(f"[mcpproxy] token ready for REST provider: {name}")
+            except NeedsAuthorization as exc:
+                print(f"[mcpproxy] REST provider '{name}' needs authorization: {exc.auth_url}")
+            except Exception as exc:  # noqa: BLE001 — best-effort warm-up
+                print(f"[mcpproxy] warm-up for REST provider '{name}' did not complete: {exc}")
+
+    try:
+        asyncio.run(_warm_all())
+    except Exception as exc:  # noqa: BLE001
+        print(f"_warm_rest_providers error: {exc}")
+        traceback.print_exc()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -723,6 +806,10 @@ if __name__ == "__main__":
                 target=_warm_remote_providers, daemon=True, name="remote-warmup"
             )
             warm_thread.start()
+            rest_warm_thread = threading.Thread(
+                target=_warm_rest_providers, daemon=True, name="rest-warmup"
+            )
+            rest_warm_thread.start()
         mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
     except Exception as exc:
         print(f"main error: {exc}")

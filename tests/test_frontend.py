@@ -1,4 +1,5 @@
 """Unit tests for the HTTP frontend (frontend/app.py)."""
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +16,7 @@ from frontend.app import (
     _read_env_file,
     _structured_to_yaml,
     _validate_provider,
+    _validate_rest,
     _write_env_file,
     _write_workdir_env_file,
     create_app,
@@ -95,6 +97,42 @@ REPOSITORY_PROVIDER = {
         "documentation": "", "enabled": True,
         "parameters": [
             {"name": "query", "type": "string", "description": "Search query", "required": True, "default": None}
+        ],
+        "secrets": [],
+    }],
+}
+
+REST_PROVIDER = {
+    "name": "weather",
+    "type": "rest",
+    "documentation": "",
+    "command": "",
+    "code": "",
+    "requirements": ["httpx"],
+    "setup_commands": [],
+    "rest": {
+        "base_url": "https://api.example.com/v1",
+        "headers": {"Accept": "application/json"},
+        "auth": {
+            "type": "authorization_code",
+            "authorize_url": "https://auth.example.com/authorize",
+            "token_url": "https://auth.example.com/token",
+            "client_id_env": "WEATHER_CLIENT_ID",
+            "client_secret_env": "WEATHER_CLIENT_SECRET",
+            "scopes": ["read"],
+        },
+        "openapi": "",
+        "endpoints": [
+            {"name": "get_forecast", "method": "GET", "path": "/forecast/{city}",
+             "path_params": ["city"], "query_params": ["units"], "body_params": []},
+        ],
+    },
+    "tools": [{
+        "name": "get_forecast", "function": "", "description": "Get the forecast",
+        "documentation": "", "enabled": True,
+        "parameters": [
+            {"name": "city", "type": "string", "description": "City", "required": True, "default": None},
+            {"name": "units", "type": "string", "description": "Units", "required": False, "default": None},
         ],
         "secrets": [],
     }],
@@ -1140,3 +1178,337 @@ class TestWebTerminal:
         with client.websocket_connect("/ws/terminal") as ws:
             msg = ws.receive_text()
         assert "disabled" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# REST providers
+# ---------------------------------------------------------------------------
+
+class TestRestSpecConversion:
+    def test_structured_to_yaml_emits_rest_block(self):
+        out = _structured_to_yaml(REST_PROVIDER)
+        spec = yaml.safe_load(out)
+        assert spec["rest"]["base_url"] == "https://api.example.com/v1"
+        assert spec["rest"]["auth"]["type"] == "authorization_code"
+        assert spec["rest"]["endpoints"][0]["name"] == "get_forecast"
+        assert "package" not in spec and "code" not in spec
+
+    def test_rest_tool_has_no_function_field(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        assert "function" not in spec["tools"][0]
+
+    def test_provider_to_structured_round_trips_rest(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        structured = _provider_to_structured("weather", spec)
+        assert structured["type"] == "rest"
+        assert structured["rest"]["base_url"] == "https://api.example.com/v1"
+        assert structured["rest"]["auth"]["client_id_env"] == "WEATHER_CLIENT_ID"
+        assert structured["rest"]["endpoints"][0]["path"] == "/forecast/{city}"
+
+    def test_default_headers_and_query_api_key_round_trip(self, app, tools_dir):
+        """Editor-set default headers and an api_key-in-query auth survive save."""
+        provider = {
+            **REST_PROVIDER,
+            "rest": {
+                **REST_PROVIDER["rest"],
+                "headers": {"Accept": "application/json", "X-Trace": "1"},
+                "auth": {"type": "api_key", "in": "query", "name": "apikey", "value_env": "DEMO_KEY"},
+            },
+        }
+        r = TestClient(app).post("/api/tools", json={"name": "weather2", "provider": provider})
+        assert r.status_code == 200, r.text
+        spec = yaml.safe_load((tools_dir / "weather2.yaml").read_text())
+        assert spec["rest"]["headers"] == {"Accept": "application/json", "X-Trace": "1"}
+        assert spec["rest"]["auth"] == {"type": "api_key", "in": "query", "name": "apikey", "value_env": "DEMO_KEY"}
+        # api_key value env surfaces as a secret key
+        assert "DEMO_KEY" in r.json()["secret_keys"]
+        # and it round-trips back into the structured editor form
+        structured = _provider_to_structured("weather2", spec)
+        assert structured["rest"]["headers"]["X-Trace"] == "1"
+        assert structured["rest"]["auth"]["in"] == "query"
+
+    def test_editor_update_preserves_edited_endpoints(self, app, tools_dir):
+        """Simulate the inline editor saving a REST provider with an added
+        endpoint + renamed tool — auth and endpoints must survive the PUT."""
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        edited = {**REST_PROVIDER}
+        edited["rest"] = {
+            **REST_PROVIDER["rest"],
+            "base_url": "https://api.example.com/v2",
+            "endpoints": REST_PROVIDER["rest"]["endpoints"] + [
+                {"name": "list_alerts", "method": "GET", "path": "/alerts",
+                 "path_params": [], "query_params": ["region"], "body_params": []},
+            ],
+        }
+        edited["tools"] = REST_PROVIDER["tools"] + [
+            {"name": "list_alerts", "function": "", "description": "List alerts",
+             "documentation": "", "enabled": True, "parameters": [], "secrets": []},
+        ]
+        r = TestClient(app).put("/api/tools/weather", json={"provider": edited})
+        assert r.status_code == 200
+        spec = yaml.safe_load((tools_dir / "weather.yaml").read_text())
+        assert spec["rest"]["base_url"] == "https://api.example.com/v2"
+        names = {e["name"] for e in spec["rest"]["endpoints"]}
+        assert names == {"get_forecast", "list_alerts"}
+        assert spec["rest"]["auth"]["type"] == "authorization_code"
+
+
+class TestValidateRest:
+    def test_valid_rest_provider_ok(self):
+        assert _validate_provider(REST_PROVIDER)["ok"] is True
+
+    def test_missing_base_url_fails(self):
+        bad = {**REST_PROVIDER, "rest": {**REST_PROVIDER["rest"], "base_url": ""}}
+        result = _validate_provider(bad)
+        assert result["ok"] is False
+        assert any("base_url" in e for e in result["errors"])
+
+    def test_client_credentials_requires_token_url(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "client_credentials"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("token_url" in e for e in errors)
+        assert any("client_id_env" in e for e in errors)
+
+    def test_authorization_code_requires_authorize_url(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "authorization_code"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("authorize_url" in e for e in errors)
+
+    def test_requires_openapi_or_endpoints(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "none"},
+                     "openapi": "", "endpoints": []},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("openapi" in e or "endpoint" in e for e in errors)
+
+    def test_unknown_auth_type_fails(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "wat"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("auth.type" in e for e in errors)
+
+
+class TestExtractSecretEnvKeysRest:
+    def test_rest_auth_env_keys_extracted(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        keys = _extract_secret_env_keys(spec)
+        assert "WEATHER_CLIENT_ID" in keys
+        assert "WEATHER_CLIENT_SECRET" in keys
+
+
+class TestListToolsRest:
+    def test_lists_rest_provider_is_rest_true(self, app, tools_dir):
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        data = TestClient(app).get("/api/tools").json()
+        assert data[0]["is_rest"] is True
+        assert data[0]["provider_type"] == "rest"
+
+
+class TestIntrospectOpenAPIEndpoint:
+    def test_returns_endpoints_and_tools(self, client):
+        fake = (
+            [{"name": "op", "method": "GET", "path": "/x",
+              "path_params": [], "query_params": [], "body_params": []}],
+            [{"name": "op", "description": "d", "input_schema": {"type": "object", "properties": {}, "required": []}}],
+        )
+        with patch("rest_provider.introspect_openapi", return_value=fake):
+            r = client.post("/api/introspect-openapi", json={"openapi": "https://x/openapi.json"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["endpoints"][0]["name"] == "op"
+        assert body["tools"][0]["name"] == "op"
+
+    def test_error_returns_ok_false(self, client):
+        with patch("rest_provider.introspect_openapi", side_effect=RuntimeError("boom")):
+            r = client.post("/api/introspect-openapi", json={"openapi": "https://x"})
+        body = r.json()
+        assert body["ok"] is False and "boom" in body["error"]
+
+    def test_missing_source_is_400(self, client):
+        r = client.post("/api/introspect-openapi", json={})
+        assert r.status_code == 400
+
+    def test_local_path_outside_files_dir_rejected(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        monkeypatch.setattr(app_module, "FILES_DIR", tmp_path / "files")
+        (tmp_path / "files").mkdir()
+        # An absolute path outside the files dir (would otherwise be a file read).
+        r = client.post("/api/introspect-openapi", json={"openapi": "/etc/hostname"})
+        body = r.json()
+        assert body["ok"] is False
+        assert "files directory" in body["error"]
+
+    def test_local_path_traversal_rejected(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
+        (tmp_path / "secret.json").write_text("{}")
+        r = client.post("/api/introspect-openapi", json={"openapi": "../secret.json"})
+        assert r.json()["ok"] is False
+
+    def test_local_path_inside_files_dir_allowed(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
+        (files / "spec.json").write_text(json.dumps({
+            "openapi": "3.0.0",
+            "paths": {"/ping": {"get": {"operationId": "ping"}}},
+        }))
+        r = client.post("/api/introspect-openapi", json={"openapi": "spec.json"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["endpoints"][0]["name"] == "ping"
+
+
+class TestRestAuthorizeAndCallback:
+    def test_rest_authorize_begins_flow(self, app, tools_dir, monkeypatch):
+        monkeypatch.setenv("WEATHER_CLIENT_ID", "cid")
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        r = TestClient(app).post("/api/rest-authorize", json={"name": "weather"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["auth_url"].startswith("https://auth.example.com/authorize?")
+        assert "/oauth/callback" in body["redirect_uri"]
+
+    def test_rest_authorize_rejects_non_auth_code(self, app, tools_dir):
+        provider = {**REST_PROVIDER, "rest": {**REST_PROVIDER["rest"], "auth": {"type": "none"}}}
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(provider))
+        r = TestClient(app).post("/api/rest-authorize", json={"name": "weather"})
+        assert r.status_code == 400
+
+    def test_callback_missing_code_is_400(self, client):
+        r = client.get("/oauth/callback")
+        assert r.status_code == 400
+
+    def test_callback_escapes_error_param(self, client):
+        r = client.get("/oauth/callback", params={"error": "<script>alert(1)</script>"})
+        assert r.status_code == 400
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;" in r.text
+
+    def test_callback_completes_authorization(self, client):
+        with patch("rest_provider.AuthCodeTokenStore.complete_authorization",
+                   new=AsyncMock(return_value="tok")):
+            r = client.get("/oauth/callback?code=c&state=s")
+        assert r.status_code == 200
+        assert "complete" in r.text.lower()
+
+
+class TestRestWizardFlowIntegration:
+    """Drive the exact backend API sequence the REST wizard JS performs:
+    introspect OpenAPI → assemble provider → POST /api/tools → GET it back.
+
+    Uses the real OpenAPI parser (not mocked), exercising the full path a user
+    walks through the wizard, then asserts a valid, reloadable provider results.
+    """
+
+    OPENAPI = {
+        "openapi": "3.0.0",
+        "info": {"title": "Demo", "version": "1.0"},
+        "paths": {
+            "/users/{user_id}": {
+                "get": {
+                    "operationId": "get_user",
+                    "summary": "Fetch a user",
+                    "parameters": [
+                        {"name": "user_id", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "expand", "in": "query", "schema": {"type": "string"}},
+                    ],
+                }
+            },
+            "/users": {
+                "post": {
+                    "operationId": "create_user",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "type": "object", "required": ["name"],
+                            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                        }}},
+                    },
+                }
+            },
+        },
+    }
+
+    def test_full_wizard_sequence(self, app, tools_dir, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
+        client = TestClient(app)
+        spec_file = files / "openapi.json"
+        spec_file.write_text(json.dumps(self.OPENAPI))
+
+        # 1. Wizard step: introspect the OpenAPI spec (real parser, file in FILES_DIR).
+        r = client.post("/api/introspect-openapi", json={"openapi": "openapi.json"})
+        body = r.json()
+        assert body["ok"] is True
+        endpoints = body["endpoints"]
+        tools_from_spec = {t["name"]: t for t in body["tools"]}
+        assert {e["name"] for e in endpoints} == {"get_user", "create_user"}
+
+        # 2. Wizard assembles the provider exactly like wzNext() does.
+        provider = {
+            "name": "demo", "type": "rest", "command": "", "code": "",
+            "documentation": "", "requirements": ["httpx"], "setup_commands": [],
+            "rest": {
+                "base_url": "https://api.demo.test/v1", "headers": {},
+                "auth": {
+                    "type": "client_credentials",
+                    "token_url": "https://auth.demo.test/token",
+                    "client_id_env": "DEMO_ID", "client_secret_env": "DEMO_SECRET",
+                    "scopes": ["read"],
+                },
+                "openapi": "", "endpoints": endpoints,
+            },
+            "tools": [{
+                "name": e["name"], "function": "",
+                "description": tools_from_spec[e["name"]]["description"],
+                "documentation": "", "enabled": True,
+                "parameters": [
+                    {"name": pn, "type": pdef.get("type", "string"),
+                     "description": pdef.get("description", ""),
+                     "required": pn in tools_from_spec[e["name"]]["input_schema"].get("required", []),
+                     "default": None}
+                    for pn, pdef in tools_from_spec[e["name"]]["input_schema"]["properties"].items()
+                ],
+                "secrets": [],
+            } for e in endpoints],
+        }
+
+        # 3. Create it.
+        r = client.post("/api/tools", json={"name": "demo", "provider": provider})
+        assert r.status_code == 200, r.text
+
+        # 4. Read it back as the editor would, and verify the on-disk YAML.
+        got = client.get("/api/tools/demo").json()
+        assert got["type"] == "rest"
+        assert got["rest"]["base_url"] == "https://api.demo.test/v1"
+        assert {e["name"] for e in got["rest"]["endpoints"]} == {"get_user", "create_user"}
+
+        spec = yaml.safe_load((tools_dir / "demo.yaml").read_text())
+        create = next(e for e in spec["rest"]["endpoints"] if e["name"] == "create_user")
+        assert create["method"] == "POST"
+        assert set(create["body_params"]) == {"name", "age"}
+        # Secret env keys surface for the wizard's Secrets step.
+        assert set(r.json()["secret_keys"]) >= {"DEMO_ID", "DEMO_SECRET"}

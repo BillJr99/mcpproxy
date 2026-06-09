@@ -114,6 +114,7 @@ Click **+ New Provider** and choose a provider type:
 | **Python code** | Write `async def` functions; the UI lists the ones it finds as you type. Each becomes a tool entry. |
 | **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary). When you click **Next**, mcpproxy auto-introspects the command and pre-populates the tool list; if introspection fails you can still proceed and add tools by hand. |
 | **Repository** | Provide a git URL and a list of build commands. mcpproxy clones the repo, runs the build commands, then introspects the resulting stdio MCP server. The URL and build commands are persisted in YAML so the repo can be re-cloned and re-built automatically on every container restart. |
+| **REST / OAuth API** | Point at a REST API: a base URL plus an OpenAPI spec (imported into tools automatically) or hand-entered endpoints, with optional OAuth. Each endpoint becomes an MCP tool. See [REST / OAuth providers](#rest--oauth-providers). |
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
@@ -142,6 +143,106 @@ ready when needed.
 
 > **After editing and saving** a provider's command or setup steps, click **Restart MCP Server**
 > (the yellow bar that appears after saving) to apply the changes.
+
+## REST / OAuth providers
+
+A **REST provider** wraps an HTTP/REST API directly — no Python and no separate MCP
+server needed. A provider YAML with a `rest:` block declares a base URL, an `auth:`
+block, and a set of endpoints; each endpoint becomes an MCP tool. mcpproxy builds the
+HTTP request (path/query/body), attaches authentication, and returns the JSON response.
+
+Create one through the **+ New Provider → REST / OAuth API** wizard. You can **import an
+OpenAPI spec** (URL or file — OpenAPI 3.x or Swagger 2.0) to generate the endpoints and tools automatically, or
+enter endpoints by hand. OpenAPI specs are expanded into concrete endpoints when the
+provider is created, so startup stays fast and offline.
+
+After creation, the editor lets you **edit everything inline** — the base URL, the auth
+block, default headers (sent on every request), and the endpoint list (method, path, and
+which params go in the path / query / body). Adding or removing an endpoint keeps its
+paired tool in sync (endpoints map 1:1 to tools by name), and **⟳ Sync params to tool
+schema** regenerates a tool's input schema from its endpoint's params.
+
+Large responses are **truncated** to a bounded preview (with a `truncated` flag) so a
+single call can't flood the model's context — tune or disable via `MCPPROXY_REST_MAX_BYTES`.
+
+### Authentication
+
+The `auth.type` field selects how requests are authenticated. Secrets are referenced by
+**environment-variable name** (the `*_env` fields) and filled in via the Secrets UI / `.env` —
+never written into the YAML.
+
+| `auth.type` | Fields | Behaviour |
+|---|---|---|
+| `none` | — | No authentication. |
+| `bearer` | `token_env` | Sends `Authorization: Bearer <env>`. |
+| `api_key` | `value_env`, plus either `header` (default `X-Api-Key`) or `in: query` + `name` | Sends the secret in a custom header, or as a query parameter when `in: query`. |
+| `client_credentials` | `token_url`, `client_id_env`, `client_secret_env`, `scopes` | OAuth2 client-credentials. Token is fetched, cached, and auto-refreshed on expiry/401. |
+| `authorization_code` | `authorize_url`, `token_url`, `client_id_env`, `client_secret_env` (optional for PKCE), `scopes` | Interactive OAuth2 + PKCE. Click **🔐 Authorize** in the editor to complete the browser flow; tokens are cached and refreshed automatically. |
+
+For `authorization_code`, register the redirect URI **`<MCPPROXY_OAUTH_REDIRECT_BASE>/oauth/callback`**
+(default `http://localhost:8889/oauth/callback`) with your OAuth provider. Tokens are cached
+under `MCPPROXY_REST_AUTH_DIR` (default `/app/.rest-auth`, gitignored).
+
+### Example
+
+```yaml
+rest:
+  base_url: https://api.example.com/v1
+  headers:
+    Accept: application/json
+  auth:
+    type: client_credentials
+    token_url: https://auth.example.com/oauth/token
+    client_id_env: EXAMPLE_CLIENT_ID
+    client_secret_env: EXAMPLE_CLIENT_SECRET
+    scopes: [read, write]
+  endpoints:
+    - name: get_user
+      method: GET
+      path: /users/{user_id}
+      path_params: [user_id]
+      query_params: [include]
+      body_params: []
+    - name: create_item
+      method: POST
+      path: /items
+      path_params: []
+      query_params: []
+      body_params: [title, body]
+
+requirements: [httpx]
+
+tools:
+  - name: get_user
+    description: Fetch a user by id.
+    input_schema:
+      type: object
+      properties:
+        user_id: {type: string}
+        include: {type: string}
+      required: [user_id]
+  - name: create_item
+    description: Create an item.
+    input_schema:
+      type: object
+      properties:
+        title: {type: string}
+        body:  {type: string}
+      required: [title]
+```
+
+Each tool's `name` maps 1:1 to an endpoint's `name`. REST providers depend on `httpx`
+(installed by default).
+
+At startup, OAuth-backed REST providers are **warmed**: `client_credentials` tokens are
+fetched and cached, and `authorization_code` providers that have no usable token surface
+their **🔐 Authorize** link in the banner immediately, rather than only after the first
+failed tool call. (Disable with `MCPPROXY_WARM_REMOTE=0`.)
+
+Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
+`MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), `MCPPROXY_REST_MAX_BYTES` (max
+response size before truncation; 0 disables), and `MCPPROXY_OAUTH_FLOW_TTL` (seconds an
+in-flight authorization attempt stays valid; default 600).
 
 ## Secrets
 

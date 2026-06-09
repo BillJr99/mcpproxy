@@ -1403,6 +1403,13 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           </div>
           <div class="mb-2">
             <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Default headers <span class="text-muted fw-normal" style="text-transform:none">— sent on every request</span></span>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="addRestHeader()">+ Add header</button>
+            </label>
+            <div id="rest-headers-container"></div>
+          </div>
+          <div class="mb-2">
+            <label class="form-label d-flex justify-content-between align-items-center">
               <span>Endpoints <span class="text-muted fw-normal" style="text-transform:none">— each maps 1:1 to a tool by name</span></span>
               <button class="btn btn-sm btn-outline-secondary py-0" onclick="addRestEndpoint()">+ Add endpoint</button>
             </label>
@@ -2142,13 +2149,50 @@ function renderRestEditor(p) {
   const rest = p.rest || (p.rest = {});
   rest.auth = rest.auth || {type: 'none'};
   rest.endpoints = rest.endpoints || [];
+  rest.headers = rest.headers || {};
+  // Edit headers as an ordered array of {key,value}; serialized back to an object
+  // in collectProvider so the YAML stays a plain mapping.
+  rest.headerRows = Object.entries(rest.headers).map(([key, value]) => ({key, value}));
   document.getElementById('f-rest-base-url').value = rest.base_url || '';
   document.getElementById('f-rest-auth-type').value = rest.auth.type || 'none';
   document.getElementById('rest-authorize-btn').style.display =
     (rest.auth.type === 'authorization_code') ? '' : 'none';
   document.getElementById('rest-auth-status').textContent = '';
   renderRestAuthFields(rest.auth);
+  renderRestHeaders(rest.headerRows);
   renderRestEndpoints(rest.endpoints);
+}
+
+function renderRestHeaders(rows) {
+  const c = document.getElementById('rest-headers-container');
+  if (!rows.length) { c.innerHTML = '<div class="text-muted" style="font-size:.8em">(none)</div>'; return; }
+  c.innerHTML = rows.map((h, i) => `
+    <div class="list-row mt-1">
+      <input class="form-control form-control-sm font-monospace" placeholder="Accept" style="max-width:40%"
+        value="${esc(h.key || '')}" oninput="updateRestHeader(${i},'key',this.value)">
+      <input class="form-control form-control-sm font-monospace" placeholder="application/json"
+        value="${esc(h.value || '')}" oninput="updateRestHeader(${i},'value',this.value)">
+      <button class="btn-icon" onclick="removeRestHeader(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function addRestHeader() {
+  ensureProvider();
+  const rest = currentProvider.rest || (currentProvider.rest = {});
+  rest.headerRows = rest.headerRows || [];
+  rest.headerRows.push({key: '', value: ''});
+  renderRestHeaders(rest.headerRows);
+}
+
+function removeRestHeader(i) {
+  ensureProvider();
+  currentProvider.rest.headerRows.splice(i, 1);
+  renderRestHeaders(currentProvider.rest.headerRows);
+}
+
+function updateRestHeader(i, which, val) {
+  ensureProvider();
+  currentProvider.rest.headerRows[i][which] = val;
 }
 
 function updateRestAuthType(val) {
@@ -2183,8 +2227,17 @@ function renderRestAuthFields(auth) {
   if (t === 'bearer') {
     html = _restAuthRow('Token env var', 'token_env', auth.token_env, 'EXAMPLE_TOKEN');
   } else if (t === 'api_key') {
-    html = _restAuthRow('Header name', 'header', auth.header, 'X-Api-Key')
-         + _restAuthRow('Value env var', 'value_env', auth.value_env, 'EXAMPLE_API_KEY');
+    const loc = auth.in === 'query' ? 'query' : 'header';
+    html = `<div class="mb-2"><label class="form-label">Send key in</label>
+        <select class="form-select form-select-sm" onchange="updateRestAuthField('in', this.value); renderRestAuthFields(currentProvider.rest.auth)">
+          <option value="header" ${loc === 'header' ? 'selected' : ''}>Header</option>
+          <option value="query" ${loc === 'query' ? 'selected' : ''}>Query parameter</option>
+        </select></div>`;
+    if (loc === 'query')
+      html += _restAuthRow('Query param name', 'name', auth.name, 'api_key');
+    else
+      html += _restAuthRow('Header name', 'header', auth.header, 'X-Api-Key');
+    html += _restAuthRow('Value env var', 'value_env', auth.value_env, 'EXAMPLE_API_KEY');
   } else if (t === 'client_credentials' || t === 'authorization_code') {
     if (t === 'authorization_code')
       html += _restAuthRow('Authorize URL', 'authorize_url', auth.authorize_url, 'https://auth.example.com/oauth/authorize');
@@ -2685,10 +2738,14 @@ function collectProvider() {
   } else if (p.type === 'package') {
     p.command = document.getElementById('f-command').value.trim();
   } else if (p.type === 'rest') {
-    // The auth block and endpoints are carried in currentProvider.rest; only the
-    // base URL is editable in the rich editor.
+    // auth + endpoints are carried in currentProvider.rest; base URL comes from
+    // the field, and the header rows are serialized back into a plain object.
     p.rest = currentProvider.rest || {};
     p.rest.base_url = document.getElementById('f-rest-base-url').value.trim();
+    const headers = {};
+    (p.rest.headerRows || []).forEach(h => { if (h.key && h.key.trim()) headers[h.key.trim()] = h.value; });
+    p.rest.headers = headers;
+    delete p.rest.headerRows;
   } else {
     p.code = codeEditor.getValue();
   }

@@ -57,6 +57,11 @@ _FLOW_TTL = float(os.environ.get("MCPPROXY_OAUTH_FLOW_TTL", "600"))
 # Default timeout (seconds) for every outbound HTTP request.
 HTTP_TIMEOUT = float(os.environ.get("MCPPROXY_REST_TIMEOUT", "30"))
 
+# Maximum size (bytes) of a response body returned to the caller.  Responses
+# larger than this are truncated to a bounded preview so a single REST call can't
+# flood the model's context with megabytes of JSON.  Set to 0 to disable.
+MAX_RESPONSE_BYTES = int(os.environ.get("MCPPROXY_REST_MAX_BYTES", "100000"))
+
 
 class NeedsAuthorization(Exception):
     """Raised when an authorization_code provider has no usable token.
@@ -355,12 +360,20 @@ class _AuthResolver:
         if self.type == "authorization_code":
             self._auth_code_store = AuthCodeTokenStore(provider_name, self.auth)
 
+    def apply_query(self, params: dict[str, Any]) -> None:
+        """Add auth that travels in the query string (api_key with ``in: query``)."""
+        if self.type == "api_key" and self.auth.get("in") == "query":
+            name = self.auth.get("name") or self.auth.get("header") or "api_key"
+            params[name] = _require_env(self.auth["value_env"])
+
     async def apply(self, headers: dict[str, str], *, force_refresh: bool = False) -> None:
         if self.type == "none":
             return
         if self.type == "bearer":
             headers["Authorization"] = f"Bearer {_require_env(self.auth['token_env'])}"
         elif self.type == "api_key":
+            if self.auth.get("in") == "query":
+                return  # handled by apply_query
             header_name = self.auth.get("header", "X-Api-Key")
             prefix = self.auth.get("prefix", "")
             value = _require_env(self.auth["value_env"])
@@ -413,6 +426,32 @@ def _split_kwargs(
     return path, query, body
 
 
+def _cap_response(resp: httpx.Response, tool_name: str) -> Any:
+    """Parse the response, truncating bodies larger than ``MAX_RESPONSE_BYTES``.
+
+    Oversized bodies are returned as a bounded text preview with a ``truncated``
+    flag rather than handed back whole, so one call can't flood the model's
+    context.  Set MCPPROXY_REST_MAX_BYTES=0 to disable.
+    """
+    text = resp.text
+    if MAX_RESPONSE_BYTES and len(text) > MAX_RESPONSE_BYTES:
+        return {
+            "ok": True,
+            "status": resp.status_code,
+            "truncated": True,
+            "total_bytes": len(text),
+            "preview": text[:MAX_RESPONSE_BYTES],
+            "note": (
+                f"Response was {len(text)} bytes, truncated to {MAX_RESPONSE_BYTES}. "
+                "Narrow the request (e.g. query params / pagination) for the full result."
+            ),
+        }
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return {"ok": True, "status": resp.status_code, "text": text}
+
+
 def _make_rest_handler(
     endpoint_spec: dict[str, Any],
     rest_config: dict[str, Any],
@@ -433,6 +472,7 @@ def _make_rest_handler(
     async def rest_handler(context: dict[str, Any], **kwargs: Any) -> Any:
         try:
             path_params, query, body = _split_kwargs(endpoint_spec, kwargs)
+            resolver.apply_query(query)  # api_key-in-query auth
             path = path_template.format(**path_params)
             url = f"{base_url}{path}"
 
@@ -460,10 +500,7 @@ def _make_rest_handler(
                     "tool": tool_name,
                 }
 
-            try:
-                return resp.json()
-            except (json.JSONDecodeError, ValueError):
-                return {"ok": True, "status": resp.status_code, "text": resp.text}
+            return _cap_response(resp, tool_name)
         except NeedsAuthorization as exc:
             return {"ok": False, "error": str(exc), "auth_url": exc.auth_url, "tool": tool_name}
         except Exception as exc:  # noqa: BLE001

@@ -1205,6 +1205,28 @@ class TestRestSpecConversion:
         assert structured["rest"]["auth"]["client_id_env"] == "WEATHER_CLIENT_ID"
         assert structured["rest"]["endpoints"][0]["path"] == "/forecast/{city}"
 
+    def test_default_headers_and_query_api_key_round_trip(self, app, tools_dir):
+        """Editor-set default headers and an api_key-in-query auth survive save."""
+        provider = {
+            **REST_PROVIDER,
+            "rest": {
+                **REST_PROVIDER["rest"],
+                "headers": {"Accept": "application/json", "X-Trace": "1"},
+                "auth": {"type": "api_key", "in": "query", "name": "apikey", "value_env": "DEMO_KEY"},
+            },
+        }
+        r = TestClient(app).post("/api/tools", json={"name": "weather2", "provider": provider})
+        assert r.status_code == 200, r.text
+        spec = yaml.safe_load((tools_dir / "weather2.yaml").read_text())
+        assert spec["rest"]["headers"] == {"Accept": "application/json", "X-Trace": "1"}
+        assert spec["rest"]["auth"] == {"type": "api_key", "in": "query", "name": "apikey", "value_env": "DEMO_KEY"}
+        # api_key value env surfaces as a secret key
+        assert "DEMO_KEY" in r.json()["secret_keys"]
+        # and it round-trips back into the structured editor form
+        structured = _provider_to_structured("weather2", spec)
+        assert structured["rest"]["headers"]["X-Trace"] == "1"
+        assert structured["rest"]["auth"]["in"] == "query"
+
     def test_editor_update_preserves_edited_endpoints(self, app, tools_dir):
         """Simulate the inline editor saving a REST provider with an added
         endpoint + renamed tool — auth and endpoints must survive the PUT."""

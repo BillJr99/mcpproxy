@@ -353,6 +353,25 @@ class TestResolveRestAuth:
         assert headers["Authorization"] == "Bearer cc"
         assert resolver.supports_retry is True
 
+    def test_api_key_in_query_uses_apply_query_not_header(self, monkeypatch):
+        monkeypatch.setenv("MY_KEY", "qk")
+        resolver = resolve_rest_auth("prov", {"auth": {
+            "type": "api_key", "in": "query", "name": "apikey", "value_env": "MY_KEY"}})
+        headers: dict = {}
+        asyncio.run(resolver.apply(headers))
+        assert headers == {}  # nothing in headers
+        params: dict = {}
+        resolver.apply_query(params)
+        assert params == {"apikey": "qk"}
+
+    def test_apply_query_noop_for_header_api_key(self, monkeypatch):
+        monkeypatch.setenv("MY_KEY", "k")
+        resolver = resolve_rest_auth("prov", {"auth": {
+            "type": "api_key", "header": "X-Api-Key", "value_env": "MY_KEY"}})
+        params: dict = {}
+        resolver.apply_query(params)
+        assert params == {}
+
 
 # ---------------------------------------------------------------------------
 # _make_rest_handler
@@ -436,6 +455,37 @@ class TestMakeRestHandler:
         ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
         result = self._call(ep, cfg, {})
         assert result["ok"] is False and "auth_url" in result
+
+    def test_api_key_query_added_to_request(self, http_recorder, monkeypatch):
+        monkeypatch.setenv("QK", "secretkey")
+        http_recorder["responses"].append(FakeResponse(json_data={"ok": True}))
+        cfg = {**REST_CONFIG, "auth": {"type": "api_key", "in": "query", "name": "key", "value_env": "QK"}}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": ["q"], "body_params": []}
+        self._call(ep, cfg, {"q": "term"})
+        assert http_recorder["calls"][0]["params"] == {"q": "term", "key": "secretkey"}
+
+    def test_large_response_is_truncated(self, http_recorder, monkeypatch):
+        monkeypatch.setattr(rest_provider, "MAX_RESPONSE_BYTES", 50)
+        big = "x" * 500
+        http_recorder["responses"].append(FakeResponse(status_code=200, json_data=None, text=big))
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, REST_CONFIG, {})
+        assert result["truncated"] is True
+        assert result["total_bytes"] == 500
+        assert len(result["preview"]) == 50
+
+    def test_small_response_not_truncated(self, http_recorder, monkeypatch):
+        monkeypatch.setattr(rest_provider, "MAX_RESPONSE_BYTES", 100000)
+        http_recorder["responses"].append(FakeResponse(json_data={"v": 1}))
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        assert self._call(ep, REST_CONFIG, {}) == {"v": 1}
+
+    def test_truncation_disabled_with_zero(self, http_recorder, monkeypatch):
+        monkeypatch.setattr(rest_provider, "MAX_RESPONSE_BYTES", 0)
+        http_recorder["responses"].append(FakeResponse(json_data={"data": "y" * 500}))
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, REST_CONFIG, {})
+        assert result == {"data": "y" * 500}
 
 
 # ---------------------------------------------------------------------------

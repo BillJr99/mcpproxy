@@ -157,10 +157,13 @@ enter endpoints by hand. OpenAPI specs are expanded into concrete endpoints when
 provider is created, so startup stays fast and offline.
 
 After creation, the editor lets you **edit everything inline** — the base URL, the auth
-block, and the endpoint list (method, path, and which params go in the path / query /
-body). Adding or removing an endpoint keeps its paired tool in sync (endpoints map 1:1
-to tools by name), and **⟳ Sync params to tool schema** regenerates a tool's input
-schema from its endpoint's params.
+block, default headers (sent on every request), and the endpoint list (method, path, and
+which params go in the path / query / body). Adding or removing an endpoint keeps its
+paired tool in sync (endpoints map 1:1 to tools by name), and **⟳ Sync params to tool
+schema** regenerates a tool's input schema from its endpoint's params.
+
+Large responses are **truncated** to a bounded preview (with a `truncated` flag) so a
+single call can't flood the model's context — tune or disable via `MCPPROXY_REST_MAX_BYTES`.
 
 ### Authentication
 
@@ -172,7 +175,7 @@ never written into the YAML.
 |---|---|---|
 | `none` | — | No authentication. |
 | `bearer` | `token_env` | Sends `Authorization: Bearer <env>`. |
-| `api_key` | `header` (default `X-Api-Key`), `value_env` | Sends the secret in a custom header. |
+| `api_key` | `value_env`, plus either `header` (default `X-Api-Key`) or `in: query` + `name` | Sends the secret in a custom header, or as a query parameter when `in: query`. |
 | `client_credentials` | `token_url`, `client_id_env`, `client_secret_env`, `scopes` | OAuth2 client-credentials. Token is fetched, cached, and auto-refreshed on expiry/401. |
 | `authorization_code` | `authorize_url`, `token_url`, `client_id_env`, `client_secret_env` (optional for PKCE), `scopes` | Interactive OAuth2 + PKCE. Click **🔐 Authorize** in the editor to complete the browser flow; tokens are cached and refreshed automatically. |
 
@@ -237,8 +240,9 @@ their **🔐 Authorize** link in the banner immediately, rather than only after 
 failed tool call. (Disable with `MCPPROXY_WARM_REMOTE=0`.)
 
 Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
-`MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), and `MCPPROXY_OAUTH_FLOW_TTL`
-(seconds an in-flight authorization attempt stays valid; default 600).
+`MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), `MCPPROXY_REST_MAX_BYTES` (max
+response size before truncation; 0 disables), and `MCPPROXY_OAUTH_FLOW_TTL` (seconds an
+in-flight authorization attempt stays valid; default 600).
 
 ## Secrets
 

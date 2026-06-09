@@ -21,6 +21,7 @@ WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
 
 import ast
 import asyncio
+import html
 import fcntl
 import json
 import os
@@ -43,7 +44,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from config import CONFIG_DIR, ENV_FILE, REPOS_DIR
+from config import CONFIG_DIR, ENV_FILE, FILES_DIR, REPOS_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +533,26 @@ def _extract_functions(code: str) -> dict[str, Any]:
 # FastAPI app factory
 # ---------------------------------------------------------------------------
 
+def _safe_local_openapi_path(source: str) -> str:
+    """Resolve a local OpenAPI file path, restricted to FILES_DIR.
+
+    Stops the introspection endpoint from being used to read arbitrary files
+    (e.g. ``/app/.env``).  Returns the resolved absolute path, or raises
+    ``ValueError`` if the path escapes the files directory or does not exist.
+    """
+    base = FILES_DIR.resolve()
+    candidate = Path(source)
+    candidate = candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise ValueError(
+            f"Local OpenAPI files must live under the files directory ({base}). "
+            "Use an http(s) URL, or place the spec in that directory."
+        )
+    if not candidate.is_file():
+        raise ValueError(f"OpenAPI file not found in the files directory: {source}")
+    return str(candidate)
+
+
 def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> "FastAPI":
     _config_dir = config_dir or CONFIG_DIR
     _env_file = env_file or ENV_FILE
@@ -706,21 +727,30 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
 
     @app.post("/api/introspect-openapi")
     async def introspect_openapi_endpoint(request: Request) -> dict:
-        """Parse an OpenAPI 3.0 spec (URL or file) into endpoints + tools.
+        """Parse an OpenAPI 3.x / Swagger 2.0 spec (URL or file) into endpoints + tools.
 
-        Body: { openapi: <url-or-path>, base_url?: <str> }.  Returns
-        ``{ok, endpoints, tools}`` (or ``{ok: False, error}``).  The wizard calls
-        this to expand an OpenAPI source into concrete endpoints before saving, so
-        the server never has to fetch the spec at registration time.
+        Body: { openapi: <url-or-path> }.  Returns ``{ok, endpoints, tools}`` (or
+        ``{ok: False, error}``).  The wizard calls this to expand an OpenAPI source
+        into concrete endpoints before saving, so the server never fetches the spec
+        at registration time.
+
+        Local file sources are restricted to the files directory (FILES_DIR) so the
+        endpoint can't read arbitrary files (e.g. ``.env``).  Parsing performs
+        blocking network/file I/O, so it runs in a worker thread to avoid blocking
+        the UI event loop.
         """
         body = await request.json()
         source = (body.get("openapi") or "").strip()
-        base_url = (body.get("base_url") or "").strip() or None
         if not source:
             raise HTTPException(400, "openapi (URL or file path) is required")
+        if not (source.startswith("http://") or source.startswith("https://")):
+            try:
+                source = _safe_local_openapi_path(source)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc), "endpoints": [], "tools": []}
         try:
             from rest_provider import introspect_openapi
-            endpoints, tools = introspect_openapi(source, base_url=base_url)
+            endpoints, tools = await asyncio.to_thread(introspect_openapi, source)
             return {"ok": True, "endpoints": endpoints, "tools": tools}
         except Exception as exc:
             traceback.print_exc()
@@ -762,8 +792,12 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         Exchanges ``code`` for tokens (using the PKCE verifier registered under
         ``state``) and persists them, then renders a small close-the-tab page.
         """
+        # Escape every interpolated value: these come from the redirect query
+        # string / upstream errors and must not be able to inject HTML or script.
         if error:
-            return HTMLResponse(f"<h3>Authorization failed</h3><p>{error}</p>", status_code=400)
+            return HTMLResponse(
+                f"<h3>Authorization failed</h3><p>{html.escape(error)}</p>", status_code=400
+            )
         if not code or not state:
             return HTMLResponse("<h3>Missing code or state</h3>", status_code=400)
         try:
@@ -776,7 +810,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         except Exception as exc:
             traceback.print_exc()
             return HTMLResponse(
-                f"<h3>Authorization error</h3><p>{exc}</p>", status_code=400
+                f"<h3>Authorization error</h3><p>{html.escape(str(exc))}</p>", status_code=400
             )
 
     # ── Repository clone-and-build ───────────────────────────────────────────
@@ -3106,12 +3140,11 @@ function wzRestValidateAuth(auth) {
 
 async function wzRestIntrospect() {
   const source = document.getElementById('wz-rest-openapi').value.trim();
-  const baseUrl = document.getElementById('wz-rest-base-url').value.trim();
   const resEl = document.getElementById('wz-rest-result');
   if (!source) { resEl.innerHTML = '<span class="text-danger" style="font-size:.85em">Enter an OpenAPI URL or file path first.</span>'; return; }
   resEl.innerHTML = '<span class="text-muted" style="font-size:.85em">Parsing OpenAPI spec…</span>';
   try {
-    const r = await api('POST', '/api/introspect-openapi', {openapi: source, base_url: baseUrl});
+    const r = await api('POST', '/api/introspect-openapi', {openapi: source});
     if (!r.ok) throw new Error(r.error || 'introspection failed');
     wzRestEndpoints = r.endpoints || [];
     wzRestEndpointTools = {};

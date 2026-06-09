@@ -1345,6 +1345,39 @@ class TestIntrospectOpenAPIEndpoint:
         r = client.post("/api/introspect-openapi", json={})
         assert r.status_code == 400
 
+    def test_local_path_outside_files_dir_rejected(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        monkeypatch.setattr(app_module, "FILES_DIR", tmp_path / "files")
+        (tmp_path / "files").mkdir()
+        # An absolute path outside the files dir (would otherwise be a file read).
+        r = client.post("/api/introspect-openapi", json={"openapi": "/etc/hostname"})
+        body = r.json()
+        assert body["ok"] is False
+        assert "files directory" in body["error"]
+
+    def test_local_path_traversal_rejected(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
+        (tmp_path / "secret.json").write_text("{}")
+        r = client.post("/api/introspect-openapi", json={"openapi": "../secret.json"})
+        assert r.json()["ok"] is False
+
+    def test_local_path_inside_files_dir_allowed(self, client, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
+        (files / "spec.json").write_text(json.dumps({
+            "openapi": "3.0.0",
+            "paths": {"/ping": {"get": {"operationId": "ping"}}},
+        }))
+        r = client.post("/api/introspect-openapi", json={"openapi": "spec.json"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["endpoints"][0]["name"] == "ping"
+
 
 class TestRestAuthorizeAndCallback:
     def test_rest_authorize_begins_flow(self, app, tools_dir, monkeypatch):
@@ -1365,6 +1398,12 @@ class TestRestAuthorizeAndCallback:
     def test_callback_missing_code_is_400(self, client):
         r = client.get("/oauth/callback")
         assert r.status_code == 400
+
+    def test_callback_escapes_error_param(self, client):
+        r = client.get("/oauth/callback", params={"error": "<script>alert(1)</script>"})
+        assert r.status_code == 400
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;" in r.text
 
     def test_callback_completes_authorization(self, client):
         with patch("rest_provider.AuthCodeTokenStore.complete_authorization",
@@ -1411,13 +1450,17 @@ class TestRestWizardFlowIntegration:
         },
     }
 
-    def test_full_wizard_sequence(self, app, tools_dir, tmp_path):
+    def test_full_wizard_sequence(self, app, tools_dir, tmp_path, monkeypatch):
+        import frontend.app as app_module
+        files = tmp_path / "files"
+        files.mkdir()
+        monkeypatch.setattr(app_module, "FILES_DIR", files)
         client = TestClient(app)
-        spec_file = tmp_path / "openapi.json"
+        spec_file = files / "openapi.json"
         spec_file.write_text(json.dumps(self.OPENAPI))
 
-        # 1. Wizard step: introspect the OpenAPI spec (real parser).
-        r = client.post("/api/introspect-openapi", json={"openapi": str(spec_file)})
+        # 1. Wizard step: introspect the OpenAPI spec (real parser, file in FILES_DIR).
+        r = client.post("/api/introspect-openapi", json={"openapi": "openapi.json"})
         body = r.json()
         assert body["ok"] is True
         endpoints = body["endpoints"]

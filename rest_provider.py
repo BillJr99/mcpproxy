@@ -90,6 +90,26 @@ def _require_env(env_name: str) -> str:
     return value
 
 
+def _loop_lock(holder: Any) -> asyncio.Lock:
+    """Return an ``asyncio.Lock`` bound to the *current* running loop.
+
+    The token managers/stores are cached in module-level state and may be touched
+    from more than one event loop over a process's lifetime (the startup warm-up
+    thread first, then the MCP server loop).  An ``asyncio.Lock`` binds to the
+    loop of its first ``await``, so a single shared lock would later raise
+    "bound to a different loop".  Recreating the lock when the running loop
+    changes keeps each loop's use correctly serialized (uses are single-loop at
+    runtime) without the cross-loop crash.
+    """
+    loop = asyncio.get_running_loop()
+    lock = getattr(holder, "_lock", None)
+    if lock is None or getattr(holder, "_lock_loop", None) is not loop:
+        lock = asyncio.Lock()
+        holder._lock = lock
+        holder._lock_loop = loop
+    return lock
+
+
 # ---------------------------------------------------------------------------
 # OAuth2 client_credentials
 # ---------------------------------------------------------------------------
@@ -112,13 +132,14 @@ class OAuthTokenManager:
         self.extra = dict(extra or {})
         self._access_token: str | None = None
         self._expires_at: float = 0.0
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: Any = None
 
     def _is_expired(self) -> bool:
         return (not self._access_token) or (time.time() >= self._expires_at - _EXPIRY_SKEW)
 
     async def get_token(self, *, force_refresh: bool = False) -> str:
-        async with self._lock:
+        async with _loop_lock(self):
             if force_refresh or self._is_expired():
                 await self._fetch()
             assert self._access_token is not None
@@ -198,7 +219,8 @@ class AuthCodeTokenStore:
     def __init__(self, provider: str, auth: dict[str, Any]) -> None:
         self.provider = provider
         self.auth = auth
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+        self._lock_loop: Any = None
 
     # ── persistence ─────────────────────────────────────────────────────────
 
@@ -223,7 +245,7 @@ class AuthCodeTokenStore:
     # ── token access ────────────────────────────────────────────────────────
 
     async def get_token(self, *, force_refresh: bool = False) -> str:
-        async with self._lock:
+        async with _loop_lock(self):
             data = self._load()
             access = data.get("access_token")
             expires_at = float(data.get("expires_at", 0))
@@ -563,13 +585,15 @@ def _object_props(doc: dict[str, Any], schema: Any) -> tuple[dict[str, Any], set
 
 
 def introspect_openapi(
-    source: str, base_url: str | None = None
+    source: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse an OpenAPI 3.0 document into (endpoints, tools).
+    """Parse an OpenAPI 3.x / Swagger 2.0 document into (endpoints, tools).
 
     ``source`` is a URL (fetched via httpx) or a local file path.  Returns a list
     of endpoint specs (method/path/param classification) and a parallel list of
     tool specs (name/description/input_schema) ready to drop into the provider.
+    The API's base URL is configured separately on the provider, so it is not
+    derived here.
     """
     raw = _load_openapi_source(source)
     doc = _parse_openapi_text(raw)

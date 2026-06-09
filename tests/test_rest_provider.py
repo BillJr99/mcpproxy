@@ -211,6 +211,19 @@ class TestOAuthTokenManager:
         b = rest_provider.get_token_manager(CC_AUTH)
         assert a is b
 
+    def test_reused_across_event_loops(self, http_recorder, monkeypatch):
+        """A cached manager warmed in one loop (startup thread) must still work
+        from a different loop (MCP server) — the lock must not bind to one loop."""
+        monkeypatch.setenv("CC_ID", "id")
+        monkeypatch.setenv("CC_SECRET", "secret")
+        http_recorder["responses"].append(FakeResponse(json_data={"access_token": "a", "expires_in": 3600}))
+        http_recorder["responses"].append(FakeResponse(json_data={"access_token": "b", "expires_in": 3600}))
+        mgr = self._mgr()
+        # loop A (e.g. warm-up thread), then loop B (e.g. MCP server) — no RuntimeError.
+        t1 = asyncio.run(mgr.get_token())
+        t2 = asyncio.run(mgr.get_token(force_refresh=True))
+        assert t1 == "a" and t2 == "b"
+
 
 # ---------------------------------------------------------------------------
 # AuthCodeTokenStore (authorization_code + PKCE)

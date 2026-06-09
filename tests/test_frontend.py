@@ -1,4 +1,5 @@
 """Unit tests for the HTTP frontend (frontend/app.py)."""
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -1349,3 +1350,100 @@ class TestRestAuthorizeAndCallback:
             r = client.get("/oauth/callback?code=c&state=s")
         assert r.status_code == 200
         assert "complete" in r.text.lower()
+
+
+class TestRestWizardFlowIntegration:
+    """Drive the exact backend API sequence the REST wizard JS performs:
+    introspect OpenAPI → assemble provider → POST /api/tools → GET it back.
+
+    Uses the real OpenAPI parser (not mocked), exercising the full path a user
+    walks through the wizard, then asserts a valid, reloadable provider results.
+    """
+
+    OPENAPI = {
+        "openapi": "3.0.0",
+        "info": {"title": "Demo", "version": "1.0"},
+        "paths": {
+            "/users/{user_id}": {
+                "get": {
+                    "operationId": "get_user",
+                    "summary": "Fetch a user",
+                    "parameters": [
+                        {"name": "user_id", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "expand", "in": "query", "schema": {"type": "string"}},
+                    ],
+                }
+            },
+            "/users": {
+                "post": {
+                    "operationId": "create_user",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "type": "object", "required": ["name"],
+                            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                        }}},
+                    },
+                }
+            },
+        },
+    }
+
+    def test_full_wizard_sequence(self, app, tools_dir, tmp_path):
+        client = TestClient(app)
+        spec_file = tmp_path / "openapi.json"
+        spec_file.write_text(json.dumps(self.OPENAPI))
+
+        # 1. Wizard step: introspect the OpenAPI spec (real parser).
+        r = client.post("/api/introspect-openapi", json={"openapi": str(spec_file)})
+        body = r.json()
+        assert body["ok"] is True
+        endpoints = body["endpoints"]
+        tools_from_spec = {t["name"]: t for t in body["tools"]}
+        assert {e["name"] for e in endpoints} == {"get_user", "create_user"}
+
+        # 2. Wizard assembles the provider exactly like wzNext() does.
+        provider = {
+            "name": "demo", "type": "rest", "command": "", "code": "",
+            "documentation": "", "requirements": ["httpx"], "setup_commands": [],
+            "rest": {
+                "base_url": "https://api.demo.test/v1", "headers": {},
+                "auth": {
+                    "type": "client_credentials",
+                    "token_url": "https://auth.demo.test/token",
+                    "client_id_env": "DEMO_ID", "client_secret_env": "DEMO_SECRET",
+                    "scopes": ["read"],
+                },
+                "openapi": "", "endpoints": endpoints,
+            },
+            "tools": [{
+                "name": e["name"], "function": "",
+                "description": tools_from_spec[e["name"]]["description"],
+                "documentation": "", "enabled": True,
+                "parameters": [
+                    {"name": pn, "type": pdef.get("type", "string"),
+                     "description": pdef.get("description", ""),
+                     "required": pn in tools_from_spec[e["name"]]["input_schema"].get("required", []),
+                     "default": None}
+                    for pn, pdef in tools_from_spec[e["name"]]["input_schema"]["properties"].items()
+                ],
+                "secrets": [],
+            } for e in endpoints],
+        }
+
+        # 3. Create it.
+        r = client.post("/api/tools", json={"name": "demo", "provider": provider})
+        assert r.status_code == 200, r.text
+
+        # 4. Read it back as the editor would, and verify the on-disk YAML.
+        got = client.get("/api/tools/demo").json()
+        assert got["type"] == "rest"
+        assert got["rest"]["base_url"] == "https://api.demo.test/v1"
+        assert {e["name"] for e in got["rest"]["endpoints"]} == {"get_user", "create_user"}
+
+        spec = yaml.safe_load((tools_dir / "demo.yaml").read_text())
+        create = next(e for e in spec["rest"]["endpoints"] if e["name"] == "create_user")
+        assert create["method"] == "POST"
+        assert set(create["body_params"]) == {"name", "age"}
+        # Secret env keys surface for the wizard's Secrets step.
+        assert set(r.json()["secret_keys"]) >= {"DEMO_ID", "DEMO_SECRET"}

@@ -115,7 +115,19 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
     for key in (spec.get("repository") or {}).get("env_keys") or []:
         if key and key not in keys:
             keys.append(key)
+    # REST providers reference auth secrets by env-var name (``*_env`` keys) in
+    # the auth block, so surface those for the Secrets UI / missing-secrets badge.
+    for key in _rest_auth_env_keys(spec):
+        if key and key not in keys:
+            keys.append(key)
     return keys
+
+
+def _rest_auth_env_keys(spec: dict[str, Any]) -> list[str]:
+    """Return the env-var names referenced by a REST provider's auth block."""
+    auth = (spec.get("rest") or {}).get("auth") or {}
+    candidates = ("token_env", "value_env", "client_id_env", "client_secret_env")
+    return [auth[k] for k in candidates if auth.get(k)]
 
 
 _ENV_EXAMPLE_CANDIDATES = (".env.example", ".env.sample", ".env.template")
@@ -184,6 +196,11 @@ def _get_repository_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
     return spec.get("repository") or None
 
 
+def _get_rest_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the rest sub-dict (rest:), or None for non-REST providers."""
+    return spec.get("rest") or None
+
+
 def _safe_provider_dirname(name: str) -> str:
     """Normalize a provider name into a safe single-segment directory name."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "-", name or "").strip("-")
@@ -229,7 +246,24 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
 
     pkg_sub = _get_package_spec(spec)
     repo_sub = _get_repository_spec(spec)
-    if repo_sub is not None:
+    rest_sub = _get_rest_spec(spec)
+    rest_out: dict[str, Any] = {}
+    if rest_sub is not None:
+        ptype = "rest"
+        command = ""
+        repo_url = ""
+        repo_ref = ""
+        build_commands = []
+        workdir = ""
+        repo_env_keys = []
+        rest_out = {
+            "base_url": (rest_sub.get("base_url") or "").strip(),
+            "headers": dict(rest_sub.get("headers") or {}),
+            "auth": dict(rest_sub.get("auth") or {"type": "none"}),
+            "openapi": (rest_sub.get("openapi") or "").strip(),
+            "endpoints": list(rest_sub.get("endpoints") or []),
+        }
+    elif repo_sub is not None:
         ptype = "repository"
         command = (pkg_sub.get("command") if pkg_sub else "") or ""
         command = command.strip()
@@ -268,6 +302,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "build_commands": build_commands,
         "repo_env_keys": repo_env_keys,
         "workdir": workdir,
+        "rest": rest_out,
         "tools": tools_out,
     }
 
@@ -282,7 +317,25 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
 
     ptype = provider.get("type", "code")
 
-    if ptype == "package":
+    if ptype == "rest":
+        rest_in = provider.get("rest") or {}
+        rest_block: dict[str, Any] = {
+            "base_url": (rest_in.get("base_url") or "").strip(),
+        }
+        headers = {k: v for k, v in (rest_in.get("headers") or {}).items() if k}
+        if headers:
+            rest_block["headers"] = headers
+        auth = dict(rest_in.get("auth") or {"type": "none"})
+        auth.setdefault("type", "none")
+        rest_block["auth"] = auth
+        openapi = (rest_in.get("openapi") or "").strip()
+        if openapi:
+            rest_block["openapi"] = openapi
+        endpoints = [e for e in (rest_in.get("endpoints") or []) if e.get("name")]
+        if endpoints:
+            rest_block["endpoints"] = endpoints
+        spec["rest"] = rest_block
+    elif ptype == "package":
         spec["package"] = {"command": (provider.get("command") or "").strip()}
     elif ptype == "repository":
         spec["package"] = {"command": (provider.get("command") or "").strip()}
@@ -354,11 +407,52 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
 # Validation
 # ---------------------------------------------------------------------------
 
+_REST_AUTH_TYPES = {"none", "bearer", "api_key", "client_credentials", "authorization_code"}
+
+
+def _validate_rest(provider: dict[str, Any]) -> list[str]:
+    """Return validation errors for a REST provider's ``rest`` block."""
+    errors: list[str] = []
+    rest = provider.get("rest") or {}
+    if not (rest.get("base_url") or "").strip():
+        errors.append("base_url is required for REST providers")
+
+    auth = rest.get("auth") or {}
+    atype = (auth.get("type") or "none").strip()
+    if atype not in _REST_AUTH_TYPES:
+        errors.append(f"auth.type must be one of {sorted(_REST_AUTH_TYPES)}")
+    if atype == "bearer" and not (auth.get("token_env") or "").strip():
+        errors.append("auth.token_env is required for bearer auth")
+    if atype == "api_key" and not (auth.get("value_env") or "").strip():
+        errors.append("auth.value_env is required for api_key auth")
+    if atype == "client_credentials":
+        for key in ("token_url", "client_id_env", "client_secret_env"):
+            if not (auth.get(key) or "").strip():
+                errors.append(f"auth.{key} is required for client_credentials auth")
+    if atype == "authorization_code":
+        for key in ("authorize_url", "token_url", "client_id_env"):
+            if not (auth.get(key) or "").strip():
+                errors.append(f"auth.{key} is required for authorization_code auth")
+
+    openapi = (rest.get("openapi") or "").strip()
+    endpoints = rest.get("endpoints") or []
+    if not openapi and not endpoints:
+        errors.append("REST providers need either an openapi source or at least one endpoint")
+    for i, ep in enumerate(endpoints):
+        if not (ep.get("method") or "").strip():
+            errors.append(f"rest.endpoints[{i}]: method is required")
+        if not (ep.get("path") or "").strip():
+            errors.append(f"rest.endpoints[{i}]: path is required")
+    return errors
+
+
 def _validate_provider(provider: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     ptype = provider.get("type", "code")
 
-    if ptype == "package":
+    if ptype == "rest":
+        errors.extend(_validate_rest(provider))
+    elif ptype == "package":
         if not (provider.get("command") or "").strip():
             errors.append("command is required for package providers")
     elif ptype == "repository":
@@ -462,6 +556,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                 validation = _validate_provider(structured)
                 is_package = bool(_get_package_spec(spec))
                 is_repository = bool(_get_repository_spec(spec))
+                is_rest = bool(_get_rest_spec(spec))
                 out.append({
                     "name": path.stem,
                     "file": path.name,
@@ -470,6 +565,7 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
                     "provider_type": structured["type"],
                     "is_package": is_package,
                     "is_repository": is_repository,
+                    "is_rest": is_rest,
                     "secret_keys": secret_keys,
                     "missing_secrets": missing_secrets,
                     "validation_errors": validation["errors"],
@@ -596,11 +692,92 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         bridge refreshes silently and this stays empty.
 
         With no `command`, returns every pending URL keyed by spawn command.
+        REST providers' authorization_code flows publish their URLs the same way
+        (keyed by provider name) and are merged into the ``pending`` map.
         """
         from process_runner import pending_auth_urls
+        from rest_provider import pending_rest_auth
         if command:
             return {"ok": True, "auth_url": pending_auth_urls.get(command.strip())}
-        return {"ok": True, "pending": dict(pending_auth_urls)}
+        merged = {**pending_auth_urls, **pending_rest_auth}
+        return {"ok": True, "pending": merged, "rest_pending": dict(pending_rest_auth)}
+
+    # ── REST / OpenAPI ───────────────────────────────────────────────────────
+
+    @app.post("/api/introspect-openapi")
+    async def introspect_openapi_endpoint(request: Request) -> dict:
+        """Parse an OpenAPI 3.0 spec (URL or file) into endpoints + tools.
+
+        Body: { openapi: <url-or-path>, base_url?: <str> }.  Returns
+        ``{ok, endpoints, tools}`` (or ``{ok: False, error}``).  The wizard calls
+        this to expand an OpenAPI source into concrete endpoints before saving, so
+        the server never has to fetch the spec at registration time.
+        """
+        body = await request.json()
+        source = (body.get("openapi") or "").strip()
+        base_url = (body.get("base_url") or "").strip() or None
+        if not source:
+            raise HTTPException(400, "openapi (URL or file path) is required")
+        try:
+            from rest_provider import introspect_openapi
+            endpoints, tools = introspect_openapi(source, base_url=base_url)
+            return {"ok": True, "endpoints": endpoints, "tools": tools}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "endpoints": [], "tools": []}
+
+    @app.post("/api/rest-authorize")
+    async def rest_authorize(request: Request) -> dict:
+        """Begin an authorization_code flow for a saved REST provider.
+
+        Body: { name: <provider> }.  Reads the provider's auth block from its
+        YAML, builds the PKCE authorize URL, publishes it to ``pending_rest_auth``,
+        and returns ``{ok, auth_url, redirect_uri}`` for the UI to open.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        _guard_name(name)
+        path = _config_dir / f"{name}.yaml"
+        if not path.exists():
+            raise HTTPException(404, f"Provider '{name}' not found")
+        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        auth = (spec.get("rest") or {}).get("auth") or {}
+        if (auth.get("type") or "").strip() != "authorization_code":
+            raise HTTPException(400, "Provider does not use authorization_code auth")
+        try:
+            from rest_provider import AuthCodeTokenStore, oauth_redirect_uri
+            store = AuthCodeTokenStore(name, auth)
+            auth_url = store.begin_authorization()
+            return {"ok": True, "auth_url": auth_url, "redirect_uri": oauth_redirect_uri()}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc)}
+
+    @app.get("/oauth/callback")
+    async def oauth_callback(
+        code: str = "", state: str = "", error: str = ""
+    ) -> "HTMLResponse":
+        """OAuth redirect target for REST providers' authorization_code flow.
+
+        Exchanges ``code`` for tokens (using the PKCE verifier registered under
+        ``state``) and persists them, then renders a small close-the-tab page.
+        """
+        if error:
+            return HTMLResponse(f"<h3>Authorization failed</h3><p>{error}</p>", status_code=400)
+        if not code or not state:
+            return HTMLResponse("<h3>Missing code or state</h3>", status_code=400)
+        try:
+            from rest_provider import AuthCodeTokenStore
+            await AuthCodeTokenStore.complete_authorization(state, code)
+            return HTMLResponse(
+                "<h3>Authorization complete</h3>"
+                "<p>You may close this tab and return to mcpproxy.</p>"
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return HTMLResponse(
+                f"<h3>Authorization error</h3><p>{exc}</p>", status_code=400
+            )
 
     # ── Repository clone-and-build ───────────────────────────────────────────
 
@@ -1200,6 +1377,23 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div id="rebuild-status" class="mt-2 fn-status"></div>
         </div>
 
+        <!-- REST box (rest providers) -->
+        <div class="section-box" id="rest-box" style="display:none">
+          <div class="section-title">
+            🔌 REST API
+            <button class="btn btn-sm btn-outline-warning py-0" id="rest-authorize-btn" style="display:none"
+              onclick="authorizeRestProvider()"
+              title="Run the OAuth authorization_code flow to obtain / refresh a token">🔐 Authorize</button>
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Base URL</label>
+            <input id="f-rest-base-url" class="form-control form-control-sm font-monospace"
+              placeholder="https://api.example.com/v1" oninput="updateRestBaseUrl(this.value)">
+          </div>
+          <div class="text-muted" style="font-size:.8em">Auth: <code id="f-rest-auth-type">none</code> · Endpoints: <code id="f-rest-endpoint-count">0</code></div>
+          <div id="rest-auth-status" class="mt-2 fn-status"></div>
+        </div>
+
         <!-- Code box (code providers) -->
         <div class="section-box" id="code-box" style="display:none">
           <div class="section-title">🐍 Python Code</div>
@@ -1310,6 +1504,15 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
               </div>
             </div>
             <div class="col-md-3">
+              <div class="card wizard-choice h-100" onclick="wzSelectType('rest')">
+                <div class="card-body text-center p-4">
+                  <div style="font-size:2.5em">🔌</div>
+                  <h6 class="mt-2">REST / OAuth API</h6>
+                  <small class="text-muted">Point at a REST API (base URL + endpoints, or an OpenAPI spec) with optional OAuth — each endpoint becomes an MCP tool</small>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-3">
               <div class="card wizard-choice h-100" onclick="wzSelectType('code')">
                 <div class="card-body text-center p-4">
                   <div style="font-size:2.5em">🐍</div>
@@ -1406,6 +1609,100 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div id="wz-repo-result" class="mt-2"></div>
         </div>
 
+        <!-- Step: REST / OAuth API -->
+        <div id="wz-rest" class="wizard-step">
+          <div class="mb-3">
+            <label class="form-label">Provider name</label>
+            <input class="form-control" id="wz-rest-name" placeholder="weather">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Base URL *</label>
+            <input class="form-control font-monospace" id="wz-rest-base-url"
+              placeholder="https://api.example.com/v1">
+            <div class="text-muted mt-1" style="font-size:.8em">Requests are sent to <code>&lt;base URL&gt;&lt;endpoint path&gt;</code>.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Authentication</label>
+            <select class="form-select" id="wz-rest-auth-type" onchange="wzRestAuthChanged()">
+              <option value="none">None</option>
+              <option value="bearer">Bearer token (from env)</option>
+              <option value="api_key">API key header (from env)</option>
+              <option value="client_credentials">OAuth2 — client credentials</option>
+              <option value="authorization_code">OAuth2 — authorization code + PKCE</option>
+            </select>
+          </div>
+          <div class="mb-3" id="wz-rest-auth-fields" style="display:none">
+            <!-- bearer -->
+            <div class="wz-rest-auth wz-rest-auth-bearer" style="display:none">
+              <label class="form-label">Token env var *</label>
+              <input class="form-control font-monospace" id="wz-rest-token-env" placeholder="EXAMPLE_TOKEN">
+            </div>
+            <!-- api_key -->
+            <div class="wz-rest-auth wz-rest-auth-api_key" style="display:none">
+              <div class="row g-2">
+                <div class="col">
+                  <label class="form-label">Header name</label>
+                  <input class="form-control font-monospace" id="wz-rest-header" placeholder="X-Api-Key">
+                </div>
+                <div class="col">
+                  <label class="form-label">Value env var *</label>
+                  <input class="form-control font-monospace" id="wz-rest-value-env" placeholder="EXAMPLE_API_KEY">
+                </div>
+              </div>
+            </div>
+            <!-- oauth shared -->
+            <div class="wz-rest-auth wz-rest-auth-oauth" style="display:none">
+              <div class="mb-2 wz-rest-auth-authcode-only" style="display:none">
+                <label class="form-label">Authorize URL *</label>
+                <input class="form-control font-monospace" id="wz-rest-authorize-url" placeholder="https://auth.example.com/oauth/authorize">
+              </div>
+              <div class="mb-2">
+                <label class="form-label">Token URL *</label>
+                <input class="form-control font-monospace" id="wz-rest-token-url" placeholder="https://auth.example.com/oauth/token">
+              </div>
+              <div class="row g-2 mb-2">
+                <div class="col">
+                  <label class="form-label">Client ID env var *</label>
+                  <input class="form-control font-monospace" id="wz-rest-client-id-env" placeholder="EXAMPLE_CLIENT_ID">
+                </div>
+                <div class="col">
+                  <label class="form-label">Client secret env var <span class="text-muted fw-normal" style="text-transform:none" id="wz-rest-secret-optional"></span></label>
+                  <input class="form-control font-monospace" id="wz-rest-client-secret-env" placeholder="EXAMPLE_CLIENT_SECRET">
+                </div>
+              </div>
+              <div class="mb-2">
+                <label class="form-label">Scopes <span class="text-muted fw-normal" style="text-transform:none">space-separated</span></label>
+                <input class="form-control font-monospace" id="wz-rest-scopes" placeholder="read write">
+              </div>
+              <div class="text-muted wz-rest-auth-authcode-only" style="display:none;font-size:.8em">
+                Register this redirect URI with your OAuth provider: <code id="wz-rest-redirect-uri">http://localhost:8889/oauth/callback</code>.
+                After creating the provider, click <b>🔐 Authorize</b> in the editor to complete the browser flow.
+              </div>
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Endpoints</label>
+            <ul class="nav nav-tabs" style="font-size:.85em">
+              <li class="nav-item"><a class="nav-link active" id="wz-rest-tab-openapi" href="#" onclick="wzRestTab('openapi');return false">Import OpenAPI</a></li>
+              <li class="nav-item"><a class="nav-link" id="wz-rest-tab-manual" href="#" onclick="wzRestTab('manual');return false">Manual</a></li>
+            </ul>
+            <div class="pt-2" id="wz-rest-openapi-pane">
+              <label class="form-label">OpenAPI URL or file path</label>
+              <div class="d-flex gap-2">
+                <input class="form-control font-monospace" id="wz-rest-openapi" placeholder="https://api.example.com/openapi.json">
+                <button class="btn btn-outline-secondary" onclick="wzRestIntrospect()" id="wz-rest-introspect-btn">Introspect</button>
+              </div>
+              <div class="text-muted mt-1" style="font-size:.8em">Parses the spec into endpoints + tools when you click <b>Introspect</b> or <b>Next</b>.</div>
+            </div>
+            <div class="pt-2" id="wz-rest-manual-pane" style="display:none">
+              <div id="wz-rest-endpoints-container"></div>
+              <button class="btn btn-sm btn-outline-secondary py-0 mt-1" onclick="wzRestAddEndpoint()">+ Add endpoint</button>
+              <div class="text-muted mt-1" style="font-size:.8em">Path params use <code>{name}</code>; list each param under the right column (path / query / body).</div>
+            </div>
+          </div>
+          <div id="wz-rest-result" class="mt-2"></div>
+        </div>
+
         <!-- Step: code paste -->
         <div id="wz-code" class="wizard-step">
           <div class="mb-3">
@@ -1485,9 +1782,11 @@ let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null, termModal = null;
 let webTerminalEnabled = false;
 let term = null, termFit = null, termSock = null;  // xterm.js terminal state
-let wzType = null;            // 'code' | 'package' | 'repository' | 'remote'
+let wzType = null;            // 'code' | 'package' | 'repository' | 'remote' | 'rest'
 let wzStep = 'type';
 let wzIntrospectedTools = []; // tools returned by introspect
+let wzRestEndpoints = [];     // REST wizard: concrete endpoint specs
+let wzRestEndpointTools = {}; // REST wizard: endpoint name → tool spec (from OpenAPI)
 let wzRepoCtx = null;         // repository-wizard state carried across steps
                               //   {name, command, repo_url, repo_ref,
                               //    build_commands, workdir, env_keys, tools,
@@ -1668,6 +1967,16 @@ async function openProvider(name) {
 // Failure (or absence of input) is silent — the editor falls back to free-form text.
 async function discoverFunctions() {
   if (!currentProvider) return;
+  // REST providers derive their tool names from the configured endpoints; no
+  // subprocess introspection or code analysis is involved.
+  if (currentProvider.type === 'rest') {
+    knownFunctions = ((currentProvider.rest || {}).endpoints || []).map(e => e.name).filter(Boolean);
+    knownFnStatus = 'ok';
+    knownFnMessage = `Found ${knownFunctions.length} endpoint${knownFunctions.length === 1 ? '' : 's'}`;
+    _renderKnownFnStatus();
+    _refreshToolDropdowns();
+    return;
+  }
   const isRepo = currentProvider.type === 'repository';
   const isPkg = currentProvider.type === 'package' || isRepo;
   knownFnStatus = 'busy';
@@ -1719,7 +2028,7 @@ function _renderKnownFnStatus() {
 // reset focus / scroll position).  Each dropdown's inner option list is replaced.
 function _refreshToolDropdowns() {
   if (!currentProvider) return;
-  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository';
+  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest';
   const field = isPkg ? 'name' : 'function';
   (currentProvider.tools || []).forEach((t, i) => {
     const sel = document.getElementById(`fn-pick-${i}`);
@@ -1763,14 +2072,18 @@ function _refreshEditorBars(name) {
 
 function renderProvider(p) {
   const isRepo = p.type === 'repository';
+  const isRest = p.type === 'rest';
   const isPkg = p.type === 'package' || isRepo; // repo also uses package.command
   const isCode = p.type === 'code';
-  const label = isRepo ? ' (repository)' : isPkg ? ' (package)' : ' (code)';
+  // REST tools (like package tools) are selected by endpoint name, not function.
+  const nameDriven = isPkg || isRest;
+  const label = isRepo ? ' (repository)' : isRest ? ' (rest)' : isPkg ? ' (package)' : ' (code)';
   document.getElementById('editor-title').textContent = p.name + label;
   document.getElementById('f-documentation').value = p.documentation || '';
 
   document.getElementById('package-box').style.display = isPkg ? '' : 'none';
   document.getElementById('repository-box').style.display = isRepo ? '' : 'none';
+  document.getElementById('rest-box').style.display = isRest ? '' : 'none';
   document.getElementById('code-box').style.display = isCode ? '' : 'none';
 
   if (isPkg) {
@@ -1786,6 +2099,15 @@ function renderProvider(p) {
     renderBuildCommands(p.build_commands || []);
     renderEnvKeys(p.repo_env_keys || []);
   }
+  if (isRest) {
+    const rest = p.rest || {};
+    document.getElementById('f-rest-base-url').value = rest.base_url || '';
+    document.getElementById('f-rest-auth-type').textContent = (rest.auth || {}).type || 'none';
+    document.getElementById('f-rest-endpoint-count').textContent = (rest.endpoints || []).length;
+    document.getElementById('rest-authorize-btn').style.display =
+      ((rest.auth || {}).type === 'authorization_code') ? '' : 'none';
+    document.getElementById('rest-auth-status').textContent = '';
+  }
   if (isCode) {
     codeEditor.setValue(p.code || '');
     setTimeout(() => codeEditor.refresh(), 50);
@@ -1793,7 +2115,31 @@ function renderProvider(p) {
 
   renderRequirements(p.requirements || []);
   renderSetupCommands(p.setup_commands || []);
-  renderTools(p.tools || [], isPkg);
+  renderTools(p.tools || [], nameDriven);
+}
+
+function updateRestBaseUrl(val) {
+  ensureProvider();
+  if (!currentProvider.rest) currentProvider.rest = {};
+  currentProvider.rest.base_url = val;
+}
+
+async function authorizeRestProvider() {
+  if (!currentName) return;
+  const status = document.getElementById('rest-auth-status');
+  status.className = 'fn-status busy';
+  status.textContent = 'Starting authorization…';
+  try {
+    const r = await api('POST', '/api/rest-authorize', {name: currentName});
+    if (!r.ok) throw new Error(r.error || 'authorization failed');
+    window.open(r.auth_url, '_blank', 'noopener');
+    status.className = 'fn-status ok';
+    status.innerHTML = `Opened the authorization page. After approving, tokens are cached automatically. ` +
+      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>`;
+  } catch(e) {
+    status.className = 'fn-status error';
+    status.textContent = e.message || 'authorization failed';
+  }
 }
 
 // Build commands list (repository providers)
@@ -2156,6 +2502,11 @@ function collectProvider() {
     p.repo_env_keys = (currentProvider.repo_env_keys || []).filter(k => k.trim());
   } else if (p.type === 'package') {
     p.command = document.getElementById('f-command').value.trim();
+  } else if (p.type === 'rest') {
+    // The auth block and endpoints are carried in currentProvider.rest; only the
+    // base URL is editable in the rich editor.
+    p.rest = currentProvider.rest || {};
+    p.rest.base_url = document.getElementById('f-rest-base-url').value.trim();
   } else {
     p.code = codeEditor.getValue();
   }
@@ -2182,7 +2533,7 @@ function updateSecret(ti, si, field, val) {
 
 function addTool() {
   ensureProvider();
-  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository';
+  const isPkg = currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest';
   currentProvider.tools.push({
     name: '', function: '', description: '', documentation: '',
     enabled: true, parameters: [], secrets: [],
@@ -2193,31 +2544,31 @@ function addTool() {
 function removeTool(i) {
   ensureProvider();
   currentProvider.tools.splice(i, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 
 function addParam(ti) {
   ensureProvider();
   currentProvider.tools[ti].parameters.push({name:'',type:'string',description:'',required:false,default:null});
-  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 
 function removeParam(ti, pi) {
   ensureProvider();
   currentProvider.tools[ti].parameters.splice(pi, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 
 function addSecret(ti) {
   ensureProvider();
   currentProvider.tools[ti].secrets.push({arg:'',env:''});
-  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 
 function removeSecret(ti, si) {
   ensureProvider();
   currentProvider.tools[ti].secrets.splice(si, 1);
-  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository');
+  renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2376,7 +2727,7 @@ async function saveSecrets() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Wizard
 // ─────────────────────────────────────────────────────────────────────────────
-const WZ_STEPS = ['type','remote','package','repository','code','secrets'];
+const WZ_STEPS = ['type','remote','package','repository','rest','code','secrets'];
 
 function wzShowStep(step) {
   WZ_STEPS.forEach(s => {
@@ -2414,8 +2765,24 @@ function openWizard() {
   document.getElementById('wz-remote-name').value = '';
   document.getElementById('wz-remote-url').value = '';
   document.getElementById('wz-remote-result').innerHTML = '';
+  wzRestReset();
   wzShowStep('type');
   wizModal.show();
+}
+
+function wzRestReset() {
+  wzRestEndpoints = [];
+  wzRestEndpointTools = {};
+  ['wz-rest-name','wz-rest-base-url','wz-rest-token-env','wz-rest-header','wz-rest-value-env',
+   'wz-rest-authorize-url','wz-rest-token-url','wz-rest-client-id-env','wz-rest-client-secret-env',
+   'wz-rest-scopes','wz-rest-openapi'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  const at = document.getElementById('wz-rest-auth-type'); if (at) at.value = 'none';
+  const ec = document.getElementById('wz-rest-endpoints-container'); if (ec) ec.innerHTML = '';
+  const res = document.getElementById('wz-rest-result'); if (res) res.innerHTML = '';
+  wzRestAuthChanged();
+  wzRestTab('openapi');
+  const ru = document.getElementById('wz-rest-redirect-uri');
+  if (ru) ru.textContent = (window.location.origin || 'http://localhost:8889') + '/oauth/callback';
 }
 
 function wzAddRepoBuild() { _wzListAdd('wz-repo-builds-container', 'npm install'); }
@@ -2441,6 +2808,124 @@ function wzSelectType(type) {
   document.querySelectorAll('.wizard-choice').forEach(el => el.classList.remove('selected'));
   event.currentTarget.classList.add('selected');
   setTimeout(() => wzShowStep(type), 120);
+}
+
+// ── REST wizard helpers ──────────────────────────────────────────────────────
+
+function wzRestAuthChanged() {
+  const type = document.getElementById('wz-rest-auth-type').value;
+  const wrap = document.getElementById('wz-rest-auth-fields');
+  wrap.style.display = type === 'none' ? 'none' : '';
+  document.querySelectorAll('#wz-rest-auth-fields .wz-rest-auth').forEach(el => el.style.display = 'none');
+  if (type === 'bearer') document.querySelector('.wz-rest-auth-bearer').style.display = '';
+  else if (type === 'api_key') document.querySelector('.wz-rest-auth-api_key').style.display = '';
+  else if (type === 'client_credentials' || type === 'authorization_code') {
+    document.querySelector('.wz-rest-auth-oauth').style.display = '';
+    const authCodeOnly = type === 'authorization_code';
+    document.querySelectorAll('.wz-rest-auth-authcode-only').forEach(el => el.style.display = authCodeOnly ? '' : 'none');
+    document.getElementById('wz-rest-secret-optional').textContent = authCodeOnly ? 'optional (PKCE)' : 'required';
+  }
+}
+
+function wzRestTab(which) {
+  const openapi = which === 'openapi';
+  document.getElementById('wz-rest-tab-openapi').classList.toggle('active', openapi);
+  document.getElementById('wz-rest-tab-manual').classList.toggle('active', !openapi);
+  document.getElementById('wz-rest-openapi-pane').style.display = openapi ? '' : 'none';
+  document.getElementById('wz-rest-manual-pane').style.display = openapi ? 'none' : '';
+}
+
+function wzRestCollectAuth() {
+  const type = document.getElementById('wz-rest-auth-type').value;
+  const auth = { type };
+  const g = id => (document.getElementById(id).value || '').trim();
+  if (type === 'bearer') auth.token_env = g('wz-rest-token-env');
+  else if (type === 'api_key') { auth.header = g('wz-rest-header') || 'X-Api-Key'; auth.value_env = g('wz-rest-value-env'); }
+  else if (type === 'client_credentials' || type === 'authorization_code') {
+    auth.token_url = g('wz-rest-token-url');
+    auth.client_id_env = g('wz-rest-client-id-env');
+    const sec = g('wz-rest-client-secret-env'); if (sec) auth.client_secret_env = sec;
+    const scopes = g('wz-rest-scopes'); if (scopes) auth.scopes = scopes.split(/\s+/).filter(Boolean);
+    if (type === 'authorization_code') auth.authorize_url = g('wz-rest-authorize-url');
+  }
+  return auth;
+}
+
+function wzRestValidateAuth(auth) {
+  if (auth.type === 'bearer' && !auth.token_env) return 'Bearer auth needs a token env var.';
+  if (auth.type === 'api_key' && !auth.value_env) return 'API-key auth needs a value env var.';
+  if (auth.type === 'client_credentials') {
+    if (!auth.token_url || !auth.client_id_env || !auth.client_secret_env)
+      return 'Client-credentials needs token URL, client ID env, and client secret env.';
+  }
+  if (auth.type === 'authorization_code') {
+    if (!auth.authorize_url || !auth.token_url || !auth.client_id_env)
+      return 'Authorization-code needs authorize URL, token URL, and client ID env.';
+  }
+  return '';
+}
+
+async function wzRestIntrospect() {
+  const source = document.getElementById('wz-rest-openapi').value.trim();
+  const baseUrl = document.getElementById('wz-rest-base-url').value.trim();
+  const resEl = document.getElementById('wz-rest-result');
+  if (!source) { resEl.innerHTML = '<span class="text-danger" style="font-size:.85em">Enter an OpenAPI URL or file path first.</span>'; return; }
+  resEl.innerHTML = '<span class="text-muted" style="font-size:.85em">Parsing OpenAPI spec…</span>';
+  try {
+    const r = await api('POST', '/api/introspect-openapi', {openapi: source, base_url: baseUrl});
+    if (!r.ok) throw new Error(r.error || 'introspection failed');
+    wzRestEndpoints = r.endpoints || [];
+    wzRestEndpointTools = {};
+    (r.tools || []).forEach(t => { wzRestEndpointTools[t.name] = t; });
+    resEl.innerHTML = `<div style="color:var(--green);font-size:.85em">✓ Found ${wzRestEndpoints.length} endpoint(s)</div>`;
+  } catch(e) {
+    wzRestEndpoints = []; wzRestEndpointTools = {};
+    resEl.innerHTML = `<div class="text-danger" style="font-size:.85em">✗ ${esc(e.message)}</div>`;
+  }
+}
+
+function wzRestAddEndpoint() {
+  const c = document.getElementById('wz-rest-endpoints-container');
+  const idx = c.children.length;
+  const div = document.createElement('div');
+  div.className = 'border rounded p-2 mt-1';
+  div.innerHTML = `
+    <div class="row g-2">
+      <div class="col-4"><input class="form-control form-control-sm font-monospace wz-ep-name" placeholder="get_user"></div>
+      <div class="col-2">
+        <select class="form-select form-select-sm wz-ep-method">
+          <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option>
+        </select>
+      </div>
+      <div class="col-5"><input class="form-control form-control-sm font-monospace wz-ep-path" placeholder="/users/{user_id}"></div>
+      <div class="col-1"><button class="btn-icon" onclick="this.closest('.border').remove()" title="Remove">✕</button></div>
+    </div>
+    <div class="row g-2 mt-1" style="font-size:.8em">
+      <div class="col"><input class="form-control form-control-sm font-monospace wz-ep-pathp" placeholder="path params: user_id"></div>
+      <div class="col"><input class="form-control form-control-sm font-monospace wz-ep-queryp" placeholder="query params: include"></div>
+      <div class="col"><input class="form-control form-control-sm font-monospace wz-ep-bodyp" placeholder="body params: title,body"></div>
+    </div>`;
+  c.appendChild(div);
+}
+
+function wzRestCollectManualEndpoints() {
+  const eps = [];
+  const tools = {};
+  document.querySelectorAll('#wz-rest-endpoints-container > .border').forEach(div => {
+    const name = (div.querySelector('.wz-ep-name').value || '').trim();
+    const path = (div.querySelector('.wz-ep-path').value || '').trim();
+    if (!name || !path) return;
+    const csv = sel => (div.querySelector(sel).value || '').split(',').map(s => s.trim()).filter(Boolean);
+    const path_params = csv('.wz-ep-pathp');
+    const query_params = csv('.wz-ep-queryp');
+    const body_params = csv('.wz-ep-bodyp');
+    eps.push({name, method: div.querySelector('.wz-ep-method').value, path, path_params, query_params, body_params});
+    const props = {}; const required = [];
+    [...path_params, ...query_params, ...body_params].forEach(pn => { props[pn] = {type:'string'}; });
+    path_params.forEach(pn => required.push(pn));
+    tools[name] = {name, description: name, input_schema: {type:'object', properties: props, required}};
+  });
+  return {eps, tools};
 }
 
 // Wizard requirement/setup-command list helpers
@@ -2614,6 +3099,54 @@ async function wzNext() {
     return;
   }
 
+  if (wzStep === 'rest') {
+    const name = document.getElementById('wz-rest-name').value.trim();
+    const baseUrl = document.getElementById('wz-rest-base-url').value.trim();
+    if (!name) { errEl.textContent = 'Provider name is required.'; return; }
+    if (!baseUrl) { errEl.textContent = 'Base URL is required.'; return; }
+    const openapi = document.getElementById('wz-rest-openapi').value.trim();
+    const nextBtn = document.getElementById('wz-next-btn');
+    const manualActive = document.getElementById('wz-rest-manual-pane').style.display !== 'none';
+    if (manualActive) {
+      const m = wzRestCollectManualEndpoints();
+      wzRestEndpoints = m.eps; wzRestEndpointTools = m.tools;
+    } else if (openapi && !wzRestEndpoints.length) {
+      // OpenAPI source given but not yet introspected — do it now.
+      nextBtn.disabled = true; const t = nextBtn.textContent; nextBtn.textContent = '⏳ Introspecting…';
+      try { await wzRestIntrospect(); }
+      finally { nextBtn.disabled = false; nextBtn.textContent = t; }
+    }
+    if (!wzRestEndpoints.length) {
+      errEl.textContent = 'Add at least one endpoint, or import an OpenAPI spec.'; return;
+    }
+    const auth = wzRestCollectAuth();
+    const authErr = wzRestValidateAuth(auth);
+    if (authErr) { errEl.textContent = authErr; return; }
+    const tools = wzRestEndpoints.map(ep => {
+      const t = wzRestEndpointTools[ep.name];
+      return {
+        name: ep.name, function: '',
+        description: (t && t.description) || ep.name,
+        documentation: '', enabled: true,
+        parameters: _schemaToParams((t && (t.input_schema || t.inputSchema)) || {}),
+        secrets: [],
+      };
+    });
+    const provider = {
+      name, type: 'rest', command: '', code: '', documentation: '',
+      requirements: ['httpx'], setup_commands: [],
+      rest: { base_url: baseUrl, headers: {}, auth, openapi: '', endpoints: wzRestEndpoints },
+      tools,
+    };
+    try {
+      const r = await api('POST', '/api/tools', {name, provider});
+      currentName = name; currentProvider = provider;
+      loadList();
+      await wzGoSecrets(r.secret_keys || []);
+    } catch(e) { errEl.textContent = e.message; }
+    return;
+  }
+
   if (wzStep === 'code') {
     const name = document.getElementById('wz-code-name').value.trim();
     const code = document.getElementById('wz-code-input').value;
@@ -2649,7 +3182,7 @@ async function wzNext() {
 }
 
 function wzBack() {
-  const map = {remote:'type', package:'type', repository:'type', code:'type', secrets: wzType||'type'};
+  const map = {remote:'type', package:'type', repository:'type', rest:'type', code:'type', secrets: wzType||'type'};
   wzShowStep(map[wzStep] || 'type');
 }
 

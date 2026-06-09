@@ -3,3 +3,4 @@ pyyaml
 personalcapital2
 fastapi
 uvicorn[standard]
+httpx

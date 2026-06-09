@@ -15,6 +15,7 @@ from frontend.app import (
     _read_env_file,
     _structured_to_yaml,
     _validate_provider,
+    _validate_rest,
     _write_env_file,
     _write_workdir_env_file,
     create_app,
@@ -95,6 +96,42 @@ REPOSITORY_PROVIDER = {
         "documentation": "", "enabled": True,
         "parameters": [
             {"name": "query", "type": "string", "description": "Search query", "required": True, "default": None}
+        ],
+        "secrets": [],
+    }],
+}
+
+REST_PROVIDER = {
+    "name": "weather",
+    "type": "rest",
+    "documentation": "",
+    "command": "",
+    "code": "",
+    "requirements": ["httpx"],
+    "setup_commands": [],
+    "rest": {
+        "base_url": "https://api.example.com/v1",
+        "headers": {"Accept": "application/json"},
+        "auth": {
+            "type": "authorization_code",
+            "authorize_url": "https://auth.example.com/authorize",
+            "token_url": "https://auth.example.com/token",
+            "client_id_env": "WEATHER_CLIENT_ID",
+            "client_secret_env": "WEATHER_CLIENT_SECRET",
+            "scopes": ["read"],
+        },
+        "openapi": "",
+        "endpoints": [
+            {"name": "get_forecast", "method": "GET", "path": "/forecast/{city}",
+             "path_params": ["city"], "query_params": ["units"], "body_params": []},
+        ],
+    },
+    "tools": [{
+        "name": "get_forecast", "function": "", "description": "Get the forecast",
+        "documentation": "", "enabled": True,
+        "parameters": [
+            {"name": "city", "type": "string", "description": "City", "required": True, "default": None},
+            {"name": "units", "type": "string", "description": "Units", "required": False, "default": None},
         ],
         "secrets": [],
     }],
@@ -1140,3 +1177,150 @@ class TestWebTerminal:
         with client.websocket_connect("/ws/terminal") as ws:
             msg = ws.receive_text()
         assert "disabled" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# REST providers
+# ---------------------------------------------------------------------------
+
+class TestRestSpecConversion:
+    def test_structured_to_yaml_emits_rest_block(self):
+        out = _structured_to_yaml(REST_PROVIDER)
+        spec = yaml.safe_load(out)
+        assert spec["rest"]["base_url"] == "https://api.example.com/v1"
+        assert spec["rest"]["auth"]["type"] == "authorization_code"
+        assert spec["rest"]["endpoints"][0]["name"] == "get_forecast"
+        assert "package" not in spec and "code" not in spec
+
+    def test_rest_tool_has_no_function_field(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        assert "function" not in spec["tools"][0]
+
+    def test_provider_to_structured_round_trips_rest(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        structured = _provider_to_structured("weather", spec)
+        assert structured["type"] == "rest"
+        assert structured["rest"]["base_url"] == "https://api.example.com/v1"
+        assert structured["rest"]["auth"]["client_id_env"] == "WEATHER_CLIENT_ID"
+        assert structured["rest"]["endpoints"][0]["path"] == "/forecast/{city}"
+
+
+class TestValidateRest:
+    def test_valid_rest_provider_ok(self):
+        assert _validate_provider(REST_PROVIDER)["ok"] is True
+
+    def test_missing_base_url_fails(self):
+        bad = {**REST_PROVIDER, "rest": {**REST_PROVIDER["rest"], "base_url": ""}}
+        result = _validate_provider(bad)
+        assert result["ok"] is False
+        assert any("base_url" in e for e in result["errors"])
+
+    def test_client_credentials_requires_token_url(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "client_credentials"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("token_url" in e for e in errors)
+        assert any("client_id_env" in e for e in errors)
+
+    def test_authorization_code_requires_authorize_url(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "authorization_code"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("authorize_url" in e for e in errors)
+
+    def test_requires_openapi_or_endpoints(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "none"},
+                     "openapi": "", "endpoints": []},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("openapi" in e or "endpoint" in e for e in errors)
+
+    def test_unknown_auth_type_fails(self):
+        provider = {
+            "type": "rest",
+            "rest": {"base_url": "https://x", "auth": {"type": "wat"},
+                     "endpoints": [{"name": "t", "method": "GET", "path": "/"}]},
+            "tools": [{"name": "t", "description": "d"}],
+        }
+        errors = _validate_rest(provider)
+        assert any("auth.type" in e for e in errors)
+
+
+class TestExtractSecretEnvKeysRest:
+    def test_rest_auth_env_keys_extracted(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        keys = _extract_secret_env_keys(spec)
+        assert "WEATHER_CLIENT_ID" in keys
+        assert "WEATHER_CLIENT_SECRET" in keys
+
+
+class TestListToolsRest:
+    def test_lists_rest_provider_is_rest_true(self, app, tools_dir):
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        data = TestClient(app).get("/api/tools").json()
+        assert data[0]["is_rest"] is True
+        assert data[0]["provider_type"] == "rest"
+
+
+class TestIntrospectOpenAPIEndpoint:
+    def test_returns_endpoints_and_tools(self, client):
+        fake = (
+            [{"name": "op", "method": "GET", "path": "/x",
+              "path_params": [], "query_params": [], "body_params": []}],
+            [{"name": "op", "description": "d", "input_schema": {"type": "object", "properties": {}, "required": []}}],
+        )
+        with patch("rest_provider.introspect_openapi", return_value=fake):
+            r = client.post("/api/introspect-openapi", json={"openapi": "https://x/openapi.json"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["endpoints"][0]["name"] == "op"
+        assert body["tools"][0]["name"] == "op"
+
+    def test_error_returns_ok_false(self, client):
+        with patch("rest_provider.introspect_openapi", side_effect=RuntimeError("boom")):
+            r = client.post("/api/introspect-openapi", json={"openapi": "https://x"})
+        body = r.json()
+        assert body["ok"] is False and "boom" in body["error"]
+
+    def test_missing_source_is_400(self, client):
+        r = client.post("/api/introspect-openapi", json={})
+        assert r.status_code == 400
+
+
+class TestRestAuthorizeAndCallback:
+    def test_rest_authorize_begins_flow(self, app, tools_dir, monkeypatch):
+        monkeypatch.setenv("WEATHER_CLIENT_ID", "cid")
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        r = TestClient(app).post("/api/rest-authorize", json={"name": "weather"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["auth_url"].startswith("https://auth.example.com/authorize?")
+        assert "/oauth/callback" in body["redirect_uri"]
+
+    def test_rest_authorize_rejects_non_auth_code(self, app, tools_dir):
+        provider = {**REST_PROVIDER, "rest": {**REST_PROVIDER["rest"], "auth": {"type": "none"}}}
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(provider))
+        r = TestClient(app).post("/api/rest-authorize", json={"name": "weather"})
+        assert r.status_code == 400
+
+    def test_callback_missing_code_is_400(self, client):
+        r = client.get("/oauth/callback")
+        assert r.status_code == 400
+
+    def test_callback_completes_authorization(self, client):
+        with patch("rest_provider.AuthCodeTokenStore.complete_authorization",
+                   new=AsyncMock(return_value="tok")):
+            r = client.get("/oauth/callback?code=c&state=s")
+        assert r.status_code == 200
+        assert "complete" in r.text.lower()

@@ -281,6 +281,11 @@ def _get_package_command(spec: dict[str, Any]) -> str | None:
     return None
 
 
+def _get_rest_config(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the ``rest:`` sub-dict for REST providers, or None otherwise."""
+    return spec.get("rest") or None
+
+
 def _make_process_handler(
     command: str,
     tool_name: str,
@@ -417,6 +422,7 @@ def register_provider(spec: dict[str, Any]) -> None:
     source_path = spec.get("_config_path", "<unknown>")
     provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
     try:
+        rest_config = _get_rest_config(spec)
         command = _get_package_command(spec)
         # Repository providers piggy-back on the package code path; the only
         # difference is that their subprocess is spawned with cwd=<workdir>
@@ -424,7 +430,35 @@ def register_provider(spec: dict[str, Any]) -> None:
         cwd = repository_workdir(provider_name, spec)
         env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
 
-        if command is not None:
+        if rest_config is not None:
+            # ── REST provider ─────────────────────────────────────────────────
+            # Each tool maps 1:1 to an endpoint (matched by name).  Endpoints are
+            # concrete by this point (OpenAPI specs are expanded into endpoints at
+            # create time by the frontend), so registration is network-free.
+            from rest_provider import _make_rest_handler
+
+            endpoints = {
+                e.get("name"): e for e in (rest_config.get("endpoints") or [])
+            }
+            for tool_spec in spec.get("tools", []):
+                tool_name = tool_spec.get("name", "<unnamed>")
+                if not tool_is_enabled(tool_spec):
+                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                    continue
+                endpoint_spec = endpoints.get(tool_name)
+                if endpoint_spec is None:
+                    raise ValueError(
+                        f"REST tool '{tool_name}' in {source_path} has no matching "
+                        f"endpoint (rest.endpoints[].name must equal the tool name)"
+                    )
+                handler = _make_rest_handler(endpoint_spec, rest_config, provider_name)
+                register_tool(
+                    tool_spec,
+                    handler,
+                    advertised_name=advertised_tool_name(provider_name, tool_name),
+                )
+
+        elif command is not None:
             # ── package provider (npx / uvx / python -m / any binary) ──────────
             for tool_spec in spec.get("tools", []):
                 tool_name = tool_spec.get("name", "<unnamed>")

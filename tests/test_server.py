@@ -21,6 +21,7 @@ from server import (
     SUBPROCESS_KEYS,
     _build_typed_signature,
     _get_package_command,
+    _get_rest_config,
     advertised_tool_name,
     build_runtime_context,
     exec_provider_code,
@@ -685,6 +686,79 @@ class TestRegisterProviderPrefixing:
         }
         names = self._capture_registered(spec)
         assert names == ["p__alive"]
+
+
+# ---------------------------------------------------------------------------
+# register_provider — REST providers
+# ---------------------------------------------------------------------------
+
+class TestRegisterProviderRest:
+    def _capture_registered(self, spec):
+        names: list[str] = []
+
+        def fake_decorator(**kwargs):
+            names.append(kwargs.get("name"))
+            return lambda fn: fn
+
+        with patch("server.mcp") as mock_mcp:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_provider(spec)
+        return names
+
+    def _rest_spec(self, tmp_path, enabled=True):
+        return {
+            "_config_path": str(tmp_path / "weather.yaml"),
+            "rest": {
+                "base_url": "https://api.example.com",
+                "auth": {"type": "none"},
+                "endpoints": [
+                    {"name": "get_forecast", "method": "GET", "path": "/forecast",
+                     "path_params": [], "query_params": ["city"], "body_params": []},
+                ],
+            },
+            "tools": [{
+                "name": "get_forecast",
+                "description": "Get the forecast",
+                "enabled": enabled,
+                "input_schema": {"type": "object",
+                                 "properties": {"city": {"type": "string"}}, "required": ["city"]},
+            }],
+        }
+
+    def test_get_rest_config_helper(self):
+        assert _get_rest_config({"rest": {"base_url": "x"}}) == {"base_url": "x"}
+        assert _get_rest_config({"package": {"command": "x"}}) is None
+        assert _get_rest_config({}) is None
+
+    def test_rest_branch_detected_and_prefixed(self, tmp_path: Path):
+        names = self._capture_registered(self._rest_spec(tmp_path))
+        assert names == ["weather__get_forecast"]
+
+    def test_rest_tool_registered_into_tool_registry(self, tmp_path: Path):
+        tool_registry.clear()
+        try:
+            self._capture_registered(self._rest_spec(tmp_path))
+            entry = tool_registry.get("weather__get_forecast")
+            assert entry is not None
+            assert entry["spec"]["name"] == "get_forecast"
+        finally:
+            tool_registry.clear()
+
+    def test_disabled_rest_tool_skipped(self, tmp_path: Path):
+        names = self._capture_registered(self._rest_spec(tmp_path, enabled=False))
+        assert names == []
+
+    def test_rest_tool_missing_endpoint_raises(self, tmp_path: Path):
+        spec = self._rest_spec(tmp_path)
+        spec["rest"]["endpoints"] = []  # no endpoint matching the tool
+        with pytest.raises(ValueError, match="no matching"):
+            self._capture_registered(spec)
+
+    def test_rest_checked_before_package(self, tmp_path: Path):
+        # A spec with both rest and (nonsense) package should take the rest path.
+        spec = self._rest_spec(tmp_path)
+        names = self._capture_registered(spec)
+        assert names == ["weather__get_forecast"]
 
 
 # ---------------------------------------------------------------------------

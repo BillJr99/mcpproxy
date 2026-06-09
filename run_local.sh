@@ -344,6 +344,8 @@ export MCP_ENV_FILE="$ENV_FILE"
 # default to /app/files and /app/repos (see Dockerfile + docker-compose.yml).
 export MCPPROXY_FILES_DIR="${MCPPROXY_FILES_DIR:-$ROOT_DIR/files}"
 export MCPPROXY_REPOS_DIR="${MCPPROXY_REPOS_DIR:-$ROOT_DIR/repos}"
+# OAuth token cache for REST providers' authorization_code flow (gitignored).
+export MCPPROXY_REST_AUTH_DIR="${MCPPROXY_REST_AUTH_DIR:-$ROOT_DIR/.rest-auth}"
 unset MCP_REPOS_DIR  # no longer used
 
 # ─────────────────────────────────────────────────────────────────────────────

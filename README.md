@@ -327,6 +327,7 @@ docker run -d --rm \
   -v mcpproxy-npm:/root/.npm \
   -v mcpproxy-uv-tools:/root/.local/share/uv \
   -v mcpproxy-mcp-auth:/app/.mcp-auth \
+  -v mcpproxy-rest-auth:/app/.rest-auth \
   -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
@@ -373,9 +374,14 @@ docker run -d \
   -v mcpproxy-npm:/root/.npm \
   -v mcpproxy-uv-tools:/root/.local/share/uv \
   -v mcpproxy-mcp-auth:/app/.mcp-auth \
+  -v mcpproxy-rest-auth:/app/.rest-auth \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
+
+The `mcpproxy-rest-auth` volume persists OAuth tokens for REST `authorization_code`
+providers (see [REST / OAuth providers](#rest--oauth-providers)) so you authorize once
+rather than on every fresh container. Omit it if you don't use REST OAuth providers.
 
 #### `.env`: the two flags it needs, and why
 

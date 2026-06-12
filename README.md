@@ -125,6 +125,43 @@ The **🔑 Secrets** button (also available in the wizard's final step) reads al
 entries from the selected provider, shows which variables are already set in `.env`, and lets
 you fill in or update missing values — all without leaving the browser.
 
+### Files manager
+
+The **📁 Files** navbar button opens a file browser over the volume-mounted directories
+(`tools`, `files`, and `repos` — i.e. `/app/tools`, `/app/files`, `/app/repos` in the
+container). From the browser you can:
+
+- **Browse** with a root selector and clickable breadcrumb navigation
+- **📁 New folder** — create subdirectories (e.g. `tools/secrets/`)
+- **⬆ Upload** — drop one or more files into the current directory (e.g. a Google
+  `client_secret.json` for the [OAuth bootstrap](#oauth-token-file-bootstrap-oauth-block))
+- **Download** any file by clicking it
+- **🗑 Delete** files and directories (non-empty directories ask before deleting recursively)
+
+All paths are validated against the whitelisted roots (directory-traversal and
+symlink-escape attempts are rejected), and uploads stream to disk with a size cap
+(`MCPPROXY_MAX_UPLOAD_BYTES`, default 50 MB).
+
+### Tool tester
+
+The **🧪 Test Tools** navbar button lists every registered tool, grouped by provider,
+with a filter box. Selecting a tool generates an argument form straight from its JSON
+input schema — enums become dropdowns, booleans checkboxes, numbers/strings typed
+inputs, and objects/arrays a raw-JSON textarea — with required/optional badges,
+descriptions, and defaults pre-filled. **▶ Invoke** runs the tool and pretty-prints the
+result (with error styling on failure), so you can exercise a provider end-to-end
+without connecting an LLM client.
+
+The registry is populated at server startup, so after creating or editing a provider,
+restart and reopen the dialog (an empty list shows a one-click restart hint).
+
+Under the hood the tester uses the **OpenAI-compatible tools endpoints** on the UI port,
+which any OpenAI-style caller (e.g. OpenWebUI tool servers) can also use directly:
+
+- `GET /v1/tools` — every registered tool in OpenAI function-calling schema format
+- `POST /v1/tools/{tool_name}/invoke` — call a tool with `{"arguments": {...}}`;
+  returns `{"type": "tool_result", "content": [...], "is_error": bool}`
+
 ### Setup Commands
 
 Each provider has a **Setup Commands** list (editable in the editor panel, saved to YAML).

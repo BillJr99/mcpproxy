@@ -345,6 +345,11 @@ class AuthCodeTokenStore:
         flow = cls._pending_flows.pop(state, None)
         if flow is None:
             raise RuntimeError("Unknown or expired authorization state")
+        if flow.get("kind", "rest") != "rest":
+            # Provider-declared bootstrap flows (oauth: block, e.g. Google
+            # token files) share this registry/callback but complete elsewhere.
+            from oauth_bootstrap import complete_authorization as _complete_external
+            return await _complete_external(flow, code)
         auth = flow["auth"]
         data = {
             "grant_type": "authorization_code",

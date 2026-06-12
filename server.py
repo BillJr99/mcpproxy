@@ -657,37 +657,28 @@ register_builtin_tools()
 # at call time rather than preventing the whole server from coming up.
 
 def bootstrap_provider(provider_spec: dict[str, Any]) -> None:
-    """Register one provider and run its setup, in whichever order works.
+    """Run a provider's setup, then register it.  Never raises.
 
-    Registration normally runs first so a slow or failing build never blocks
-    the tools from being advertised.  But a code provider whose code block
-    imports its declared ``requirements`` at module level cannot exec until
-    they are pip-installed — so when registration fails we run setup and
-    retry once before giving up.  Never raises.
+    Setup (pip requirements / build / setup_commands) runs first because a
+    code provider whose code block imports its declared ``requirements`` at
+    module level cannot exec until they are installed.  A setup failure does
+    not block registration — the tools are still advertised and surface the
+    error at call time instead of keeping the whole server down.
     """
     source_path = provider_spec.get("_config_path", "<unknown>")
-    try:
-        register_provider(provider_spec)
-    except Exception as exc:
-        print(
-            f"register_provider failed for {source_path} ({exc}) — "
-            "running requirements/setup and retrying once"
-        )
-        try:
-            run_provider_setup(provider_spec)
-            register_provider(provider_spec)
-        except Exception as exc2:
-            print(f"Skipping provider {source_path} — register_provider failed: {exc2}")
-            traceback.print_exc()
-        return
     try:
         run_provider_setup(provider_spec)
     except Exception as exc:
         print(
             f"Provider {source_path}: setup failed ({exc}). "
-            "Tools are registered but their subprocess may not work until the "
+            "Tools will still be registered but may not work until the "
             "build / requirements / setup_commands are fixed (see the editor)."
         )
+        traceback.print_exc()
+    try:
+        register_provider(provider_spec)
+    except Exception as exc:
+        print(f"Skipping provider {source_path} — register_provider failed: {exc}")
         traceback.print_exc()
 
 
@@ -803,6 +794,43 @@ def _warm_rest_providers() -> None:
         traceback.print_exc()
 
 
+def _oauth_bootstrap_providers() -> list[tuple[str, dict[str, Any]]]:
+    """Return (provider_name, oauth_cfg) for every provider with an oauth: block."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for spec in load_provider_specs(CONFIG_DIR):
+        oauth_cfg = spec.get("oauth") or {}
+        if oauth_cfg.get("type"):
+            name = Path(spec.get("_config_path", "")).stem or "oauth"
+            out.append((name, oauth_cfg))
+    return out
+
+
+def _warm_oauth_providers() -> None:
+    """Check provider-declared OAuth token files once at startup.
+
+    A token file with a refresh_token counts as ready (the provider's own
+    client libraries refresh at call time).  Otherwise the consent URL is
+    published to the pending-auth banner so the user can authorize from the
+    UI before the first failed tool call.  Disable with MCPPROXY_WARM_REMOTE=0.
+    """
+    providers = _oauth_bootstrap_providers()
+    if not providers:
+        return
+    import asyncio
+
+    import oauth_bootstrap
+
+    async def _warm_all() -> None:
+        for name, oauth_cfg in providers:
+            await oauth_bootstrap.warm_provider(name, oauth_cfg)
+
+    try:
+        asyncio.run(_warm_all())
+    except Exception as exc:  # noqa: BLE001
+        print(f"_warm_oauth_providers error: {exc}")
+        traceback.print_exc()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -831,6 +859,10 @@ if __name__ == "__main__":
                 target=_warm_rest_providers, daemon=True, name="rest-warmup"
             )
             rest_warm_thread.start()
+            oauth_warm_thread = threading.Thread(
+                target=_warm_oauth_providers, daemon=True, name="oauth-warmup"
+            )
+            oauth_warm_thread.start()
         mcp.run(transport="streamable-http", host=MCP_HOST, port=MCP_PORT)
     except Exception as exc:
         print(f"main error: {exc}")

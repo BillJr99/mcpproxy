@@ -19,6 +19,7 @@ POST /api/files/mkdir           — create a directory {root, path}
 POST /api/files/upload          — multipart upload (root, path, file)
 GET  /api/files/download        — download a file (?root=&path=)
 DELETE /api/files               — delete a file/dir (?root=&path=&recursive=)
+POST /api/oauth-bootstrap       — begin a provider-declared OAuth consent flow {name}
 POST /api/restart               — send SIGTERM to restart server
 GET  /api/config                — UI feature flags (e.g. web_terminal)
 WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
@@ -318,6 +319,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "repo_env_keys": repo_env_keys,
         "workdir": workdir,
         "rest": rest_out,
+        "oauth": dict(spec.get("oauth") or {}),
         "tools": tools_out,
     }
 
@@ -374,6 +376,20 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         code = (provider.get("code") or "").strip()
         if code:
             spec["code"] = code + "\n"
+
+    oauth = provider.get("oauth") or {}
+    if oauth.get("type"):
+        oauth_block: dict[str, Any] = {"type": oauth["type"]}
+        for key in ("client_secret_file", "token_file"):
+            if (oauth.get(key) or "").strip():
+                oauth_block[key] = oauth[key].strip()
+        scopes = [s for s in (oauth.get("scopes") or []) if s]
+        if scopes:
+            oauth_block["scopes"] = scopes
+        for key in ("prompt", "login_hint"):
+            if oauth.get(key):
+                oauth_block[key] = oauth[key]
+        spec["oauth"] = oauth_block
 
     requirements = [r for r in (provider.get("requirements") or []) if r]
     if requirements:
@@ -461,9 +477,39 @@ def _validate_rest(provider: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_oauth(provider: dict[str, Any]) -> list[str]:
+    """Return validation errors for a provider's top-level ``oauth`` block."""
+    import oauth_bootstrap
+
+    oauth = provider.get("oauth") or {}
+    if not oauth.get("type"):
+        return []
+    errors: list[str] = []
+    otype = (oauth.get("type") or "").strip()
+    if otype not in oauth_bootstrap.SUPPORTED_TYPES:
+        errors.append(
+            f"oauth.type must be one of {sorted(oauth_bootstrap.SUPPORTED_TYPES)}"
+        )
+        return errors
+    for key in ("client_secret_file", "token_file"):
+        if not (oauth.get(key) or "").strip():
+            errors.append(f"oauth.{key} is required for {otype} oauth")
+    scopes = oauth.get("scopes")
+    if not isinstance(scopes, list) or not [s for s in (scopes or []) if s]:
+        errors.append("oauth.scopes must be a non-empty list")
+    secret_file = (oauth.get("client_secret_file") or "").strip()
+    if secret_file and not Path(secret_file).is_file():
+        errors.append(
+            f"oauth.client_secret_file not found: {secret_file} — upload it via "
+            "the Files manager (e.g. tools/secrets/)"
+        )
+    return errors
+
+
 def _validate_provider(provider: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     ptype = provider.get("type", "code")
+    errors.extend(_validate_oauth(provider))
 
     if ptype == "rest":
         errors.extend(_validate_rest(provider))
@@ -631,6 +677,12 @@ def create_app(
                 is_package = bool(_get_package_spec(spec))
                 is_repository = bool(_get_repository_spec(spec))
                 is_rest = bool(_get_rest_spec(spec))
+                oauth_cfg = spec.get("oauth") or {}
+                oauth_out = None
+                if oauth_cfg.get("type"):
+                    import oauth_bootstrap
+                    oauth_out = {"type": oauth_cfg.get("type"),
+                                 **oauth_bootstrap.token_status(oauth_cfg)}
                 out.append({
                     "name": path.stem,
                     "file": path.name,
@@ -644,6 +696,7 @@ def create_app(
                     "missing_secrets": missing_secrets,
                     "validation_errors": validation["errors"],
                     "documentation": spec.get("documentation") or "",
+                    "oauth": oauth_out,
                 })
             except Exception as exc:
                 out.append({"name": path.stem, "file": path.name, "error": str(exc)})
@@ -832,6 +885,44 @@ def create_app(
             store = AuthCodeTokenStore(name, auth)
             auth_url = store.begin_authorization()
             return {"ok": True, "auth_url": auth_url, "redirect_uri": oauth_redirect_uri()}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/oauth-bootstrap")
+    async def oauth_bootstrap_endpoint(request: Request) -> dict:
+        """Begin (or restart) the consent flow declared by a provider's
+        top-level ``oauth:`` block (e.g. a Google token-file bootstrap).
+
+        Body: { name: <provider> }.  Builds the consent URL (offline access +
+        PKCE), publishes it to the pending-auth banner, and returns
+        ``{ok, auth_url, redirect_uri, token}`` for the UI to open.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        _guard_name(name)
+        path = _config_dir / f"{name}.yaml"
+        if not path.exists():
+            raise HTTPException(404, f"Provider '{name}' not found")
+        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        import oauth_bootstrap
+        oauth_cfg = oauth_bootstrap.get_oauth_config(spec)
+        if oauth_cfg is None:
+            raise HTTPException(400, "Provider has no oauth block")
+        if (oauth_cfg.get("type") or "").strip() not in oauth_bootstrap.SUPPORTED_TYPES:
+            raise HTTPException(
+                400,
+                f"Unsupported oauth.type (supported: {sorted(oauth_bootstrap.SUPPORTED_TYPES)})",
+            )
+        try:
+            from rest_provider import oauth_redirect_uri
+            auth_url = oauth_bootstrap.begin_authorization(name, oauth_cfg)
+            return {
+                "ok": True,
+                "auth_url": auth_url,
+                "redirect_uri": oauth_redirect_uri(),
+                "token": oauth_bootstrap.token_status(oauth_cfg),
+            }
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc)}
@@ -1637,6 +1728,24 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div id="rest-auth-status" class="mt-2 fn-status"></div>
         </div>
 
+        <!-- OAuth bootstrap box (providers with a top-level oauth: block) -->
+        <div class="section-box" id="oauth-box" style="display:none">
+          <div class="section-title">
+            🔐 OAuth Token Bootstrap
+            <button class="btn btn-sm btn-outline-warning py-0" id="oauth-bootstrap-btn"
+              onclick="authorizeOAuthProvider()"
+              title="Run the browser consent flow to mint / refresh the token file">🔐 Authorize</button>
+          </div>
+          <div id="oauth-summary" style="font-size:.875em"></div>
+          <div class="text-muted mt-2" style="font-size:.8em">
+            Declared by the <code>oauth:</code> block in this provider's YAML. After you approve in the
+            browser, the token file is written automatically — Desktop ("installed") Google clients accept
+            the localhost redirect without registration; "web" clients must have the redirect URI below
+            registered in the Google Cloud Console.
+          </div>
+          <div id="oauth-auth-status" class="mt-2 fn-status"></div>
+        </div>
+
         <!-- Code box (code providers) -->
         <div class="section-box" id="code-box" style="display:none">
           <div class="section-title">🐍 Python Code</div>
@@ -2207,6 +2316,7 @@ async function loadList() {
       providersMeta[p.name] = {
         missing_secrets: p.missing_secrets || [],
         validation_errors: p.validation_errors || [],
+        oauth: p.oauth || null,
       };
     });
     el.innerHTML = providers.map(p => {
@@ -2218,8 +2328,11 @@ async function loadList() {
       const errBadge = errs.length
         ? `<span class="badge-err" title="${esc(errs.join(' · '))}">✗ ${errs.length} config error${errs.length > 1 ? 's' : ''}</span>`
         : '';
-      const alertRow = (warnBadge || errBadge)
-        ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}</div>`
+      const oauthBadge = (p.oauth && !p.oauth.has_refresh_token)
+        ? `<span class="badge-warn" title="OAuth token missing — open the provider and click Authorize">🔐 authorize</span>`
+        : '';
+      const alertRow = (warnBadge || errBadge || oauthBadge)
+        ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}${oauthBadge}</div>`
         : '';
       const isRepo = p.is_repository || p.provider_type === 'repository';
       const isPkg = p.is_package && !isRepo;
@@ -2418,9 +2531,56 @@ function renderProvider(p) {
     setTimeout(() => codeEditor.refresh(), 50);
   }
 
+  renderOauthSummary(p);
+
   renderRequirements(p.requirements || []);
   renderSetupCommands(p.setup_commands || []);
   renderTools(p.tools || [], nameDriven);
+}
+
+// ── OAuth bootstrap (top-level oauth: block) ─────────────────────────────────
+
+function renderOauthSummary(p) {
+  const cfg = p.oauth || {};
+  const box = document.getElementById('oauth-box');
+  if (!cfg.type) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  document.getElementById('oauth-auth-status').textContent = '';
+  const meta = (providersMeta[p.name] || {}).oauth || {};
+  const tokenLine = meta.has_refresh_token
+    ? `<span style="color:var(--green)">✓ token present (refresh ok)${meta.expiry ? ' — expires ' + esc(meta.expiry) : ''}</span>`
+    : `<span style="color:var(--yellow)">✗ no usable token — click Authorize</span>`;
+  const rows = [
+    ['Type', esc(cfg.type)],
+    ['Client secret', `<code>${esc(cfg.client_secret_file || '')}</code>`],
+    ['Token file', `<code>${esc(cfg.token_file || '')}</code>`],
+    ['Scopes', (cfg.scopes || []).map(s => `<code>${esc(s)}</code>`).join('<br>') || '(none)'],
+    ['Status', tokenLine],
+    ['Redirect URI', `<code>${esc(window.location.origin)}/oauth/callback</code>`],
+  ];
+  document.getElementById('oauth-summary').innerHTML = rows.map(([k, v]) =>
+    `<div class="d-flex gap-2 mb-1"><span class="text-muted" style="flex:0 0 110px">${k}</span><span style="min-width:0;word-break:break-all">${v}</span></div>`
+  ).join('');
+}
+
+async function authorizeOAuthProvider() {
+  if (!currentName) return;
+  const status = document.getElementById('oauth-auth-status');
+  status.className = 'fn-status busy';
+  status.textContent = 'Starting authorization…';
+  try {
+    const r = await api('POST', '/api/oauth-bootstrap', {name: currentName});
+    if (!r.ok) throw new Error(r.error || 'authorization failed');
+    window.open(r.auth_url, '_blank', 'noopener');
+    status.className = 'fn-status ok';
+    status.innerHTML = `Opened the consent page. After approving, the token file is written automatically. ` +
+      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>`;
+    // Refresh the list (and this summary) once the callback has likely landed.
+    setTimeout(async () => { await loadList(); if (currentProvider) renderOauthSummary(currentProvider); }, 4000);
+  } catch(e) {
+    status.className = 'fn-status error';
+    status.textContent = e.message || 'authorization failed';
+  }
 }
 
 function updateRestBaseUrl(val) {

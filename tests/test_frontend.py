@@ -1692,3 +1692,165 @@ class TestNewUISmoke:
         for needle in ("files-modal", "tooltest-modal", "openFiles()", "openToolTester()",
                        "filesUpload", "ttInvoke"):
             assert needle in html, needle
+
+
+# ---------------------------------------------------------------------------
+# OAuth bootstrap (provider-declared oauth: block)
+# ---------------------------------------------------------------------------
+
+def _oauth_provider_yaml(tools_dir: Path, tmp_path: Path, name: str = "gmailish") -> dict:
+    cs = tmp_path / "client_secret.json"
+    cs.write_text(json.dumps({"installed": {
+        "client_id": "cid.apps.googleusercontent.com", "client_secret": "s",
+    }}))
+    spec = {
+        "code": "async def ping(context):\n    return 1\n",
+        "tools": [{"name": "ping", "function": "ping", "description": "Ping",
+                   "input_schema": {"type": "object", "properties": {}, "required": []}}],
+        "oauth": {
+            "type": "google",
+            "client_secret_file": str(cs),
+            "token_file": str(tmp_path / "secrets" / "token.json"),
+            "scopes": ["https://www.googleapis.com/auth/gmail.labels"],
+        },
+    }
+    (tools_dir / f"{name}.yaml").write_text(yaml.safe_dump(spec))
+    return spec
+
+
+@pytest.fixture(autouse=True)
+def _clear_oauth_flow_state():
+    import rest_provider
+    from rest_provider import AuthCodeTokenStore
+    rest_provider.pending_rest_auth.clear()
+    AuthCodeTokenStore._pending_flows.clear()
+    yield
+    rest_provider.pending_rest_auth.clear()
+    AuthCodeTokenStore._pending_flows.clear()
+
+
+class TestOauthBootstrap:
+    def test_begin_flow_happy_path(self, client, tools_dir, tmp_path):
+        _oauth_provider_yaml(tools_dir, tmp_path)
+        r = client.post("/api/oauth-bootstrap", json={"name": "gmailish"})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert "access_type=offline" in data["auth_url"]
+        assert "prompt=consent" in data["auth_url"]
+        assert data["redirect_uri"].endswith("/oauth/callback")
+        assert data["token"]["present"] is False
+        # published to the banner channel
+        import rest_provider
+        assert "gmailish" in rest_provider.pending_rest_auth
+
+    def test_unknown_provider_404(self, client):
+        r = client.post("/api/oauth-bootstrap", json={"name": "nope"})
+        assert r.status_code == 404
+
+    def test_provider_without_oauth_block_400(self, client, tools_dir):
+        (tools_dir / "plain.yaml").write_text(yaml.safe_dump({
+            "code": "async def f(context):\n    return 1\n",
+            "tools": [{"name": "f", "function": "f", "description": "x",
+                       "input_schema": {"type": "object", "properties": {}}}],
+        }))
+        r = client.post("/api/oauth-bootstrap", json={"name": "plain"})
+        assert r.status_code == 400
+
+    def test_missing_client_secret_returns_error(self, client, tools_dir, tmp_path):
+        spec = _oauth_provider_yaml(tools_dir, tmp_path)
+        spec["oauth"]["client_secret_file"] = str(tmp_path / "missing.json")
+        (tools_dir / "gmailish.yaml").write_text(yaml.safe_dump(spec))
+        r = client.post("/api/oauth-bootstrap", json={"name": "gmailish"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is False
+        assert "not found" in data["error"]
+
+    def test_list_tools_exposes_token_state(self, client, tools_dir, tmp_path):
+        spec = _oauth_provider_yaml(tools_dir, tmp_path)
+        entry = next(p for p in client.get("/api/tools").json() if p["name"] == "gmailish")
+        assert entry["oauth"]["type"] == "google"
+        assert entry["oauth"]["has_refresh_token"] is False
+
+        token_file = Path(spec["oauth"]["token_file"])
+        token_file.parent.mkdir(parents=True)
+        token_file.write_text(json.dumps({"refresh_token": "rt", "expiry": "2030-01-01T00:00:00Z"}))
+        entry = next(p for p in client.get("/api/tools").json() if p["name"] == "gmailish")
+        assert entry["oauth"]["has_refresh_token"] is True
+        # providers without an oauth block expose null
+        (tools_dir / "plain.yaml").write_text(yaml.safe_dump({"tools": []}))
+        entry = next(p for p in client.get("/api/tools").json() if p["name"] == "plain")
+        assert entry["oauth"] is None
+
+    def test_structured_roundtrip_preserves_oauth(self, client, tools_dir, tmp_path):
+        _oauth_provider_yaml(tools_dir, tmp_path)
+        got = client.get("/api/tools/gmailish").json()
+        assert got["oauth"]["type"] == "google"
+        assert got["oauth"]["scopes"] == ["https://www.googleapis.com/auth/gmail.labels"]
+        # write it back through the editor path and re-read
+        r = client.put("/api/tools/gmailish", json={"provider": got})
+        assert r.status_code == 200, r.text
+        spec = yaml.safe_load((tools_dir / "gmailish.yaml").read_text())
+        assert spec["oauth"]["type"] == "google"
+        assert spec["oauth"]["client_secret_file"] == got["oauth"]["client_secret_file"]
+        assert spec["oauth"]["token_file"] == got["oauth"]["token_file"]
+        assert spec["oauth"]["scopes"] == got["oauth"]["scopes"]
+
+    def test_validation_errors(self, tmp_path):
+        from frontend.app import _validate_oauth
+        cs = tmp_path / "cs.json"
+        cs.write_text("{}")
+        base = {"oauth": {"type": "google", "client_secret_file": str(cs),
+                          "token_file": "/x/token.json", "scopes": ["a"]}}
+        assert _validate_oauth(base) == []
+        assert _validate_oauth({"oauth": {}}) == []  # no block → no errors
+
+        errs = _validate_oauth({"oauth": {"type": "github"}})
+        assert any("oauth.type" in e for e in errs)
+
+        errs = _validate_oauth({"oauth": {"type": "google"}})
+        assert any("client_secret_file" in e for e in errs)
+        assert any("token_file" in e for e in errs)
+        assert any("scopes" in e for e in errs)
+
+        missing = dict(base["oauth"], client_secret_file=str(tmp_path / "nope.json"))
+        errs = _validate_oauth({"oauth": missing})
+        assert any("not found" in e for e in errs)
+
+    def test_callback_completes_google_flow_and_writes_token(
+        self, client, tools_dir, tmp_path, monkeypatch
+    ):
+        import oauth_bootstrap
+        from rest_provider import AuthCodeTokenStore
+
+        spec = _oauth_provider_yaml(tools_dir, tmp_path)
+        r = client.post("/api/oauth-bootstrap", json={"name": "gmailish"})
+        assert r.json()["ok"] is True
+        state = next(iter(AuthCodeTokenStore._pending_flows))
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+            def raise_for_status(self):
+                pass
+
+        class _Client:
+            def __init__(self, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *exc): return False
+            async def post(self, url, data=None, **kw): return _Resp()
+
+        monkeypatch.setattr(oauth_bootstrap.httpx, "AsyncClient", _Client)
+        r = client.get(f"/oauth/callback?code=thecode&state={state}")
+        assert r.status_code == 200
+        assert "Authorization complete" in r.text
+        record = json.loads(Path(spec["oauth"]["token_file"]).read_text())
+        assert record["refresh_token"] == "rt"
+        assert record["client_id"] == "cid.apps.googleusercontent.com"
+
+    def test_html_contains_oauth_ui(self, client):
+        html = client.get("/").text
+        assert "oauth-bootstrap-btn" in html
+        assert "/api/oauth-bootstrap" in html

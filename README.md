@@ -125,6 +125,43 @@ The **🔑 Secrets** button (also available in the wizard's final step) reads al
 entries from the selected provider, shows which variables are already set in `.env`, and lets
 you fill in or update missing values — all without leaving the browser.
 
+### Files manager
+
+The **📁 Files** navbar button opens a file browser over the volume-mounted directories
+(`tools`, `files`, and `repos` — i.e. `/app/tools`, `/app/files`, `/app/repos` in the
+container). From the browser you can:
+
+- **Browse** with a root selector and clickable breadcrumb navigation
+- **📁 New folder** — create subdirectories (e.g. `tools/secrets/`)
+- **⬆ Upload** — drop one or more files into the current directory (e.g. a Google
+  `client_secret.json` for the [OAuth bootstrap](#oauth-token-file-bootstrap-oauth-block))
+- **Download** any file by clicking it
+- **🗑 Delete** files and directories (non-empty directories ask before deleting recursively)
+
+All paths are validated against the whitelisted roots (directory-traversal and
+symlink-escape attempts are rejected), and uploads stream to disk with a size cap
+(`MCPPROXY_MAX_UPLOAD_BYTES`, default 50 MB).
+
+### Tool tester
+
+The **🧪 Test Tools** navbar button lists every registered tool, grouped by provider,
+with a filter box. Selecting a tool generates an argument form straight from its JSON
+input schema — enums become dropdowns, booleans checkboxes, numbers/strings typed
+inputs, and objects/arrays a raw-JSON textarea — with required/optional badges,
+descriptions, and defaults pre-filled. **▶ Invoke** runs the tool and pretty-prints the
+result (with error styling on failure), so you can exercise a provider end-to-end
+without connecting an LLM client.
+
+The registry is populated at server startup, so after creating or editing a provider,
+restart and reopen the dialog (an empty list shows a one-click restart hint).
+
+Under the hood the tester uses the **OpenAI-compatible tools endpoints** on the UI port,
+which any OpenAI-style caller (e.g. OpenWebUI tool servers) can also use directly:
+
+- `GET /v1/tools` — every registered tool in OpenAI function-calling schema format
+- `POST /v1/tools/{tool_name}/invoke` — call a tool with `{"arguments": {...}}`;
+  returns `{"type": "tool_result", "content": [...], "is_error": bool}`
+
 ### Setup Commands
 
 Each provider has a **Setup Commands** list (editable in the editor panel, saved to YAML).
@@ -243,6 +280,47 @@ Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
 `MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), `MCPPROXY_REST_MAX_BYTES` (max
 response size before truncation; 0 disables), and `MCPPROXY_OAUTH_FLOW_TTL` (seconds an
 in-flight authorization attempt stays valid; default 600).
+
+### OAuth token-file bootstrap (`oauth:` block)
+
+Some providers — typically **code providers** using Google client libraries — need a
+user-consent OAuth token *file* (e.g. `gmail_token.json` minted from
+`client_secret.json`) rather than header injection. Instead of running
+`InstalledAppFlow` on a machine with a browser and copying the files in, declare the
+need in the provider YAML and let mcpproxy run the flow:
+
+```yaml
+oauth:
+  type: google            # the only supported type today
+  client_secret_file: /app/tools/secrets/client_secret.json
+  token_file: /app/tools/secrets/gmail_token.json
+  scopes:
+    - https://www.googleapis.com/auth/gmail.settings.basic
+    - https://www.googleapis.com/auth/gmail.labels
+  # optional: prompt (default "consent"), login_hint
+```
+
+How it works:
+
+1. Create a Google OAuth client (Desktop **installed** type is easiest) in the Google
+   Cloud Console, download `client_secret.json`, and upload it via the **📁 Files**
+   manager (e.g. into `tools/secrets/`).
+2. At startup (and via the **🔐 Authorize** button in the provider editor), mcpproxy
+   checks `token_file`. If no usable token exists, the consent URL — built with PKCE,
+   `access_type=offline`, and `prompt=consent` — appears in the yellow pending-auth
+   banner.
+3. Click it, approve in Google, and the browser is redirected to mcpproxy's
+   `/oauth/callback`, which exchanges the code and writes `token_file` in exactly the
+   format `google.oauth2.credentials.Credentials.from_authorized_user_file()` accepts.
+4. Your provider code reads the token file as usual; the Google client libraries refresh
+   the access token automatically from the stored `refresh_token` at call time. If the
+   token is ever revoked, the 🔐 badge and banner reappear — re-authorizing is one click.
+
+Redirect URI: Desktop ("installed") Google clients accept `http://localhost:8889/oauth/callback`
+without registration (browse the UI via localhost when authorizing). "Web" clients must
+have the exact URI registered — set `MCPPROXY_OAUTH_REDIRECT_BASE` if the UI is served
+from a different origin. Note `prompt=consent` is the default because Google only issues
+a refresh_token on a full consent screen, not on silent re-approval.
 
 ## Secrets
 

@@ -1142,3 +1142,81 @@ class TestBuildCommandTimeout:
         import server as srv
         assert isinstance(srv.BUILD_COMMAND_TIMEOUT, int)
         assert srv.BUILD_COMMAND_TIMEOUT > 0
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_provider — register/setup ordering and the missing-import retry
+# ---------------------------------------------------------------------------
+
+from server import bootstrap_provider
+
+
+class TestBootstrapProvider:
+    SPEC = {"_config_path": "/app/tools/demo.yaml"}
+
+    def test_happy_path_registers_then_runs_setup(self):
+        with patch("server.register_provider") as mock_reg, \
+             patch("server.run_provider_setup") as mock_setup:
+            bootstrap_provider(self.SPEC)
+        mock_reg.assert_called_once_with(self.SPEC)
+        mock_setup.assert_called_once_with(self.SPEC)
+
+    def test_setup_failure_does_not_raise_after_registration(self):
+        with patch("server.register_provider") as mock_reg, \
+             patch("server.run_provider_setup", side_effect=RuntimeError("build failed")):
+            bootstrap_provider(self.SPEC)  # must not raise
+        mock_reg.assert_called_once()
+
+    def test_register_failure_runs_setup_and_retries(self):
+        # A code provider importing its declared requirements at module level
+        # fails to exec before pip install — setup must run, then retry.
+        with patch("server.register_provider",
+                   side_effect=[ModuleNotFoundError("No module named 'google'"), None]) as mock_reg, \
+             patch("server.run_provider_setup") as mock_setup:
+            bootstrap_provider(self.SPEC)
+        assert mock_reg.call_count == 2
+        mock_setup.assert_called_once_with(self.SPEC)
+
+    def test_register_failure_twice_skips_without_raising(self):
+        with patch("server.register_provider",
+                   side_effect=ModuleNotFoundError("No module named 'google'")) as mock_reg, \
+             patch("server.run_provider_setup") as mock_setup:
+            bootstrap_provider(self.SPEC)  # must not raise
+        assert mock_reg.call_count == 2
+        mock_setup.assert_called_once()
+
+    def test_register_and_setup_failure_skips_without_raising(self):
+        with patch("server.register_provider",
+                   side_effect=ModuleNotFoundError("No module named 'google'")) as mock_reg, \
+             patch("server.run_provider_setup", side_effect=RuntimeError("pip failed")):
+            bootstrap_provider(self.SPEC)  # must not raise
+        mock_reg.assert_called_once()  # retry never reached when setup fails
+
+    def test_end_to_end_code_provider_with_missing_module(self, tmp_path):
+        """Real exec path: code imports a module that 'pip install' makes available."""
+        fake_pkg = tmp_path / "fake_google_pkg"
+        fake_pkg.mkdir()
+        (fake_pkg / "__init__.py").write_text("VALUE = 42\n")
+
+        spec = {
+            "_config_path": str(tmp_path / "demo.yaml"),
+            "code": "import fake_google_pkg\nasync def ping(context):\n    return fake_google_pkg.VALUE\n",
+            "requirements": ["fake-google-pkg"],
+            "tools": [{"name": "ping", "function": "ping",
+                       "description": "", "input_schema": {"type": "object", "properties": {}}}],
+        }
+
+        import sys
+        def fake_pip(*args, **kwargs):
+            sys.path.insert(0, str(tmp_path))
+            return MagicMock(returncode=0)
+
+        tool_registry.clear()
+        try:
+            with patch("server.subprocess.run", side_effect=fake_pip):
+                bootstrap_provider(spec)
+            assert tool_registry.get("demo__ping") is not None
+        finally:
+            tool_registry.clear()
+            sys.path.remove(str(tmp_path))
+            sys.modules.pop("fake_google_pkg", None)

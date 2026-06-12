@@ -655,14 +655,31 @@ register_builtin_tools()
 # setup fails (e.g. a build command exits non-zero) are still registered if
 # register_provider succeeded; broken tool invocations will surface the error
 # at call time rather than preventing the whole server from coming up.
-for provider_spec in load_provider_specs(CONFIG_DIR):
+
+def bootstrap_provider(provider_spec: dict[str, Any]) -> None:
+    """Register one provider and run its setup, in whichever order works.
+
+    Registration normally runs first so a slow or failing build never blocks
+    the tools from being advertised.  But a code provider whose code block
+    imports its declared ``requirements`` at module level cannot exec until
+    they are pip-installed — so when registration fails we run setup and
+    retry once before giving up.  Never raises.
+    """
     source_path = provider_spec.get("_config_path", "<unknown>")
     try:
         register_provider(provider_spec)
     except Exception as exc:
-        print(f"Skipping provider {source_path} — register_provider failed: {exc}")
-        traceback.print_exc()
-        continue
+        print(
+            f"register_provider failed for {source_path} ({exc}) — "
+            "running requirements/setup and retrying once"
+        )
+        try:
+            run_provider_setup(provider_spec)
+            register_provider(provider_spec)
+        except Exception as exc2:
+            print(f"Skipping provider {source_path} — register_provider failed: {exc2}")
+            traceback.print_exc()
+        return
     try:
         run_provider_setup(provider_spec)
     except Exception as exc:
@@ -672,6 +689,10 @@ for provider_spec in load_provider_specs(CONFIG_DIR):
             "build / requirements / setup_commands are fixed (see the editor)."
         )
         traceback.print_exc()
+
+
+for provider_spec in load_provider_specs(CONFIG_DIR):
+    bootstrap_provider(provider_spec)
 
 
 # ---------------------------------------------------------------------------

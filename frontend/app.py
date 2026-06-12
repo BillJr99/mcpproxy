@@ -14,6 +14,11 @@ POST /api/introspect            — spawn command, run requirements/setup, retur
 POST /api/extract-functions     — parse Python code for async functions
 GET  /api/env                   — list .env vars (values masked)
 POST /api/env                   — upsert vars into .env  {vars: {KEY: VALUE}}
+GET  /api/files                 — list a directory inside a mounted root (?root=&path=)
+POST /api/files/mkdir           — create a directory {root, path}
+POST /api/files/upload          — multipart upload (root, path, file)
+GET  /api/files/download        — download a file (?root=&path=)
+DELETE /api/files               — delete a file/dir (?root=&path=&recursive=)
 POST /api/restart               — send SIGTERM to restart server
 GET  /api/config                — UI feature flags (e.g. web_terminal)
 WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
@@ -37,12 +42,21 @@ import termios
 import textwrap
 import threading
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from config import CONFIG_DIR, ENV_FILE, FILES_DIR, REPOS_DIR
 
@@ -553,9 +567,48 @@ def _safe_local_openapi_path(source: str) -> str:
     return str(candidate)
 
 
-def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> "FastAPI":
+# ---------------------------------------------------------------------------
+# File manager helpers
+# ---------------------------------------------------------------------------
+#
+# The /api/files endpoints let the UI manage the volume-mounted directories
+# (tools, files, repos) — e.g. create /app/tools/secrets and upload
+# client_secret.json into it.  Like the rest of the UI there is no auth: this
+# is intended for a trusted, single-user/local admin UI.
+
+MAX_UPLOAD_BYTES = int(os.environ.get("MCPPROXY_MAX_UPLOAD_BYTES", 50 * 1024 * 1024))
+
+
+def _resolve_in_root(roots: dict[str, Path], root: str, rel: str) -> Path:
+    """Resolve ``rel`` inside the whitelisted root, rejecting escapes.
+
+    Resolves symlinks before checking containment, so both ``..`` traversal
+    and symlinks pointing outside the root raise HTTPException(400).
+    """
+    base = roots.get(root)
+    if base is None:
+        raise HTTPException(400, f"Unknown root {root!r} (expected one of {sorted(roots)})")
+    base = base.resolve()
+    target = (base / (rel or "").lstrip("/")).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, f"Path escapes the {root} directory: {rel!r}")
+    return target
+
+
+def create_app(
+    config_dir: Path | None = None,
+    env_file: Path | None = None,
+    file_roots: dict[str, Path] | None = None,
+) -> "FastAPI":
     _config_dir = config_dir or CONFIG_DIR
     _env_file = env_file or ENV_FILE
+    _file_roots = file_roots or {
+        "tools": _config_dir,
+        "files": FILES_DIR,
+        "repos": REPOS_DIR,
+    }
 
     app = FastAPI(title="mcpproxy UI", docs_url=None, redoc_url=None)
 
@@ -938,6 +991,133 @@ def create_app(config_dir: Path | None = None, env_file: Path | None = None) -> 
         _write_env_file(_env_file, updates)
         return {"ok": True, "written": list(updates.keys())}
 
+    # ── File manager ─────────────────────────────────────────────────────────
+    #
+    # Browse / mkdir / upload / download / delete inside the volume-mounted
+    # roots (tools, files, repos).  Paths are always relative to a whitelisted
+    # root and validated with resolve()+relative_to() — see _resolve_in_root.
+
+    @app.get("/api/files")
+    async def list_dir(root: str = "tools", path: str = "") -> dict:
+        target = _resolve_in_root(_file_roots, root, path)
+        entries: list[dict[str, Any]] = []
+        if target.is_dir():
+            base = _file_roots[root].resolve()
+            for entry in target.iterdir():
+                if entry.is_symlink():
+                    etype = "symlink"
+                elif entry.is_dir():
+                    etype = "directory"
+                else:
+                    etype = "file"
+                try:
+                    stat = entry.stat() if etype != "symlink" else entry.lstat()
+                    size = stat.st_size if etype == "file" else 0
+                    mtime = stat.st_mtime
+                except OSError:
+                    size, mtime = 0, 0
+                entries.append({
+                    "name": entry.name,
+                    "path": entry.relative_to(base).as_posix(),
+                    "type": etype,
+                    "size": size,
+                    "mtime": mtime,
+                })
+            entries.sort(key=lambda e: (e["type"] != "directory", e["name"].lower()))
+        return {
+            "ok": True,
+            "root": root,
+            "path": path,
+            "roots": sorted(_file_roots),
+            "entries": entries,
+        }
+
+    @app.post("/api/files/mkdir")
+    async def make_dir(request: Request) -> dict:
+        body = await request.json()
+        root = (body.get("root") or "tools").strip()
+        rel = (body.get("path") or "").strip()
+        if not rel.strip("/"):
+            raise HTTPException(400, "path is required")
+        target = _resolve_in_root(_file_roots, root, rel)
+        if target.exists() and not target.is_dir():
+            raise HTTPException(400, f"A file already exists at {rel!r}")
+        target.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": target.relative_to(_file_roots[root].resolve()).as_posix()}
+
+    @app.post("/api/files/upload")
+    async def upload_file(
+        root: str = Form("tools"),
+        path: str = Form(""),
+        file: UploadFile = File(...),
+    ) -> dict:
+        """Upload a file into ``path`` (a directory) under the given root.
+
+        The client-supplied filename is reduced to its basename, so it cannot
+        carry path segments.  Existing files are overwritten — this is a
+        trusted single-admin UI and re-uploading a corrected file is the
+        common case.
+        """
+        name = Path(file.filename or "").name
+        if not name or name in (".", ".."):
+            raise HTTPException(400, "Invalid filename")
+        target_dir = _resolve_in_root(_file_roots, root, path)
+        if target_dir.exists() and not target_dir.is_dir():
+            raise HTTPException(400, f"Upload target {path!r} is not a directory")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / name
+        size = 0
+        try:
+            with target.open("wb") as out:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            413, f"File exceeds the upload limit ({MAX_UPLOAD_BYTES} bytes)"
+                        )
+                    out.write(chunk)
+        except HTTPException:
+            target.unlink(missing_ok=True)
+            raise
+        rel = target.relative_to(_file_roots[root].resolve()).as_posix()
+        return {"ok": True, "path": rel, "size": size}
+
+    @app.get("/api/files/download")
+    async def download_file(root: str = "tools", path: str = "") -> FileResponse:
+        target = _resolve_in_root(_file_roots, root, path)
+        if not target.is_file():
+            raise HTTPException(404, f"File not found: {path!r}")
+        return FileResponse(target, filename=target.name)
+
+    @app.delete("/api/files")
+    async def delete_path(root: str = "tools", path: str = "", recursive: bool = False) -> dict:
+        rel = PurePosixPath(path.strip("/"))
+        if not rel.name or rel.name in (".", ".."):
+            raise HTTPException(400, "path is required (cannot delete the root itself)")
+        # Validate the parent directory, then lstat the final component: a
+        # symlink pointing outside the root would fail _resolve_in_root, but
+        # deleting the link itself is safe — remove it without following it.
+        parent = _resolve_in_root(_file_roots, root, rel.parent.as_posix())
+        target = parent / rel.name
+        if target.is_symlink():
+            target.unlink()
+            return {"ok": True}
+        if not target.exists():
+            raise HTTPException(404, f"Not found: {path!r}")
+        if target.is_dir():
+            if recursive:
+                shutil.rmtree(target)
+            else:
+                try:
+                    target.rmdir()
+                except OSError:
+                    raise HTTPException(
+                        400, f"Directory {path!r} is not empty (pass recursive=true)"
+                    )
+        else:
+            target.unlink()
+        return {"ok": True}
+
     # ── OpenAI-compatible tool endpoints ─────────────────────────────────────
     #
     # These endpoints let OpenAI-style callers (e.g. OpenWebUI tool servers)
@@ -1277,6 +1457,10 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
     <button class="btn btn-sm btn-success" onclick="openWizard()">+ New Provider</button>
     <button class="btn btn-sm btn-outline-light" id="terminal-btn" style="display:none"
       onclick="openTerminal()" title="Open an interactive shell in the server container">🖥 Terminal</button>
+    <button class="btn btn-sm btn-outline-light" onclick="openFiles()"
+      title="Browse and manage the mounted tools / files / repos directories">📁 Files</button>
+    <button class="btn btn-sm btn-outline-light" onclick="openToolTester()"
+      title="Invoke any registered tool with custom arguments">🧪 Test Tools</button>
   </div>
   <span class="ms-auto text-muted" style="font-size:.75em">MCP :8888 &nbsp;|&nbsp; UI :8889</span>
 </nav>
@@ -1826,6 +2010,67 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Files modal -->
+<div class="modal fade" id="files-modal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">📁 Files</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex gap-2 align-items-center mb-2 flex-wrap">
+          <select id="files-root" class="form-select form-select-sm" style="width:auto"
+            onchange="filesSetRoot(this.value)"></select>
+          <nav style="--bs-breadcrumb-divider:'/'">
+            <ol class="breadcrumb mb-0" id="files-crumbs" style="font-size:.875em"></ol>
+          </nav>
+          <div class="ms-auto d-flex gap-2">
+            <button class="btn btn-sm btn-outline-light" onclick="filesMkdir()">📁 New folder</button>
+            <button class="btn btn-sm btn-outline-light"
+              onclick="document.getElementById('files-upload-input').click()">⬆ Upload</button>
+            <input type="file" id="files-upload-input" multiple style="display:none"
+              onchange="filesUpload(this.files)">
+            <button class="btn btn-sm btn-outline-light" onclick="filesRefresh()">↻</button>
+          </div>
+        </div>
+        <div id="files-list" style="border:1px solid var(--border);border-radius:8px;min-height:200px"></div>
+        <div class="text-muted mt-2" style="font-size:.8em">
+          These directories are volume mounts inside the container (e.g. <code>/app/tools</code>) —
+          a good place for provider configs and credential files like
+          <code>tools/secrets/client_secret.json</code>.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tool tester modal -->
+<div class="modal fade" id="tooltest-modal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">🧪 Test Tools</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3">
+          <div class="col-md-4">
+            <input id="tt-search" class="form-control form-control-sm mb-2"
+              placeholder="Filter tools…" oninput="ttRenderList()">
+            <div id="tt-list" style="border:1px solid var(--border);border-radius:8px;max-height:60vh;overflow-y:auto"></div>
+          </div>
+          <div class="col-md-8">
+            <div id="tt-detail">
+              <div class="empty-state" style="margin-top:60px">Select a tool to test it.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -1839,6 +2084,9 @@ let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null, termModal = null;
+let filesModal = null, ttModal = null;
+let filesRoot = 'tools', filesPath = '', filesRoots = ['tools', 'files', 'repos'];
+let ttTools = [], ttSelected = null;  // tool tester: /v1/tools entries + selected name
 let webTerminalEnabled = false;
 let term = null, termFit = null, termSock = null;  // xterm.js terminal state
 let wzType = null;            // 'code' | 'package' | 'repository' | 'remote' | 'rest'
@@ -1875,7 +2123,11 @@ window.addEventListener('DOMContentLoaded', () => {
   secretsModal = new bootstrap.Modal('#secrets-modal');
   wizModal     = new bootstrap.Modal('#wizard-modal');
   termModal    = new bootstrap.Modal('#terminal-modal');
+  filesModal   = new bootstrap.Modal('#files-modal');
+  ttModal      = new bootstrap.Modal('#tooltest-modal');
   document.getElementById('terminal-modal').addEventListener('hidden.bs.modal', closeTerminal);
+  document.getElementById('files-list').addEventListener('click', filesListClick);
+  document.getElementById('tt-list').addEventListener('click', ttListClick);
   // Wizard: live function detection as the user types into the code textarea
   document.getElementById('wz-code-input').addEventListener('input', () => {
     clearTimeout(_wzAnalyzeDebounce);
@@ -3680,6 +3932,320 @@ async function _wzRepoFinalize() {
   wizModal.hide();
   await loadList();
   if (currentName) await openProvider(currentName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File manager (/api/files — browse / mkdir / upload / download / delete)
+// ─────────────────────────────────────────────────────────────────────────────
+async function openFiles() {
+  filesModal.show();
+  await filesRefresh();
+}
+
+function filesSetRoot(root) {
+  filesRoot = root;
+  filesPath = '';
+  filesRefresh();
+}
+
+function filesNavigate(path) {
+  filesPath = path;
+  filesRefresh();
+}
+
+function _fmtSize(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+async function filesRefresh() {
+  let data;
+  try {
+    data = await api('GET', `/api/files?root=${encodeURIComponent(filesRoot)}&path=${encodeURIComponent(filesPath)}`);
+  } catch (e) { toast(e.message, false); return; }
+  filesRoots = data.roots;
+
+  const sel = document.getElementById('files-root');
+  sel.innerHTML = filesRoots.map(r =>
+    `<option value="${esc(r)}" ${r === filesRoot ? 'selected' : ''}>${esc(r)}</option>`).join('');
+
+  // Breadcrumb: root + each path segment is clickable.
+  const segs = filesPath ? filesPath.split('/') : [];
+  let crumbs = `<li class="breadcrumb-item"><a href="#" data-nav="">${esc(filesRoot)}</a></li>`;
+  let acc = '';
+  for (const s of segs) {
+    acc = acc ? acc + '/' + s : s;
+    crumbs += `<li class="breadcrumb-item"><a href="#" data-nav="${esc(acc)}">${esc(s)}</a></li>`;
+  }
+  const crumbsEl = document.getElementById('files-crumbs');
+  crumbsEl.innerHTML = crumbs;
+  crumbsEl.querySelectorAll('a[data-nav]').forEach(a => a.addEventListener('click', ev => {
+    ev.preventDefault();
+    filesNavigate(a.dataset.nav);
+  }));
+
+  const list = document.getElementById('files-list');
+  if (!data.entries.length) {
+    list.innerHTML = '<div class="empty-state">Empty directory.</div>';
+    return;
+  }
+  list.innerHTML = data.entries.map(e => {
+    const icon = e.type === 'directory' ? '📁' : e.type === 'symlink' ? '🔗' : '📄';
+    const size = e.type === 'file' ? `<span class="text-muted me-3" style="font-size:.8em">${_fmtSize(e.size)}</span>` : '';
+    return `<div class="provider-item" data-path="${esc(e.path)}" data-type="${e.type}">
+      <span style="overflow:hidden;text-overflow:ellipsis">${icon} ${esc(e.name)}</span>
+      <span class="d-flex align-items-center">${size}
+        <button class="btn-icon" data-del="${esc(e.path)}" title="Delete">🗑</button>
+      </span>
+    </div>`;
+  }).join('');
+}
+
+// Single delegated click handler — avoids quoting issues with arbitrary filenames.
+function filesListClick(ev) {
+  const delBtn = ev.target.closest('[data-del]');
+  if (delBtn) {
+    const row = delBtn.closest('.provider-item');
+    filesDelete(delBtn.dataset.del, row.dataset.type === 'directory');
+    return;
+  }
+  const row = ev.target.closest('.provider-item');
+  if (!row) return;
+  if (row.dataset.type === 'directory') {
+    filesNavigate(row.dataset.path);
+  } else if (row.dataset.type === 'file') {
+    window.open(`/api/files/download?root=${encodeURIComponent(filesRoot)}&path=${encodeURIComponent(row.dataset.path)}`, '_blank');
+  }
+}
+
+async function filesMkdir() {
+  const name = prompt('New folder name (e.g. secrets):');
+  if (!name) return;
+  const path = filesPath ? `${filesPath}/${name}` : name;
+  try {
+    await api('POST', '/api/files/mkdir', {root: filesRoot, path});
+    toast(`Created ${path}`);
+    await filesRefresh();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function filesUpload(fileList) {
+  // Multipart upload — must NOT go through api() (it forces a JSON content type).
+  for (const file of fileList) {
+    const form = new FormData();
+    form.append('root', filesRoot);
+    form.append('path', filesPath);
+    form.append('file', file);
+    try {
+      const r = await fetch('/api/files/upload', {method: 'POST', body: form});
+      const data = await r.json().catch(() => ({detail: r.statusText}));
+      if (!r.ok) throw new Error(data.detail || r.statusText);
+      toast(`Uploaded ${data.path}`);
+    } catch (e) { toast(`${file.name}: ${e.message}`, false); }
+  }
+  document.getElementById('files-upload-input').value = '';
+  await filesRefresh();
+}
+
+async function filesDelete(path, isDir) {
+  if (!confirm(`Delete ${path}?`)) return;
+  let recursive = false;
+  try {
+    await api('DELETE', `/api/files?root=${encodeURIComponent(filesRoot)}&path=${encodeURIComponent(path)}`);
+  } catch (e) {
+    if (isDir && e.message.includes('not empty')) {
+      if (!confirm(`${path} is not empty — delete it and everything inside?`)) return;
+      recursive = true;
+    } else { toast(e.message, false); return; }
+  }
+  if (recursive) {
+    try {
+      await api('DELETE', `/api/files?root=${encodeURIComponent(filesRoot)}&path=${encodeURIComponent(path)}&recursive=true`);
+    } catch (e) { toast(e.message, false); return; }
+  }
+  toast(`Deleted ${path}`);
+  await filesRefresh();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool tester (/v1/tools list + /v1/tools/{name}/invoke)
+// ─────────────────────────────────────────────────────────────────────────────
+async function openToolTester() {
+  ttModal.show();
+  try {
+    const r = await api('GET', '/v1/tools');
+    ttTools = r.tools || [];
+  } catch (e) { toast(e.message, false); ttTools = []; }
+  ttRenderList();
+  if (ttSelected && !ttTools.some(t => t.function.name === ttSelected)) {
+    ttSelected = null;
+    document.getElementById('tt-detail').innerHTML =
+      '<div class="empty-state" style="margin-top:60px">Select a tool to test it.</div>';
+  }
+}
+
+function ttRenderList() {
+  const q = (document.getElementById('tt-search').value || '').toLowerCase();
+  const listEl = document.getElementById('tt-list');
+  const tools = ttTools.filter(t => t.function.name.toLowerCase().includes(q));
+  if (!ttTools.length) {
+    listEl.innerHTML = `<div class="empty-state">No tools registered.<br><br>
+      The registry is populated at server startup — after provider changes,
+      restart and reopen this dialog.<br><br>
+      <button class="btn btn-sm btn-outline-light" onclick="restartServer()">⟳ Restart server</button>
+    </div>`;
+    return;
+  }
+  if (!tools.length) {
+    listEl.innerHTML = '<div class="empty-state">No tools match the filter.</div>';
+    return;
+  }
+  // Group by provider prefix (advertised names look like provider__tool).
+  const groups = {};
+  for (const t of tools) {
+    const name = t.function.name;
+    const prov = name.includes('__') ? name.split('__')[0] : '(other)';
+    (groups[prov] = groups[prov] || []).push(t);
+  }
+  let out = '';
+  for (const prov of Object.keys(groups).sort()) {
+    out += `<div class="section-title" style="padding:8px 12px 0;margin-bottom:2px">${esc(prov)}</div>`;
+    out += groups[prov].map(t => {
+      const name = t.function.name;
+      const short = name.includes('__') ? name.split('__').slice(1).join('__') : name;
+      return `<div class="provider-item ${name === ttSelected ? 'active' : ''}" data-tool="${esc(name)}">
+        <span style="overflow:hidden;text-overflow:ellipsis" title="${esc(t.function.description)}">${esc(short)}</span>
+      </div>`;
+    }).join('');
+  }
+  listEl.innerHTML = out;
+}
+
+function ttListClick(ev) {
+  const row = ev.target.closest('[data-tool]');
+  if (!row) return;
+  ttSelected = row.dataset.tool;
+  ttRenderList();
+  ttRenderForm();
+}
+
+function ttRenderForm() {
+  const tool = ttTools.find(t => t.function.name === ttSelected);
+  if (!tool) return;
+  const schema = tool.function.parameters || {};
+  const props = schema.properties || {};
+  const required = new Set(schema.required || []);
+  let fields = '';
+  for (const [name, def] of Object.entries(props)) {
+    const isReq = required.has(name);
+    const badge = `<span class="req-badge ${isReq ? 'req-yes' : 'req-no'}">${isReq ? 'required' : 'optional'}</span>`;
+    const help = def.description
+      ? `<div class="text-muted" style="font-size:.78em;margin-top:2px">${esc(def.description)}</div>` : '';
+    const type = def.type || (def.enum ? 'string' : 'json');
+    let input;
+    if (def.enum) {
+      const blank = isReq ? '' : '<option value=""></option>';
+      input = `<select class="form-select form-select-sm tt-field" data-name="${esc(name)}" data-kind="enum">${blank}` +
+        def.enum.map(v => `<option ${String(def.default) === String(v) ? 'selected' : ''}>${esc(v)}</option>`).join('') +
+        '</select>';
+    } else if (type === 'boolean') {
+      input = `<div class="form-check">
+        <input class="form-check-input tt-field" type="checkbox" data-name="${esc(name)}" data-kind="boolean"
+          ${def.default === true ? 'checked' : ''} id="tt-f-${esc(name)}">
+        <label class="form-check-label" for="tt-f-${esc(name)}" style="font-size:.85em">enabled</label>
+      </div>`;
+    } else if (type === 'number' || type === 'integer') {
+      input = `<input class="form-control form-control-sm tt-field" type="number" data-name="${esc(name)}"
+        data-kind="${type}" ${type === 'integer' ? 'step="1"' : 'step="any"'}
+        value="${def.default != null ? esc(def.default) : ''}">`;
+    } else if (type === 'string') {
+      input = `<input class="form-control form-control-sm tt-field" data-name="${esc(name)}" data-kind="string"
+        value="${def.default != null ? esc(def.default) : ''}">`;
+    } else {  // object / array / unknown — raw JSON
+      const placeholder = JSON.stringify(def.default ?? (type === 'array' ? [] : {}), null, 2);
+      input = `<textarea class="form-control form-control-sm font-monospace tt-field" rows="3"
+        data-name="${esc(name)}" data-kind="json" spellcheck="false">${esc(placeholder)}</textarea>`;
+    }
+    fields += `<div class="mb-2">
+      <label class="form-label mb-1">${esc(name)} ${badge}
+        <span class="text-muted" style="text-transform:none;letter-spacing:0">(${esc(type)})</span></label>
+      ${input}${help}
+    </div>`;
+  }
+  if (!fields) fields = '<div class="text-muted mb-2" style="font-size:.85em">This tool takes no arguments.</div>';
+  document.getElementById('tt-detail').innerHTML = `
+    <h6 style="word-break:break-all">${esc(tool.function.name)}</h6>
+    <div class="text-muted mb-3" style="font-size:.85em;white-space:pre-wrap">${esc(tool.function.description)}</div>
+    <div class="section-box"><div class="section-title">Arguments</div><div id="tt-form">${fields}</div></div>
+    <button class="btn btn-sm btn-success" id="tt-invoke-btn" onclick="ttInvoke()">▶ Invoke</button>
+    <div id="tt-result" class="mt-3"></div>`;
+}
+
+function ttCollectArgs() {
+  const tool = ttTools.find(t => t.function.name === ttSelected);
+  const required = new Set((tool.function.parameters || {}).required || []);
+  const args = {};
+  for (const el of document.querySelectorAll('#tt-form .tt-field')) {
+    const name = el.dataset.name, kind = el.dataset.kind;
+    if (kind === 'boolean') { args[name] = el.checked; continue; }
+    const raw = el.value;
+    if (raw === '') {  // empty optional fields are omitted so handler defaults apply
+      if (required.has(name)) throw new Error(`'${name}' is required`);
+      continue;
+    }
+    if (kind === 'integer') args[name] = parseInt(raw, 10);
+    else if (kind === 'number') args[name] = Number(raw);
+    else if (kind === 'json') {
+      try { args[name] = JSON.parse(raw); }
+      catch { throw new Error(`'${name}' is not valid JSON`); }
+    } else args[name] = raw;
+  }
+  return args;
+}
+
+async function ttInvoke() {
+  let args;
+  try { args = ttCollectArgs(); }
+  catch (e) { toast(e.message, false); return; }
+  const btn = document.getElementById('tt-invoke-btn');
+  const resultEl = document.getElementById('tt-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Running…';
+  resultEl.innerHTML = '';
+  try {
+    const res = await api('POST', `/v1/tools/${encodeURIComponent(ttSelected)}/invoke`, {arguments: args});
+    ttRenderResult(res);
+  } catch (e) {
+    ttRenderResult({content: [{type: 'text', text: e.message}], is_error: true});
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Invoke';
+  }
+}
+
+function ttRenderResult(res) {
+  const el = document.getElementById('tt-result');
+  const border = res.is_error ? 'border-left:3px solid var(--red)' : 'border-left:3px solid var(--green)';
+  const badge = res.is_error ? '<span class="badge-err">✗ error</span>'
+                             : '<span class="badge-repo" style="font-size:.62em">✓ ok</span>';
+  el.innerHTML = `<div class="section-box" style="${border}">
+    <div class="section-title">Result ${badge}</div>
+    <div id="tt-result-body"></div></div>`;
+  const body = document.getElementById('tt-result-body');
+  for (const item of (res.content || [])) {
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:.8em;margin:0 0 8px;color:#cdd6f4;max-height:50vh;overflow:auto';
+    if (item.type === 'text') {
+      let text = item.text;
+      try { text = JSON.stringify(JSON.parse(item.text), null, 2); } catch {}
+      pre.textContent = text;  // textContent — tool output is untrusted
+    } else {
+      pre.textContent = JSON.stringify(item, null, 2);
+    }
+    body.appendChild(pre);
+  }
+  if (!(res.content || []).length) body.innerHTML = '<span class="text-muted" style="font-size:.85em">(empty result)</span>';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

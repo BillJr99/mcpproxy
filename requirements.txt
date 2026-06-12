@@ -2,5 +2,6 @@ fastmcp
 pyyaml
 personalcapital2
 fastapi
+python-multipart
 uvicorn[standard]
 httpx

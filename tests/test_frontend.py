@@ -1512,3 +1512,183 @@ class TestRestWizardFlowIntegration:
         assert set(create["body_params"]) == {"name", "age"}
         # Secret env keys surface for the wizard's Secrets step.
         assert set(r.json()["secret_keys"]) >= {"DEMO_ID", "DEMO_SECRET"}
+
+
+# ---------------------------------------------------------------------------
+# File manager endpoints
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def file_roots(tmp_path: Path, tools_dir: Path) -> dict:
+    files_dir = tmp_path / "files"
+    repos_dir = tmp_path / "repos"
+    files_dir.mkdir()
+    repos_dir.mkdir()
+    return {"tools": tools_dir, "files": files_dir, "repos": repos_dir}
+
+
+@pytest.fixture()
+def files_client(tools_dir, env_path, file_roots):
+    app = create_app(config_dir=tools_dir, env_file=env_path, file_roots=file_roots)
+    return TestClient(app)
+
+
+class TestFilesAPI:
+    def test_list_empty_root(self, files_client):
+        r = files_client.get("/api/files", params={"root": "tools"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["entries"] == []
+        assert set(data["roots"]) == {"tools", "files", "repos"}
+
+    def test_list_entries_shape_and_order(self, files_client, file_roots):
+        root = file_roots["tools"]
+        (root / "zfile.txt").write_text("hello")
+        (root / "adir").mkdir()
+        r = files_client.get("/api/files", params={"root": "tools"})
+        entries = r.json()["entries"]
+        # Directories sort first.
+        assert [e["name"] for e in entries] == ["adir", "zfile.txt"]
+        f = entries[1]
+        assert f["type"] == "file" and f["size"] == 5 and f["path"] == "zfile.txt"
+        assert entries[0]["type"] == "directory"
+
+    def test_mkdir_nested_and_list_into(self, files_client, file_roots):
+        r = files_client.post("/api/files/mkdir", json={"root": "tools", "path": "secrets/inner"})
+        assert r.status_code == 200, r.text
+        assert (file_roots["tools"] / "secrets" / "inner").is_dir()
+        r = files_client.get("/api/files", params={"root": "tools", "path": "secrets"})
+        assert [e["name"] for e in r.json()["entries"]] == ["inner"]
+
+    def test_mkdir_empty_path_rejected(self, files_client):
+        r = files_client.post("/api/files/mkdir", json={"root": "tools", "path": ""})
+        assert r.status_code == 400
+
+    def test_upload_download_delete_roundtrip(self, files_client, file_roots):
+        files_client.post("/api/files/mkdir", json={"root": "tools", "path": "secrets"})
+        r = files_client.post(
+            "/api/files/upload",
+            data={"root": "tools", "path": "secrets"},
+            files={"file": ("client_secret.json", b'{"installed": {}}', "application/json")},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["path"] == "secrets/client_secret.json"
+        on_disk = file_roots["tools"] / "secrets" / "client_secret.json"
+        assert on_disk.read_bytes() == b'{"installed": {}}'
+
+        r = files_client.get(
+            "/api/files/download", params={"root": "tools", "path": "secrets/client_secret.json"}
+        )
+        assert r.status_code == 200
+        assert r.content == b'{"installed": {}}'
+        assert "client_secret.json" in r.headers["content-disposition"]
+
+        r = files_client.delete(
+            "/api/files", params={"root": "tools", "path": "secrets/client_secret.json"}
+        )
+        assert r.status_code == 200
+        assert not on_disk.exists()
+
+    def test_upload_creates_target_dir(self, files_client, file_roots):
+        r = files_client.post(
+            "/api/files/upload",
+            data={"root": "files", "path": "new/sub"},
+            files={"file": ("a.txt", b"x", "text/plain")},
+        )
+        assert r.status_code == 200, r.text
+        assert (file_roots["files"] / "new" / "sub" / "a.txt").exists()
+
+    def test_upload_filename_sanitized_to_basename(self, files_client, file_roots):
+        r = files_client.post(
+            "/api/files/upload",
+            data={"root": "tools", "path": ""},
+            files={"file": ("../evil.txt", b"x", "text/plain")},
+        )
+        assert r.status_code == 200, r.text
+        assert (file_roots["tools"] / "evil.txt").exists()
+        assert not (file_roots["tools"].parent / "evil.txt").exists()
+
+    def test_upload_size_limit(self, files_client, file_roots, monkeypatch):
+        import frontend.app as app_module
+        monkeypatch.setattr(app_module, "MAX_UPLOAD_BYTES", 10)
+        r = files_client.post(
+            "/api/files/upload",
+            data={"root": "tools", "path": ""},
+            files={"file": ("big.bin", b"x" * 100, "application/octet-stream")},
+        )
+        assert r.status_code == 413
+        assert not (file_roots["tools"] / "big.bin").exists()
+
+    def test_download_directory_rejected(self, files_client, file_roots):
+        (file_roots["tools"] / "adir").mkdir()
+        r = files_client.get("/api/files/download", params={"root": "tools", "path": "adir"})
+        assert r.status_code == 404
+
+    def test_delete_root_rejected(self, files_client):
+        for path in ("", "/", "."):
+            r = files_client.delete("/api/files", params={"root": "tools", "path": path})
+            assert r.status_code == 400, path
+
+    def test_delete_nonempty_dir_requires_recursive(self, files_client, file_roots):
+        d = file_roots["tools"] / "full"
+        d.mkdir()
+        (d / "x.txt").write_text("x")
+        r = files_client.delete("/api/files", params={"root": "tools", "path": "full"})
+        assert r.status_code == 400
+        r = files_client.delete(
+            "/api/files", params={"root": "tools", "path": "full", "recursive": "true"}
+        )
+        assert r.status_code == 200
+        assert not d.exists()
+
+    def test_absolute_path_treated_as_root_relative(self, files_client):
+        # Leading slashes are stripped: "/etc/passwd" means "<root>/etc/passwd",
+        # which does not exist — the real /etc/passwd is never touched.
+        r = files_client.get("/api/files/download", params={"root": "tools", "path": "/etc/passwd"})
+        assert r.status_code == 404
+
+    def test_traversal_rejected(self, files_client):
+        for path in ("../../etc", "a/../../etc"):
+            for method, url, kwargs in (
+                ("get", "/api/files", {"params": {"root": "tools", "path": path}}),
+                ("post", "/api/files/mkdir", {"json": {"root": "tools", "path": path}}),
+                ("get", "/api/files/download", {"params": {"root": "tools", "path": path}}),
+                ("delete", "/api/files", {"params": {"root": "tools", "path": path}}),
+            ):
+                r = getattr(files_client, method)(url, **kwargs)
+                assert r.status_code == 400, (method, url, path, r.text)
+
+    def test_unknown_root_rejected(self, files_client):
+        r = files_client.get("/api/files", params={"root": "bogus"})
+        assert r.status_code == 400
+
+    def test_symlink_escape_rejected_but_link_deletable(self, files_client, file_roots, tmp_path):
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        link = file_roots["tools"] / "leak"
+        link.symlink_to(outside)
+        # Reading through the link is rejected (resolves outside the root)...
+        r = files_client.get("/api/files/download", params={"root": "tools", "path": "leak"})
+        assert r.status_code == 400
+        # ...but it is listed as a symlink and the link itself can be removed.
+        entries = files_client.get("/api/files", params={"root": "tools"}).json()["entries"]
+        assert entries[0]["type"] == "symlink"
+        r = files_client.delete("/api/files", params={"root": "tools", "path": "leak"})
+        assert r.status_code == 200
+        assert not link.is_symlink() and outside.exists()
+
+    def test_default_roots_use_config_dir(self, client, tools_dir):
+        # create_app without file_roots maps "tools" to the injected config_dir.
+        (tools_dir / "p.yaml").write_text("tools: []\n")
+        r = client.get("/api/files", params={"root": "tools"})
+        assert r.status_code == 200
+        assert [e["name"] for e in r.json()["entries"]] == ["p.yaml"]
+
+
+class TestNewUISmoke:
+    def test_index_contains_files_and_tooltester_ui(self, client):
+        html = client.get("/").text
+        for needle in ("files-modal", "tooltest-modal", "openFiles()", "openToolTester()",
+                       "filesUpload", "ttInvoke"):
+            assert needle in html, needle

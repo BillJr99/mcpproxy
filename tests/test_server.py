@@ -5,6 +5,7 @@ run_provider_setup).  conftest.py sets MCP_TOOL_CONFIG_DIR to an empty temp dir 
 import so zero tools are registered and no processes are started.
 """
 import inspect
+import json
 import os
 import textwrap
 from pathlib import Path
@@ -1145,7 +1146,7 @@ class TestBuildCommandTimeout:
 
 
 # ---------------------------------------------------------------------------
-# bootstrap_provider — register/setup ordering and the missing-import retry
+# bootstrap_provider — setup runs before registration
 # ---------------------------------------------------------------------------
 
 from server import bootstrap_provider
@@ -1154,35 +1155,30 @@ from server import bootstrap_provider
 class TestBootstrapProvider:
     SPEC = {"_config_path": "/app/tools/demo.yaml"}
 
-    def test_happy_path_registers_then_runs_setup(self):
-        with patch("server.register_provider") as mock_reg, \
-             patch("server.run_provider_setup") as mock_setup:
+    def test_happy_path_runs_setup_then_registers(self):
+        order = []
+        with patch("server.register_provider",
+                   side_effect=lambda s: order.append("register")) as mock_reg, \
+             patch("server.run_provider_setup",
+                   side_effect=lambda s: order.append("setup")) as mock_setup:
             bootstrap_provider(self.SPEC)
         mock_reg.assert_called_once_with(self.SPEC)
         mock_setup.assert_called_once_with(self.SPEC)
+        # Setup first, so code blocks can import their declared requirements.
+        assert order == ["setup", "register"]
 
-    def test_setup_failure_does_not_raise_after_registration(self):
+    def test_setup_failure_still_registers(self):
         with patch("server.register_provider") as mock_reg, \
              patch("server.run_provider_setup", side_effect=RuntimeError("build failed")):
             bootstrap_provider(self.SPEC)  # must not raise
-        mock_reg.assert_called_once()
+        mock_reg.assert_called_once_with(self.SPEC)
 
-    def test_register_failure_runs_setup_and_retries(self):
-        # A code provider importing its declared requirements at module level
-        # fails to exec before pip install — setup must run, then retry.
-        with patch("server.register_provider",
-                   side_effect=[ModuleNotFoundError("No module named 'google'"), None]) as mock_reg, \
-             patch("server.run_provider_setup") as mock_setup:
-            bootstrap_provider(self.SPEC)
-        assert mock_reg.call_count == 2
-        mock_setup.assert_called_once_with(self.SPEC)
-
-    def test_register_failure_twice_skips_without_raising(self):
+    def test_register_failure_skips_without_raising(self):
         with patch("server.register_provider",
                    side_effect=ModuleNotFoundError("No module named 'google'")) as mock_reg, \
              patch("server.run_provider_setup") as mock_setup:
             bootstrap_provider(self.SPEC)  # must not raise
-        assert mock_reg.call_count == 2
+        mock_reg.assert_called_once()
         mock_setup.assert_called_once()
 
     def test_register_and_setup_failure_skips_without_raising(self):
@@ -1190,7 +1186,7 @@ class TestBootstrapProvider:
                    side_effect=ModuleNotFoundError("No module named 'google'")) as mock_reg, \
              patch("server.run_provider_setup", side_effect=RuntimeError("pip failed")):
             bootstrap_provider(self.SPEC)  # must not raise
-        mock_reg.assert_called_once()  # retry never reached when setup fails
+        mock_reg.assert_called_once()
 
     def test_end_to_end_code_provider_with_missing_module(self, tmp_path):
         """Real exec path: code imports a module that 'pip install' makes available."""
@@ -1220,3 +1216,67 @@ class TestBootstrapProvider:
             tool_registry.clear()
             sys.path.remove(str(tmp_path))
             sys.modules.pop("fake_google_pkg", None)
+
+
+# ---------------------------------------------------------------------------
+# OAuth bootstrap warm-up
+# ---------------------------------------------------------------------------
+
+from server import _oauth_bootstrap_providers, _warm_oauth_providers
+
+
+class TestOauthWarmup:
+    def _write_provider(self, config_dir: Path, tmp_path: Path) -> dict:
+        cs = tmp_path / "client_secret.json"
+        cs.write_text(json.dumps({"installed": {"client_id": "cid", "client_secret": "s"}}))
+        spec = {
+            "code": "async def ping(context):\n    return 1\n",
+            "tools": [{"name": "ping", "function": "ping", "description": "",
+                       "input_schema": {"type": "object", "properties": {}}}],
+            "oauth": {
+                "type": "google",
+                "client_secret_file": str(cs),
+                "token_file": str(tmp_path / "token.json"),
+                "scopes": ["https://www.googleapis.com/auth/gmail.labels"],
+            },
+        }
+        (config_dir / "gmailish.yaml").write_text(yaml.safe_dump(spec))
+        return spec
+
+    def test_discovery_finds_oauth_block(self, tmp_path: Path, monkeypatch):
+        config_dir = tmp_path / "tools"
+        config_dir.mkdir()
+        self._write_provider(config_dir, tmp_path)
+        (config_dir / "plain.yaml").write_text(yaml.safe_dump({"tools": []}))
+        monkeypatch.setattr("server.CONFIG_DIR", config_dir)
+        found = _oauth_bootstrap_providers()
+        assert [(n, c["type"]) for n, c in found] == [("gmailish", "google")]
+
+    def test_warmup_publishes_url_when_token_missing(self, tmp_path: Path, monkeypatch):
+        import rest_provider
+        config_dir = tmp_path / "tools"
+        config_dir.mkdir()
+        self._write_provider(config_dir, tmp_path)
+        monkeypatch.setattr("server.CONFIG_DIR", config_dir)
+        rest_provider.pending_rest_auth.clear()
+        try:
+            _warm_oauth_providers()
+            assert "gmailish" in rest_provider.pending_rest_auth
+            assert "access_type=offline" in rest_provider.pending_rest_auth["gmailish"]
+        finally:
+            rest_provider.pending_rest_auth.clear()
+            rest_provider.AuthCodeTokenStore._pending_flows.clear()
+
+    def test_warmup_noop_when_refresh_token_present(self, tmp_path: Path, monkeypatch):
+        import rest_provider
+        config_dir = tmp_path / "tools"
+        config_dir.mkdir()
+        self._write_provider(config_dir, tmp_path)
+        (tmp_path / "token.json").write_text(json.dumps({"refresh_token": "rt"}))
+        monkeypatch.setattr("server.CONFIG_DIR", config_dir)
+        rest_provider.pending_rest_auth.clear()
+        try:
+            _warm_oauth_providers()
+            assert "gmailish" not in rest_provider.pending_rest_auth
+        finally:
+            rest_provider.pending_rest_auth.clear()

@@ -244,6 +244,47 @@ Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
 response size before truncation; 0 disables), and `MCPPROXY_OAUTH_FLOW_TTL` (seconds an
 in-flight authorization attempt stays valid; default 600).
 
+### OAuth token-file bootstrap (`oauth:` block)
+
+Some providers — typically **code providers** using Google client libraries — need a
+user-consent OAuth token *file* (e.g. `gmail_token.json` minted from
+`client_secret.json`) rather than header injection. Instead of running
+`InstalledAppFlow` on a machine with a browser and copying the files in, declare the
+need in the provider YAML and let mcpproxy run the flow:
+
+```yaml
+oauth:
+  type: google            # the only supported type today
+  client_secret_file: /app/tools/secrets/client_secret.json
+  token_file: /app/tools/secrets/gmail_token.json
+  scopes:
+    - https://www.googleapis.com/auth/gmail.settings.basic
+    - https://www.googleapis.com/auth/gmail.labels
+  # optional: prompt (default "consent"), login_hint
+```
+
+How it works:
+
+1. Create a Google OAuth client (Desktop **installed** type is easiest) in the Google
+   Cloud Console, download `client_secret.json`, and upload it via the **📁 Files**
+   manager (e.g. into `tools/secrets/`).
+2. At startup (and via the **🔐 Authorize** button in the provider editor), mcpproxy
+   checks `token_file`. If no usable token exists, the consent URL — built with PKCE,
+   `access_type=offline`, and `prompt=consent` — appears in the yellow pending-auth
+   banner.
+3. Click it, approve in Google, and the browser is redirected to mcpproxy's
+   `/oauth/callback`, which exchanges the code and writes `token_file` in exactly the
+   format `google.oauth2.credentials.Credentials.from_authorized_user_file()` accepts.
+4. Your provider code reads the token file as usual; the Google client libraries refresh
+   the access token automatically from the stored `refresh_token` at call time. If the
+   token is ever revoked, the 🔐 badge and banner reappear — re-authorizing is one click.
+
+Redirect URI: Desktop ("installed") Google clients accept `http://localhost:8889/oauth/callback`
+without registration (browse the UI via localhost when authorizing). "Web" clients must
+have the exact URI registered — set `MCPPROXY_OAUTH_REDIRECT_BASE` if the UI is served
+from a different origin. Note `prompt=consent` is the default because Google only issues
+a refresh_token on a full consent screen, not on silent re-approval.
+
 ## Secrets
 
 Each tool provider YAML declares its required environment variables under `secrets.env`:

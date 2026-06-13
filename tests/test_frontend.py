@@ -1693,6 +1693,31 @@ class TestNewUISmoke:
                        "filesUpload", "ttInvoke"):
             assert needle in html, needle
 
+    def test_index_contains_catalog_ui(self, client):
+        html = client.get("/").text
+        for needle in ("catalog-modal", "openCatalog()", "catalogConfigure", "best-for"):
+            assert needle in html, needle
+
+
+class TestCatalogAPI:
+    def test_catalog_offline_returns_curated(self, client):
+        data = client.get("/api/catalog").json()
+        assert data["live"] is False
+        assert data["errors"] == {}
+        assert data["entries"], "curated catalog should not be empty"
+        for e in data["entries"]:
+            assert e["kind"] in ("mcp_remote", "rest_openapi")
+            assert e["name"] and e["id"] and e["source"]
+
+    def test_catalog_live_flag_without_probing_is_safe(self, client, monkeypatch):
+        # Gate live probing off so the endpoint never touches the network even
+        # when ?live=true is passed; it must still return the curated list.
+        import catalog
+        monkeypatch.setattr(catalog, "CATALOG_LIVE", False)
+        data = client.get("/api/catalog?live=true").json()
+        assert data["live"] is False
+        assert data["entries"]
+
 
 # ---------------------------------------------------------------------------
 # OAuth bootstrap (provider-declared oauth: block)

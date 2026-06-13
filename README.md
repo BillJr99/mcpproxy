@@ -107,17 +107,44 @@ Open **`http://localhost:8889`** in your browser after starting the server.
 
 ### New Provider wizard
 
-Click **+ New Provider** and choose a provider type:
+Click **+ New Provider** and choose a provider type. Each mode card carries a short
+*"Best for…"* hint with concrete examples so it's clear which one fits your situation:
 
-| Type | Description |
-|---|---|
-| **Python code** | Write `async def` functions; the UI lists the ones it finds as you type. Each becomes a tool entry. |
-| **Package** | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary). When you click **Next**, mcpproxy auto-introspects the command and pre-populates the tool list; if introspection fails you can still proceed and add tools by hand. |
-| **Repository** | Provide a git URL and a list of build commands. mcpproxy clones the repo, runs the build commands, then introspects the resulting stdio MCP server. The URL and build commands are persisted in YAML so the repo can be re-cloned and re-built automatically on every container restart. |
-| **REST / OAuth API** | Point at a REST API: a base URL plus an OpenAPI spec (imported into tools automatically) or hand-entered endpoints, with optional OAuth. Each endpoint becomes an MCP tool. See [REST / OAuth providers](#rest--oauth-providers). |
+| Type | Best for | Description |
+|---|---|---|
+| **Remote MCP Server** | Hosted SaaS tools that already speak MCP (Asana, Linear, Notion, GitHub) where you just have a URL | Paste a remote, OAuth-protected MCP server URL; mcpproxy bridges it with `npx -y mcp-remote <url>`, introspects its tools, and handles auth automatically. |
+| **Package** | Published MCP servers you install and run locally (Playwright, filesystem, Slack) | Enter any command that launches a stdio MCP server (`npx`, `uvx`, `python -m`, or an installed binary). When you click **Next**, mcpproxy auto-introspects the command and pre-populates the tool list; if introspection fails you can still proceed and add tools by hand. |
+| **Repository** | MCP servers distributed as source you build yourself | Provide a git URL and a list of build commands. mcpproxy clones the repo, runs the build commands, then introspects the resulting stdio MCP server. The URL and build commands are persisted in YAML so the repo can be re-cloned and re-built automatically on every container restart. |
+| **REST / OAuth API** | Any plain web API with no prebuilt MCP server (Stripe, OpenWeather, internal services) | Point at a REST API: a base URL plus an OpenAPI spec (imported into tools automatically) or hand-entered endpoints, with optional OAuth. Each endpoint becomes an MCP tool. See [REST / OAuth providers](#rest--oauth-providers). |
+| **Python code** | Quick custom logic, glue, or calculations you write inline | Write `async def` functions; the UI lists the ones it finds as you type. Each becomes a tool entry. |
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
+
+### Browse providers catalog
+
+The **🗂 Browse** button (next to **+ New Provider**) opens a searchable catalog of known
+MCP servers and REST/OpenAPI APIs. Pick one and click **Configure →** — it opens the New
+Provider wizard with the right mode selected and the URL or OpenAPI spec pre-filled, then
+the usual introspection flow runs as if you'd typed it by hand.
+
+The catalog is **hybrid**:
+
+- A **curated list** is bundled in the repo at `frontend/catalog.json` — the offline-safe
+  default. Add or edit entries there (each is either a `mcp_remote` entry with a `url`, or
+  a `rest_openapi` entry with an `openapi_url`).
+- Ticking **Probe live registries** also queries external sources — the official
+  [MCP registry](https://registry.modelcontextprotocol.io), [Smithery](https://smithery.ai)
+  (needs `SMITHERY_API_KEY`), and [APIs.guru](https://apis.guru) for OpenAPI specs. Sources
+  are fetched concurrently with per-source error isolation and a short cache, so one slow or
+  unavailable registry never blocks the others or the curated list.
+
+`/api/catalog` only ever contacts that fixed set of registry hosts (it takes no caller-supplied
+URL), and the server never fetches a catalog entry's own URL — that only happens through the
+existing, already-guarded wizard introspection. Knobs: `MCPPROXY_CATALOG_LIVE` (set `0` to
+disable live probing entirely), `MCPPROXY_CATALOG_TTL` (cache seconds, default `900`),
+`MCPPROXY_CATALOG_TIMEOUT` (per-request seconds, default `8`), `MCPPROXY_CATALOG_MAX_PER_SOURCE`
+(entry cap per live source, default `150`).
 
 ### Secrets manager
 

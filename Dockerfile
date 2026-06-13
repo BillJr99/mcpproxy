@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir uv
 ENV PATH="/root/.local/bin:$PATH"
 
-COPY server.py config.py process_runner.py builtin_tools.py tool_registry.py rest_provider.py oauth_bootstrap.py ./
+COPY server.py config.py process_runner.py builtin_tools.py tool_registry.py rest_provider.py oauth_bootstrap.py catalog.py ./
 COPY frontend/ ./frontend/
 COPY handlers/ ./handlers/
 

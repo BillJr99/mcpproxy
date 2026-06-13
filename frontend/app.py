@@ -862,6 +862,20 @@ def create_app(
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "endpoints": [], "tools": []}
 
+    @app.get("/api/catalog")
+    async def get_catalog(live: bool = False, source: str | None = None) -> dict:
+        """Browseable provider catalog — curated entries plus optional live registries.
+
+        ``?live=true`` enables probing external registries (MCP registry,
+        Smithery, APIs.guru); ``?source=mcp_registry,apis_guru`` narrows which
+        ones.  The endpoint takes no caller-supplied URL — it only ever hits a
+        fixed allowlist of registry hosts — and always returns the curated list
+        even if every live source errors (failures land in ``errors``).
+        """
+        import catalog
+        sources = [s.strip() for s in source.split(",") if s.strip()] if source else None
+        return await catalog.build_catalog(live=live, sources=sources)
+
     @app.post("/api/rest-authorize")
     async def rest_authorize(request: Request) -> dict:
         """Begin an authorization_code flow for a saved REST provider.
@@ -1517,6 +1531,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 .empty-state{color:var(--muted);text-align:center;padding:30px;font-size:.9em}
 .wizard-choice{cursor:pointer;transition:border-color .15s,background .15s;border:1px solid var(--border)!important}
 .wizard-choice:hover,.wizard-choice.selected{border-color:var(--accent)!important;background:#252535!important}
+.wizard-choice .best-for{display:block;margin-top:8px;font-size:.78em;font-style:italic;color:var(--accent);opacity:.85}
 .wizard-step{display:none}.wizard-step.active{display:block}
 .secret-set{border-left:3px solid var(--green)!important}
 .secret-unset{border-left:3px solid var(--yellow)!important}
@@ -1546,6 +1561,8 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   <span class="navbar-brand">⚡ mcpproxy</span>
   <div class="d-flex gap-2 ms-3">
     <button class="btn btn-sm btn-success" onclick="openWizard()">+ New Provider</button>
+    <button class="btn btn-sm btn-outline-info" onclick="openCatalog()"
+      title="Browse known MCP servers and REST/OpenAPI APIs and configure them in one click">🗂 Browse</button>
     <button class="btn btn-sm btn-outline-light" id="terminal-btn" style="display:none"
       onclick="openTerminal()" title="Open an interactive shell in the server container">🖥 Terminal</button>
     <button class="btn btn-sm btn-outline-light" onclick="openFiles()"
@@ -1834,6 +1851,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                   <div style="font-size:2.5em">🌐</div>
                   <h6 class="mt-2">Remote MCP Server</h6>
                   <small class="text-muted">Bridge a remote, OAuth-protected MCP server — just paste its URL (e.g. the official Asana server). Tools &amp; auth are handled automatically.</small>
+                  <small class="best-for">Best for hosted SaaS tools that already speak MCP — e.g. Asana, Linear, Notion, GitHub — where you just have a URL.</small>
                 </div>
               </div>
             </div>
@@ -1843,6 +1861,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                   <div style="font-size:2.5em">📦</div>
                   <h6 class="mt-2">Package</h6>
                   <small class="text-muted">Run an existing MCP server via <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or any command — or bridge a remote server with <code>npx -y mcp-remote &lt;url&gt;</code>. Tools are auto-detected.</small>
+                  <small class="best-for">Best for published MCP servers you install and run locally — e.g. Playwright, filesystem, Slack, Puppeteer via <code>npx</code>/<code>uvx</code>/<code>pip</code>.</small>
                 </div>
               </div>
             </div>
@@ -1852,6 +1871,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                   <div style="font-size:2.5em">📂</div>
                   <h6 class="mt-2">Repository</h6>
                   <small class="text-muted">Clone a git repo, run build commands, then introspect & spawn the resulting stdio MCP server</small>
+                  <small class="best-for">Best for MCP servers distributed as source you build yourself before running.</small>
                 </div>
               </div>
             </div>
@@ -1861,6 +1881,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                   <div style="font-size:2.5em">🔌</div>
                   <h6 class="mt-2">REST / OAuth API</h6>
                   <small class="text-muted">Point at a REST API (base URL + endpoints, or an OpenAPI spec) with optional OAuth — each endpoint becomes an MCP tool</small>
+                  <small class="best-for">Best for any plain web API that has no prebuilt MCP server — e.g. Stripe, OpenWeather, or an internal service — described by a base URL or OpenAPI spec.</small>
                 </div>
               </div>
             </div>
@@ -1870,6 +1891,7 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
                   <div style="font-size:2.5em">🐍</div>
                   <h6 class="mt-2">Python Code</h6>
                   <small class="text-muted">Write <code>async def</code> functions — each one becomes an MCP tool</small>
+                  <small class="best-for">Best for quick custom logic, glue, or calculations you write inline — no external server needed.</small>
                 </div>
               </div>
             </div>
@@ -2180,6 +2202,36 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Browse providers catalog modal -->
+<div class="modal fade" id="catalog-modal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">🗂 Browse providers</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted">Pick a known MCP server or REST/OpenAPI API — it opens the wizard with the details pre-filled.</p>
+        <div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+          <input id="catalog-search" class="form-control form-control-sm" style="flex:1 1 220px"
+            placeholder="Search by name or description…" oninput="catalogSearch()">
+          <select id="catalog-kind" class="form-select form-select-sm" style="width:auto" onchange="renderCatalog()">
+            <option value="">All types</option>
+            <option value="mcp_remote">MCP servers</option>
+            <option value="rest_openapi">REST / OpenAPI</option>
+          </select>
+          <div class="form-check form-check-inline mb-0">
+            <input class="form-check-input" type="checkbox" id="catalog-live" onchange="catalogToggleLive(this)">
+            <label class="form-check-label text-muted" for="catalog-live"
+              title="Also query the official MCP registry, Smithery, and APIs.guru">Probe live registries</label>
+          </div>
+        </div>
+        <div id="catalog-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -2193,6 +2245,7 @@ let currentName = null;
 let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null, termModal = null;
+let catalogModal = null, catalogEntries = [];
 let filesModal = null, ttModal = null;
 let filesRoot = 'tools', filesPath = '', filesRoots = ['tools', 'files', 'repos'];
 let ttTools = [], ttSelected = null;  // tool tester: /v1/tools entries + selected name
@@ -3488,11 +3541,113 @@ function wzPrefillRepoNodeTs() {
   document.getElementById('wz-repo-cmd').value = 'node build/index.js';
 }
 
-function wzSelectType(type) {
+function wzSelectType(type, prefill) {
   wzType = type;
   document.querySelectorAll('.wizard-choice').forEach(el => el.classList.remove('selected'));
-  event.currentTarget.classList.add('selected');
-  setTimeout(() => wzShowStep(type), 120);
+  // Highlight the clicked card when invoked from an onclick handler; when called
+  // programmatically (e.g. from the catalog) there is no matching card event.
+  const ct = window.event && window.event.currentTarget;
+  if (ct && ct.classList && ct.classList.contains('wizard-choice')) ct.classList.add('selected');
+  setTimeout(() => {
+    wzShowStep(type);
+    if (typeof prefill === 'function') prefill();
+  }, 120);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Browse providers catalog
+// ─────────────────────────────────────────────────────────────────────────────
+function _slugify(s) {
+  return (String(s||'').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')) || 'provider';
+}
+
+function openCatalog() {
+  catalogModal = catalogModal || new bootstrap.Modal(document.getElementById('catalog-modal'));
+  catalogModal.show();
+  loadCatalog(document.getElementById('catalog-live').checked);
+}
+
+async function loadCatalog(live) {
+  const list = document.getElementById('catalog-list');
+  list.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await api('GET', '/api/catalog?live=' + (live ? 'true' : 'false'));
+    catalogEntries = data.entries || [];
+    renderCatalog();
+    const errs = Object.keys(data.errors || {});
+    if (errs.length) toast('Some registries were unavailable: ' + errs.join(', '), false);
+  } catch (e) {
+    list.innerHTML = '<div class="empty-state" style="color:var(--red)">' + esc(e.message) + '</div>';
+  }
+}
+
+function catalogSearch() { renderCatalog(); }
+
+function catalogToggleLive(cb) { loadCatalog(cb.checked); }
+
+function renderCatalog() {
+  const q = (document.getElementById('catalog-search').value || '').toLowerCase().trim();
+  const kind = document.getElementById('catalog-kind').value;
+  const list = document.getElementById('catalog-list');
+  const rows = catalogEntries.filter(e => {
+    if (kind && e.kind !== kind) return false;
+    if (!q) return true;
+    return (e.name + ' ' + (e.description || '') + ' ' + (e.categories || []).join(' ')).toLowerCase().includes(q);
+  });
+  if (!rows.length) { list.innerHTML = '<div class="empty-state">No matching providers.</div>'; return; }
+  list.innerHTML = rows.map((e, i) => {
+    const badge = e.kind === 'mcp_remote'
+      ? '<span class="badge bg-info text-dark">MCP server</span>'
+      : '<span class="badge bg-secondary">REST / OpenAPI</span>';
+    const src = e.source && e.source !== 'curated'
+      ? '<span class="badge bg-dark border" style="font-weight:500">' + esc(e.source) + '</span>' : '';
+    const home = e.homepage
+      ? ' <a href="' + esc(e.homepage) + '" target="_blank" rel="noopener" style="font-size:.85em">↗</a>' : '';
+    return '<div class="card mb-2"><div class="card-body py-2 d-flex align-items-center gap-3">'
+      + '<div class="flex-grow-1" style="min-width:0">'
+      + '<div class="d-flex align-items-center gap-2 flex-wrap">'
+      + '<strong>' + esc(e.name) + '</strong>' + badge + src + home + '</div>'
+      + '<div class="text-muted" style="font-size:.85em">' + esc(e.description || '') + '</div>'
+      + '</div>'
+      + '<button class="btn btn-sm btn-success flex-shrink-0" onclick="catalogConfigure(' + i + ')">Configure →</button>'
+      + '</div></div>';
+  }).join('');
+  // Stash the filtered rows so the Configure buttons resolve by index.
+  list._rows = rows;
+}
+
+function catalogConfigure(idx) {
+  const entry = (document.getElementById('catalog-list')._rows || [])[idx];
+  if (!entry) return;
+  const el = document.getElementById('catalog-modal');
+  // Wait for the catalog modal to finish closing before opening the wizard so
+  // Bootstrap doesn't leave a stale backdrop behind.
+  el.addEventListener('hidden.bs.modal', () => _wizardFromEntry(entry), { once: true });
+  catalogModal.hide();
+}
+
+function _wizardFromEntry(entry) {
+  openWizard();
+  if (entry.kind === 'mcp_remote') {
+    wzSelectType('remote', () => {
+      document.getElementById('wz-remote-name').value = entry.id || _slugify(entry.name);
+      document.getElementById('wz-remote-url').value = entry.url || '';
+    });
+  } else if (entry.kind === 'rest_openapi') {
+    wzSelectType('rest', () => {
+      document.getElementById('wz-rest-name').value = entry.id || _slugify(entry.name);
+      document.getElementById('wz-rest-base-url').value = entry.base_url || '';
+      document.getElementById('wz-rest-openapi').value = entry.openapi_url || '';
+      if (entry.auth_hint) {
+        const sel = document.getElementById('wz-rest-auth-type');
+        if (sel && [...sel.options].some(o => o.value === entry.auth_hint)) {
+          sel.value = entry.auth_hint;
+          wzRestAuthChanged();
+        }
+      }
+      wzRestTab('openapi');
+    });
+  }
 }
 
 // ── REST wizard helpers ──────────────────────────────────────────────────────

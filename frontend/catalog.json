@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "asana",
+      "kind": "mcp_remote",
+      "name": "Asana",
+      "description": "Official Asana MCP server — manage tasks, projects, and workspaces. OAuth-protected.",
+      "categories": ["productivity"],
+      "homepage": "https://developers.asana.com/docs/using-asanas-model-control-protocol-mcp-server",
+      "url": "https://mcp.asana.com/v2/mcp"
+    },
+    {
+      "id": "linear",
+      "kind": "mcp_remote",
+      "name": "Linear",
+      "description": "Official Linear MCP server — issues, projects, and cycles. OAuth-protected.",
+      "categories": ["productivity", "developer"],
+      "homepage": "https://linear.app/docs/mcp",
+      "url": "https://mcp.linear.app/sse"
+    },
+    {
+      "id": "notion",
+      "kind": "mcp_remote",
+      "name": "Notion",
+      "description": "Official Notion MCP server — search, read, and update pages and databases. OAuth-protected.",
+      "categories": ["productivity", "knowledge"],
+      "homepage": "https://developers.notion.com/docs/mcp",
+      "url": "https://mcp.notion.com/mcp"
+    },
+    {
+      "id": "sentry",
+      "kind": "mcp_remote",
+      "name": "Sentry",
+      "description": "Official Sentry MCP server — query issues, events, and releases. OAuth-protected.",
+      "categories": ["developer", "observability"],
+      "homepage": "https://docs.sentry.io/product/sentry-mcp/",
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    {
+      "id": "stripe-mcp",
+      "kind": "mcp_remote",
+      "name": "Stripe",
+      "description": "Official Stripe MCP server — payments, customers, and balances. OAuth-protected.",
+      "categories": ["payments", "developer"],
+      "homepage": "https://docs.stripe.com/mcp",
+      "url": "https://mcp.stripe.com"
+    },
+    {
+      "id": "deepwiki",
+      "kind": "mcp_remote",
+      "name": "DeepWiki",
+      "description": "Ask questions about any public GitHub repository's documentation. No auth.",
+      "categories": ["developer", "knowledge"],
+      "homepage": "https://deepwiki.com",
+      "url": "https://mcp.deepwiki.com/mcp"
+    },
+    {
+      "id": "huggingface",
+      "kind": "mcp_remote",
+      "name": "Hugging Face",
+      "description": "Official Hugging Face MCP server — search models, datasets, and Spaces.",
+      "categories": ["ai", "developer"],
+      "homepage": "https://huggingface.co/settings/mcp",
+      "url": "https://huggingface.co/mcp"
+    },
+    {
+      "id": "petstore",
+      "kind": "rest_openapi",
+      "name": "Swagger Petstore",
+      "description": "The canonical OpenAPI demo API — a great way to try the REST wizard end to end.",
+      "categories": ["demo", "developer"],
+      "homepage": "https://petstore3.swagger.io",
+      "openapi_url": "https://petstore3.swagger.io/api/v3/openapi.json",
+      "base_url": "https://petstore3.swagger.io/api/v3",
+      "auth_hint": "none"
+    },
+    {
+      "id": "stripe-rest",
+      "kind": "rest_openapi",
+      "name": "Stripe REST API",
+      "description": "The full Stripe REST API as OpenAPI — payments, customers, subscriptions. Uses a bearer secret key.",
+      "categories": ["payments", "developer"],
+      "homepage": "https://stripe.com/docs/api",
+      "openapi_url": "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json",
+      "base_url": "https://api.stripe.com",
+      "auth_hint": "bearer"
+    },
+    {
+      "id": "apis-guru",
+      "kind": "rest_openapi",
+      "name": "APIs.guru Directory",
+      "description": "The APIs.guru directory API itself — list and look up thousands of public OpenAPI specs. No auth.",
+      "categories": ["developer", "directory"],
+      "homepage": "https://apis.guru",
+      "openapi_url": "https://api.apis.guru/v2/openapi.json",
+      "base_url": "https://api.apis.guru/v2",
+      "auth_hint": "none"
+    }
+  ]
+}

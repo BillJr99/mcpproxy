@@ -510,6 +510,39 @@ Notes:
   defaults `MCP_ENV_FILE` to `/app/.env`. You only *need* it if you mount the file somewhere
   else.
 
+> **Can't (or don't want to) bind-mount the `.env` file directly?** Some setups — rootless
+> Docker, SELinux, or hosts where binding a single non-existent file silently creates a
+> *directory* — make a file-level mount awkward. In that case bind-mount the **directory**
+> instead and point `MCP_ENV_FILE` at the file inside it. Mount the directory somewhere
+> outside `/app` (so it doesn't shadow the image's contents) and set `MCP_ENV_FILE`
+> accordingly:
+>
+> ```bash
+> docker run -d \
+>   --restart unless-stopped \
+>   -p 8888:8888 -p 8889:8889 \
+>   --env-file "$HOME/.mcpproxy/.env" \
+>   -e MCP_ENV_FILE=/run/secrets/mcpproxy.env \
+>   -v "$HOME/.mcpproxy/tools:/app/tools" \
+>   -v "$HOME/.mcpproxy/.env:/run/secrets/mcpproxy.env:ro" \
+>   -v mcpproxy-files:/app/files \
+>   -v mcpproxy-repos:/app/repos \
+>   -v mcpproxy-cache:/root/.cache \
+>   -v mcpproxy-npm:/root/.npm \
+>   -v mcpproxy-uv-tools:/root/.local/share/uv \
+>   -v mcpproxy-mcp-auth:/app/.mcp-auth \
+>   -v mcpproxy-rest-auth:/app/.rest-auth \
+>   --name mcpproxy \
+>   ghcr.io/billjr99/mcpproxy:latest
+> ```
+>
+> To mount the whole directory rather than the single file, replace the
+> `-v "$HOME/.mcpproxy/.env:/run/secrets/mcpproxy.env:ro"` line with
+> `-v "$HOME/.mcpproxy:/run/secrets:ro"` (the `.env` then appears at
+> `/run/secrets/.env`, so set `-e MCP_ENV_FILE=/run/secrets/.env`). Note that a read-only
+> (`:ro`) mount means the web UI's **🔑 Secrets** panel can't write changes back; drop `:ro`
+> if you want live edits to persist.
+
 The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
 providers (e.g. the official Asana MCP); persist it and you authorize once. Map the OAuth
 callback port (`-p 3334:3334`) the first time you authorize. Omit any volume you don't need

@@ -1879,3 +1879,89 @@ class TestOauthBootstrap:
         html = client.get("/").text
         assert "oauth-bootstrap-btn" in html
         assert "/api/oauth-bootstrap" in html
+
+
+# ---------------------------------------------------------------------------
+# GET /api/provider-status
+# ---------------------------------------------------------------------------
+
+class TestProviderStatus:
+    def test_empty_when_no_states_registered(self, client):
+        import provider_status
+        provider_status.clear()
+        r = client.get("/api/provider-status")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["providers"] == {}
+
+    def test_pending_state(self, client):
+        import provider_status
+        provider_status.clear()
+        provider_status.set_state(provider_status.ProviderState(name="myprov", status=provider_status.PENDING))
+        r = client.get("/api/provider-status")
+        assert r.status_code == 200
+        entry = r.json()["providers"]["myprov"]
+        assert entry["status"] == "pending"
+        assert entry["error"] is None
+        provider_status.clear()
+
+    def test_ready_state(self, client):
+        import provider_status
+        provider_status.clear()
+        provider_status.set_state(provider_status.ProviderState(name="myprov", status=provider_status.READY))
+        r = client.get("/api/provider-status")
+        entry = r.json()["providers"]["myprov"]
+        assert entry["status"] == "ready"
+        assert entry["error"] is None
+        provider_status.clear()
+
+    def test_failed_state_includes_error(self, client):
+        import provider_status
+        provider_status.clear()
+        provider_status.set_state(provider_status.ProviderState(
+            name="myprov", status=provider_status.FAILED, error="pip install returned exit code 1"
+        ))
+        r = client.get("/api/provider-status")
+        entry = r.json()["providers"]["myprov"]
+        assert entry["status"] == "failed"
+        assert entry["error"] == "pip install returned exit code 1"
+        provider_status.clear()
+
+    def test_multiple_providers(self, client):
+        import provider_status
+        provider_status.clear()
+        provider_status.set_state(provider_status.ProviderState(name="a", status=provider_status.READY))
+        provider_status.set_state(provider_status.ProviderState(name="b", status=provider_status.PENDING))
+        provider_status.set_state(provider_status.ProviderState(
+            name="c", status=provider_status.FAILED, error="oops"
+        ))
+        data = client.get("/api/provider-status").json()
+        assert data["providers"]["a"]["status"] == "ready"
+        assert data["providers"]["b"]["status"] == "pending"
+        assert data["providers"]["c"]["status"] == "failed"
+        assert data["providers"]["c"]["error"] == "oops"
+        provider_status.clear()
+
+
+# ---------------------------------------------------------------------------
+# UI smoke tests for new status + tools list features
+# ---------------------------------------------------------------------------
+
+class TestProviderStatusAndToolsListUI:
+    def test_index_contains_tools_list_ui(self, client):
+        html = client.get("/").text
+        for needle in ("toolslist-modal", "openToolsList()", "tl-list", "tl-search", "tlRenderList"):
+            assert needle in html, needle
+
+    def test_index_contains_provider_status_polling(self, client):
+        html = client.get("/").text
+        assert "pollProviderStatus" in html
+        assert "/api/provider-status" in html
+        assert "updateStatusBadges" in html
+
+    def test_index_contains_status_badge_classes(self, client):
+        html = client.get("/").text
+        assert "badge-status-pending" in html
+        assert "badge-status-ready" in html
+        assert "badge-status-failed" in html

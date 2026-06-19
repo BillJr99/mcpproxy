@@ -22,6 +22,7 @@ DELETE /api/files               — delete a file/dir (?root=&path=&recursive=)
 POST /api/oauth-bootstrap       — begin a provider-declared OAuth consent flow {name}
 POST /api/restart               — send SIGTERM to restart server
 GET  /api/config                — UI feature flags (e.g. web_terminal)
+GET  /api/provider-status       — per-provider init state {providers: {name: {status, error}}}
 WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
 """
 
@@ -1358,6 +1359,30 @@ def create_app(
         """Expose UI feature flags so the front end can hide disabled features."""
         return {"ok": True, "web_terminal": _web_terminal_enabled()}
 
+    @app.get("/api/provider-status")
+    async def provider_status_api() -> dict:
+        """Return per-provider initialization status from the background startup.
+
+        Each entry maps a provider name to its current readiness state:
+        ``status`` is ``"pending"`` (still installing), ``"ready"`` (setup done),
+        or ``"failed"`` (setup threw an error).  ``error`` is ``null`` unless
+        ``status == "failed"``, in which case it holds the failure message.
+
+        Returns ``{"ok": True, "providers": {}}`` when the background-startup
+        module is not loaded (e.g. ``MCPPROXY_BACKGROUND_SETUP=0``).
+        """
+        try:
+            import provider_status as _ps  # same in-process dict server.py populates
+            return {
+                "ok": True,
+                "providers": {
+                    name: {"status": s.status, "error": s.error}
+                    for name, s in _ps.all_states().items()
+                },
+            }
+        except ImportError:
+            return {"ok": True, "providers": {}}
+
     # ── Interactive web terminal (PTY over WebSocket) ──────────────────────────
 
     @app.websocket("/ws/terminal")
@@ -1541,6 +1566,9 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 .badge-warn{background:var(--yellow);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-err{background:var(--red);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
 .badge-disabled{background:#45475a;color:var(--muted);font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.badge-status-pending{background:var(--yellow);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-status-ready{background:var(--green);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
+.badge-status-failed{background:var(--red);color:#1e1e2e;font-size:.62em;padding:2px 6px;border-radius:3px;font-weight:700}
 .tool-card.disabled .tool-card-body{opacity:.55;filter:saturate(.6)}
 .tool-card.disabled .tool-card-header{background:#1f1f2c}
 .fn-pick-row{display:flex;gap:6px;align-items:stretch}
@@ -1567,6 +1595,8 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
       onclick="openTerminal()" title="Open an interactive shell in the server container">🖥 Terminal</button>
     <button class="btn btn-sm btn-outline-light" onclick="openFiles()"
       title="Browse and manage the mounted tools / files / repos directories">📁 Files</button>
+    <button class="btn btn-sm btn-outline-light" onclick="openToolsList()"
+      title="View all registered tools grouped by provider with readiness status">📋 Tools</button>
     <button class="btn btn-sm btn-outline-light" onclick="openToolTester()"
       title="Invoke any registered tool with custom arguments">🧪 Test Tools</button>
   </div>
@@ -2202,6 +2232,23 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Registered tools list modal -->
+<div class="modal fade" id="toolslist-modal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">📋 Registered Tools</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input id="tl-search" class="form-control form-control-sm mb-3"
+          placeholder="Filter by tool name or description…" oninput="tlRenderList()">
+        <div id="tl-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Browse providers catalog modal -->
 <div class="modal fade" id="catalog-modal" tabindex="-1">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">
@@ -2246,9 +2293,11 @@ let currentProvider = null;   // the structured JSON object being edited
 let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null, termModal = null;
 let catalogModal = null, catalogEntries = [];
-let filesModal = null, ttModal = null;
+let filesModal = null, ttModal = null, tlModal = null;
 let filesRoot = 'tools', filesPath = '', filesRoots = ['tools', 'files', 'repos'];
 let ttTools = [], ttSelected = null;  // tool tester: /v1/tools entries + selected name
+let tlTools = [], tlStatus = {};      // tools list: /v1/tools entries + provider status
+let _providerStatus = {};             // name → {status, error} from /api/provider-status
 let webTerminalEnabled = false;
 let term = null, termFit = null, termSock = null;  // xterm.js terminal state
 let wzType = null;            // 'code' | 'package' | 'repository' | 'remote' | 'rest'
@@ -2287,6 +2336,7 @@ window.addEventListener('DOMContentLoaded', () => {
   termModal    = new bootstrap.Modal('#terminal-modal');
   filesModal   = new bootstrap.Modal('#files-modal');
   ttModal      = new bootstrap.Modal('#tooltest-modal');
+  tlModal      = new bootstrap.Modal('#toolslist-modal');
   document.getElementById('terminal-modal').addEventListener('hidden.bs.modal', closeTerminal);
   document.getElementById('files-list').addEventListener('click', filesListClick);
   document.getElementById('tt-list').addEventListener('click', ttListClick);
@@ -2298,6 +2348,8 @@ window.addEventListener('DOMContentLoaded', () => {
   loadConfig();
   pollPendingAuth();
   setInterval(pollPendingAuth, 5000);
+  pollProviderStatus();
+  setInterval(pollProviderStatus, 4000);
   loadList();
 });
 
@@ -2330,6 +2382,53 @@ async function pollPendingAuth() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Provider status polling (background startup badges)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function pollProviderStatus() {
+  try {
+    const r = await api('GET', '/api/provider-status');
+    _providerStatus = r.providers || {};
+  } catch { return; }
+  // updateStatusBadges removes PENDING/FAILED badges the moment a provider
+  // flips to READY — regardless of how long initialization took.
+  updateStatusBadges();
+}
+
+function updateStatusBadges() {
+  document.querySelectorAll('.provider-item[data-name]').forEach(el => {
+    const name = el.dataset.name;
+    const st = _providerStatus[name];
+    let badge = el.querySelector('.status-init-badge');
+    // Provider is READY (or not tracked): remove any existing status badge.
+    if (!st || st.status === 'ready') {
+      if (badge) badge.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'status-init-badge';
+      let row = el.querySelector('.alert-row');
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'd-flex gap-1 flex-wrap mt-1 alert-row';
+        el.querySelector('div').appendChild(row);
+      }
+      row.prepend(badge);
+    }
+    if (st.status === 'pending') {
+      badge.className = 'status-init-badge badge-status-pending';
+      badge.title = 'Provider is still initializing — tools will be available shortly';
+      badge.textContent = '⏳ initializing';
+    } else if (st.status === 'failed') {
+      badge.className = 'status-init-badge badge-status-failed';
+      badge.title = st.error || 'Setup failed';
+      badge.textContent = '✗ setup failed';
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // API
 // ─────────────────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -2358,7 +2457,11 @@ function toast(msg, ok = true) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadList() {
   try {
-    const providers = await api('GET', '/api/tools');
+    const [providers, statusRes] = await Promise.all([
+      api('GET', '/api/tools'),
+      api('GET', '/api/provider-status').catch(() => ({providers: {}})),
+    ]);
+    _providerStatus = statusRes.providers || {};
     const el = document.getElementById('provider-list');
     if (!providers.length) {
       el.innerHTML = '<div class="p-3 text-muted" style="font-size:.85em">No providers yet — click <b>+ New Provider</b>.</div>';
@@ -2384,8 +2487,13 @@ async function loadList() {
       const oauthBadge = (p.oauth && !p.oauth.has_refresh_token)
         ? `<span class="badge-warn" title="OAuth token missing — open the provider and click Authorize">🔐 authorize</span>`
         : '';
-      const alertRow = (warnBadge || errBadge || oauthBadge)
-        ? `<div class="d-flex gap-1 flex-wrap mt-1">${warnBadge}${errBadge}${oauthBadge}</div>`
+      const st = _providerStatus[p.name];
+      const statusBadge = !st || st.status === 'ready' ? ''
+        : st.status === 'pending'
+          ? `<span class="status-init-badge badge-status-pending" title="Provider is still initializing — tools will be available shortly">⏳ initializing</span>`
+          : `<span class="status-init-badge badge-status-failed" title="${esc(st.error || 'Setup failed')}">✗ setup failed</span>`;
+      const alertRow = (warnBadge || errBadge || oauthBadge || statusBadge)
+        ? `<div class="d-flex gap-1 flex-wrap mt-1 alert-row">${statusBadge}${warnBadge}${errBadge}${oauthBadge}</div>`
         : '';
       const isRepo = p.is_repository || p.provider_type === 'repository';
       const isPkg = p.is_package && !isRepo;
@@ -2394,7 +2502,7 @@ async function loadList() {
       if (isRepo) { badgeClass = 'badge-repo'; badgeText = 'repo'; }
       else if (isPkg) { badgeClass = 'badge-pkg'; badgeText = 'pkg'; }
       return `
-      <div class="provider-item ${p.name === currentName ? 'active' : ''}" onclick="openProvider('${p.name}')">
+      <div class="provider-item ${p.name === currentName ? 'active' : ''}" data-name="${esc(p.name)}" onclick="openProvider('${p.name}')">
         <div style="min-width:0">
           <div class="fw-semibold">${p.name}</div>
           <small class="text-muted d-block" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
@@ -4561,6 +4669,62 @@ function ttRenderResult(res) {
     body.appendChild(pre);
   }
   if (!(res.content || []).length) body.innerHTML = '<span class="text-muted" style="font-size:.85em">(empty result)</span>';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registered tools list (read-only view grouped by provider)
+// ─────────────────────────────────────────────────────────────────────────────
+async function openToolsList() {
+  tlModal.show();
+  document.getElementById('tl-list').innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const [r, sr] = await Promise.all([
+      api('GET', '/v1/tools'),
+      api('GET', '/api/provider-status').catch(() => ({providers: {}})),
+    ]);
+    tlTools = r.tools || [];
+    tlStatus = sr.providers || {};
+  } catch (e) { toast(e.message, false); tlTools = []; tlStatus = {}; }
+  tlRenderList();
+}
+
+function tlRenderList() {
+  const q = (document.getElementById('tl-search').value || '').toLowerCase();
+  const listEl = document.getElementById('tl-list');
+  if (!tlTools.length) {
+    listEl.innerHTML = '<div class="empty-state">No tools registered.<br><br>Tools appear here after the server starts and providers finish initializing.</div>';
+    return;
+  }
+  const tools = tlTools.filter(t =>
+    t.function.name.toLowerCase().includes(q) ||
+    (t.function.description || '').toLowerCase().includes(q)
+  );
+  if (!tools.length) { listEl.innerHTML = '<div class="empty-state">No tools match the filter.</div>'; return; }
+  const groups = {};
+  for (const t of tools) {
+    const prov = t.function.name.includes('__') ? t.function.name.split('__')[0] : '(other)';
+    (groups[prov] = groups[prov] || []).push(t);
+  }
+  let out = '';
+  for (const prov of Object.keys(groups).sort()) {
+    const st = tlStatus[prov] || {};
+    const statusBadge = st.status === 'pending'
+      ? `<span class="badge-status-pending ms-1" title="Provider is still initializing">⏳ initializing</span>`
+      : st.status === 'failed'
+      ? `<span class="badge-status-failed ms-1" title="${esc(st.error || 'Setup failed')}">✗ failed</span>`
+      : `<span class="badge-status-ready ms-1">✓ ready</span>`;
+    const countBadge = `<span class="badge-count ms-1">${groups[prov].length}</span>`;
+    out += `<div class="section-title" style="padding:8px 12px 4px;margin-bottom:2px">${esc(prov)}${statusBadge}${countBadge}</div>`;
+    out += groups[prov].map(t => {
+      const short = t.function.name.includes('__') ? t.function.name.split('__').slice(1).join('__') : t.function.name;
+      const desc = t.function.description || '';
+      return `<div class="provider-item" style="cursor:default;flex-direction:column;align-items:flex-start;gap:2px">
+        <code style="font-size:.8em">${esc(short)}</code>
+        ${desc ? `<small class="text-muted" style="font-size:.78em;white-space:normal;line-height:1.3">${esc(desc)}</small>` : ''}
+      </div>`;
+    }).join('');
+  }
+  listEl.innerHTML = out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

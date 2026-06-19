@@ -24,6 +24,11 @@ Each tool **provider** is a single YAML file under `tools/`. The YAML contains:
 runs `setup_commands`, then registers each tool automatically — no Python files to
 maintain separately, no changes to `server.py` needed when adding new tools.
 
+By default this setup runs **in the background**: the MCP server starts accepting
+requests immediately while each provider's dependencies install. A tool whose provider
+is still installing returns a structured **retry directive** instead of blocking — see
+[Non-blocking startup](#non-blocking-startup) below.
+
 Two **built-in tools** (`mcpproxy__listfiles` and `mcpproxy__getfile`) are always registered
 without any YAML config.  They give LLMs read-only access to a configurable directory
 (default: `/app/files`, mountable as a Docker volume) — useful for retrieving screenshots
@@ -48,6 +53,46 @@ is added automatically when the tool is registered.
 |---|---|
 | **8888** | MCP endpoint — `http://localhost:8888/mcp` |
 | **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
+
+## Non-blocking startup
+
+Provider setup — cloning/building repository providers, `pip install`-ing each
+provider's `requirements`, and running its `setup_commands` (e.g.
+`npx playwright install chrome`) — can take a long time. Rather than block the
+MCP server until all of that finishes, mcpproxy **registers every tool up front
+and runs the setup in the background**:
+
+- The MCP endpoint on `8888` and the UI on `8889` come up **immediately**.
+- Every tool is advertised right away, so MCP clients see the full tool list at
+  once.
+- A call to a tool whose provider is **still installing** returns a structured
+  retry directive instead of failing or hanging:
+
+  ```json
+  {
+    "ok": false,
+    "tool": "playwright__browser_navigate",
+    "status": "initializing",
+    "retry_after_seconds": 15,
+    "message": "Tool 'playwright__browser_navigate' is not ready yet — provider 'playwright' is still installing its dependencies. Wait ~15s and call this tool again."
+  }
+  ```
+
+  The calling LLM reads the message and retries shortly. The two built-in tools
+  (`mcpproxy__listfiles` / `mcpproxy__getfile`) are always ready immediately.
+
+- If a provider's setup **fails**, its tools return `"status": "failed"` with the
+  error at call time (the rest of the server stays up).
+
+Knobs:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCPPROXY_BACKGROUND_SETUP` | `1` | Set to `0` to run setup synchronously before the server starts (the old blocking behaviour). |
+| `MCPPROXY_INIT_RETRY_SECONDS` | `15` | Seconds advertised in the `retry_after_seconds` field of the directive. |
+
+Startup stays fast across restarts because pip/uv/npm caches and cloned repos are
+persisted via Docker volumes — see [Volumes & caching](#volumes--caching).
 
 ## Layout
 
@@ -201,9 +246,10 @@ Example — for a Playwright package provider:
 npx playwright install chrome
 ```
 
-Commands run in order before the server accepts connections. The subprocess package is
-launched lazily on the first tool call, not at startup, so the browser binary is always
-ready when needed.
+Commands run in order in the background (see [Non-blocking startup](#non-blocking-startup)) —
+the server accepts connections immediately and the provider's tools return a retry directive
+until its setup finishes. The subprocess package itself is launched lazily on the first tool
+call, so the browser binary is always ready when needed.
 
 > **After editing and saving** a provider's command or setup steps, click **Restart MCP Server**
 > (the yellow bar that appears after saving) to apply the changes.
@@ -636,6 +682,10 @@ re-downloaded, re-built, or re-authorized on every fresh container.
 | `/root/.npm` | `mcpproxy-npm` | npm/npx package cache | npx re-downloads packages from the npm registry on first call. |
 | `/root/.local/share/uv` | `mcpproxy-uv-tools` | uvx per-tool venvs | uvx re-creates per-tool venvs from cached wheels. |
 | `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens aren't exposed via `mcpproxy__getfile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
+
+The image pins `PIP_CACHE_DIR=/root/.cache/pip` and `UV_CACHE_DIR=/root/.cache/uv`
+so the pip and uv wheel caches always land inside the persisted `mcpproxy-cache`
+volume, even if `HOME`/XDG defaults change.
 
 In dev (`docker-compose.override.yml`), `mcpproxy-tools`, `mcpproxy-files`,
 `mcpproxy-repos`, and `mcpproxy-mcp-auth` are replaced with bind mounts (`./tools`,

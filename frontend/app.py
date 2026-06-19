@@ -2298,6 +2298,7 @@ let filesRoot = 'tools', filesPath = '', filesRoots = ['tools', 'files', 'repos'
 let ttTools = [], ttSelected = null;  // tool tester: /v1/tools entries + selected name
 let tlTools = [], tlStatus = {};      // tools list: /v1/tools entries + provider status
 let _providerStatus = {};             // name → {status, error} from /api/provider-status
+let _statusPollTimer = null;          // setInterval handle; cleared once all providers settle
 let webTerminalEnabled = false;
 let term = null, termFit = null, termSock = null;  // xterm.js terminal state
 let wzType = null;            // 'code' | 'package' | 'repository' | 'remote' | 'rest'
@@ -2349,7 +2350,7 @@ window.addEventListener('DOMContentLoaded', () => {
   pollPendingAuth();
   setInterval(pollPendingAuth, 5000);
   pollProviderStatus();
-  setInterval(pollProviderStatus, 4000);
+  _statusPollTimer = setInterval(pollProviderStatus, 4000);
   loadList();
 });
 
@@ -2390,9 +2391,16 @@ async function pollProviderStatus() {
     const r = await api('GET', '/api/provider-status');
     _providerStatus = r.providers || {};
   } catch { return; }
-  // updateStatusBadges removes PENDING/FAILED badges the moment a provider
-  // flips to READY — regardless of how long initialization took.
+  // Remove ⏳ badges the moment a provider flips to READY, however long it took.
   updateStatusBadges();
+  // Stop polling once every provider has settled (ready or failed — no pending).
+  // Providers never go back to pending without a server restart, so no future
+  // ticks would change anything.
+  const hasPending = Object.values(_providerStatus).some(s => s.status === 'pending');
+  if (!hasPending && _statusPollTimer !== null) {
+    clearInterval(_statusPollTimer);
+    _statusPollTimer = null;
+  }
 }
 
 function updateStatusBadges() {

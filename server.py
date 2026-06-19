@@ -86,6 +86,20 @@ ADVERTISED_NAME_SEP = "__"
 # long-running server start (e.g. `npm run start:dev`) into build_commands.
 BUILD_COMMAND_TIMEOUT = int(os.environ.get("MCPPROXY_BUILD_TIMEOUT", "600"))
 
+# When enabled (default), provider setup (pip / build / setup_commands) runs on a
+# background thread so the MCP server starts accepting requests immediately.
+# Tools whose provider is still installing return a "still initializing, retry
+# shortly" directive instead of failing.  Set MCPPROXY_BACKGROUND_SETUP=0 to fall
+# back to the old behaviour (setup runs synchronously before the server starts).
+def _background_setup_enabled() -> bool:
+    return os.environ.get("MCPPROXY_BACKGROUND_SETUP", "1").strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
+# Seconds advertised in the retry directive returned for a not-yet-ready tool.
+INIT_RETRY_SECONDS = int(os.environ.get("MCPPROXY_INIT_RETRY_SECONDS", "15"))
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -410,6 +424,94 @@ def write_workdir_env_file(workdir: str, env_keys: list[str]) -> Path:
     return target
 
 
+def build_tool_handlers(
+    spec: dict[str, Any],
+) -> "dict[str, tuple[dict[str, Any], Callable[..., Any]]]":
+    """Build the real handler for every enabled tool in one provider spec.
+
+    Returns an ordered mapping of advertised tool name
+    (``<provider>__<tool>``) → ``(tool_spec, handler)``.  This is the
+    setup-dependent half of registration: it execs the code block for code
+    providers (so their declared ``requirements`` must already be installed)
+    and wires subprocess / REST handlers for the other provider kinds.
+
+    Kept separate from registration so the gated-stub flow can register tools
+    up front (from the YAML alone) and resolve these real handlers later on a
+    background thread once setup has finished.
+    """
+    source_path = spec.get("_config_path", "<unknown>")
+    provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
+    rest_config = _get_rest_config(spec)
+    command = _get_package_command(spec)
+    # Repository providers piggy-back on the package code path; the only
+    # difference is that their subprocess is spawned with cwd=<workdir>
+    # and env enriched with the repository.env_keys declared in YAML.
+    cwd = repository_workdir(provider_name, spec)
+    env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
+
+    handlers: dict[str, tuple[dict[str, Any], Callable[..., Any]]] = {}
+
+    if rest_config is not None:
+        # ── REST provider ─────────────────────────────────────────────────
+        # Each tool maps 1:1 to an endpoint (matched by name).  Endpoints are
+        # concrete by this point (OpenAPI specs are expanded into endpoints at
+        # create time by the frontend), so registration is network-free.
+        from rest_provider import _make_rest_handler
+
+        endpoints = {e.get("name"): e for e in (rest_config.get("endpoints") or [])}
+        for tool_spec in spec.get("tools", []):
+            tool_name = tool_spec.get("name", "<unnamed>")
+            if not tool_is_enabled(tool_spec):
+                print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                continue
+            endpoint_spec = endpoints.get(tool_name)
+            if endpoint_spec is None:
+                raise ValueError(
+                    f"REST tool '{tool_name}' in {source_path} has no matching "
+                    f"endpoint (rest.endpoints[].name must equal the tool name)"
+                )
+            handler = _make_rest_handler(endpoint_spec, rest_config, provider_name)
+            handlers[advertised_tool_name(provider_name, tool_name)] = (tool_spec, handler)
+
+    elif command is not None:
+        # ── package provider (npx / uvx / python -m / any binary) ──────────
+        for tool_spec in spec.get("tools", []):
+            tool_name = tool_spec.get("name", "<unnamed>")
+            if not tool_is_enabled(tool_spec):
+                print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                continue
+            handler = _make_process_handler(command, tool_name, cwd=cwd, env_keys=env_keys)
+            handlers[advertised_tool_name(provider_name, tool_name)] = (tool_spec, handler)
+
+    else:
+        # ── code provider ─────────────────────────────────────────────────
+        namespace = exec_provider_code(spec)
+        tools = spec.get("tools", [])
+        if not tools:
+            print(f"Warning: no tools declared in {source_path}")
+            return handlers
+
+        for tool_spec in tools:
+            tool_name = tool_spec.get("name", "<unnamed>")
+            if not tool_is_enabled(tool_spec):
+                print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
+                continue
+            function_name = tool_spec.get("function")
+            if not function_name:
+                raise ValueError(
+                    f"Tool '{tool_name}' in {source_path} is missing required 'function' field"
+                )
+            handler = namespace.get(function_name)
+            if handler is None:
+                raise RuntimeError(
+                    f"Function '{function_name}' (tool '{tool_name}') not found "
+                    f"in the code block of {source_path}"
+                )
+            handlers[advertised_tool_name(provider_name, tool_name)] = (tool_spec, handler)
+
+    return handlers
+
+
 def register_provider(spec: dict[str, Any]) -> None:
     """Register all tools declared in one provider spec.
 
@@ -420,88 +522,9 @@ def register_provider(spec: dict[str, Any]) -> None:
     they can be flipped back on without re-typing the schema.
     """
     source_path = spec.get("_config_path", "<unknown>")
-    provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
     try:
-        rest_config = _get_rest_config(spec)
-        command = _get_package_command(spec)
-        # Repository providers piggy-back on the package code path; the only
-        # difference is that their subprocess is spawned with cwd=<workdir>
-        # and env enriched with the repository.env_keys declared in YAML.
-        cwd = repository_workdir(provider_name, spec)
-        env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
-
-        if rest_config is not None:
-            # ── REST provider ─────────────────────────────────────────────────
-            # Each tool maps 1:1 to an endpoint (matched by name).  Endpoints are
-            # concrete by this point (OpenAPI specs are expanded into endpoints at
-            # create time by the frontend), so registration is network-free.
-            from rest_provider import _make_rest_handler
-
-            endpoints = {
-                e.get("name"): e for e in (rest_config.get("endpoints") or [])
-            }
-            for tool_spec in spec.get("tools", []):
-                tool_name = tool_spec.get("name", "<unnamed>")
-                if not tool_is_enabled(tool_spec):
-                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
-                    continue
-                endpoint_spec = endpoints.get(tool_name)
-                if endpoint_spec is None:
-                    raise ValueError(
-                        f"REST tool '{tool_name}' in {source_path} has no matching "
-                        f"endpoint (rest.endpoints[].name must equal the tool name)"
-                    )
-                handler = _make_rest_handler(endpoint_spec, rest_config, provider_name)
-                register_tool(
-                    tool_spec,
-                    handler,
-                    advertised_name=advertised_tool_name(provider_name, tool_name),
-                )
-
-        elif command is not None:
-            # ── package provider (npx / uvx / python -m / any binary) ──────────
-            for tool_spec in spec.get("tools", []):
-                tool_name = tool_spec.get("name", "<unnamed>")
-                if not tool_is_enabled(tool_spec):
-                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
-                    continue
-                handler = _make_process_handler(command, tool_name, cwd=cwd, env_keys=env_keys)
-                register_tool(
-                    tool_spec,
-                    handler,
-                    advertised_name=advertised_tool_name(provider_name, tool_name),
-                )
-
-        else:
-            # ── code provider ─────────────────────────────────────────────────
-            namespace = exec_provider_code(spec)
-            tools = spec.get("tools", [])
-            if not tools:
-                print(f"Warning: no tools declared in {source_path}")
-                return
-
-            for tool_spec in tools:
-                tool_name = tool_spec.get("name", "<unnamed>")
-                if not tool_is_enabled(tool_spec):
-                    print(f"Skipping disabled tool: {advertised_tool_name(provider_name, tool_name)}")
-                    continue
-                function_name = tool_spec.get("function")
-                if not function_name:
-                    raise ValueError(
-                        f"Tool '{tool_name}' in {source_path} is missing required 'function' field"
-                    )
-                handler = namespace.get(function_name)
-                if handler is None:
-                    raise RuntimeError(
-                        f"Function '{function_name}' (tool '{tool_name}') not found "
-                        f"in the code block of {source_path}"
-                    )
-                register_tool(
-                    tool_spec,
-                    handler,
-                    advertised_name=advertised_tool_name(provider_name, tool_name),
-                )
-
+        for advertised_name, (tool_spec, handler) in build_tool_handlers(spec).items():
+            register_tool(tool_spec, handler, advertised_name=advertised_name)
     except Exception as exc:
         print(f"register_provider error in {source_path}: {exc}")
         traceback.print_exc()
@@ -682,8 +705,149 @@ def bootstrap_provider(provider_spec: dict[str, Any]) -> None:
         traceback.print_exc()
 
 
-for provider_spec in load_provider_specs(CONFIG_DIR):
-    bootstrap_provider(provider_spec)
+# ---------------------------------------------------------------------------
+# Background (non-blocking) startup
+# ---------------------------------------------------------------------------
+#
+# With background setup enabled (the default) every provider's tools are
+# registered immediately as *gated stubs* built from the YAML alone, then the
+# slow setup (pip / build / setup_commands) runs on a background thread.  A tool
+# called while its provider is still installing returns a retry directive
+# instead of failing; once setup finishes the same registered tool transparently
+# delegates to the provider's real handler.
+
+import provider_status
+
+
+def register_gated_provider(spec: dict[str, Any], state: provider_status.ProviderState) -> None:
+    """Register every enabled tool of ``spec`` as a stub gated on ``state``.
+
+    The stub is built from the YAML tool list only (no pip/exec/network), so it
+    is safe to call before the provider's dependencies are installed.  Each
+    stub's handler consults ``state``: while ``PENDING`` it returns a retry
+    directive, when ``READY`` it delegates to ``state.handlers[advertised_name]``,
+    and when ``FAILED`` it surfaces the setup error.
+    """
+    source_path = spec.get("_config_path", "<unknown>")
+    provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
+    try:
+        for tool_spec in spec.get("tools", []):
+            tool_name = tool_spec.get("name", "<unnamed>")
+            advertised_name = advertised_tool_name(provider_name, tool_name)
+            if not tool_is_enabled(tool_spec):
+                print(f"Skipping disabled tool: {advertised_name}")
+                continue
+            register_tool(
+                tool_spec,
+                _make_gate_handler(state, advertised_name),
+                advertised_name=advertised_name,
+            )
+    except Exception as exc:
+        print(f"register_gated_provider error in {source_path}: {exc}")
+        traceback.print_exc()
+
+
+def _make_gate_handler(
+    state: provider_status.ProviderState, advertised_name: str
+) -> Callable[..., Any]:
+    """Return a handler that dispatches based on ``state.status``."""
+
+    async def gate(context: dict[str, Any], **kwargs: Any) -> Any:
+        if state.status == provider_status.READY:
+            handler = state.handlers.get(advertised_name)
+            if handler is None:
+                return {
+                    "ok": False,
+                    "tool": advertised_name,
+                    "error": f"Provider '{state.name}' is ready but tool '{advertised_name}' has no handler.",
+                }
+            return await handler(context=context, **kwargs)
+        if state.status == provider_status.FAILED:
+            return {
+                "ok": False,
+                "tool": advertised_name,
+                "status": "failed",
+                "error": f"Provider '{state.name}' failed to initialize: {state.error}",
+            }
+        # PENDING — setup still running in the background.
+        return {
+            "ok": False,
+            "tool": advertised_name,
+            "status": "initializing",
+            "retry_after_seconds": INIT_RETRY_SECONDS,
+            "message": (
+                f"Tool '{advertised_name}' is not ready yet — provider "
+                f"'{state.name}' is still installing its dependencies. "
+                f"Wait ~{INIT_RETRY_SECONDS}s and call this tool again."
+            ),
+        }
+
+    gate.__name__ = advertised_name
+    return gate
+
+
+def _resolve_provider(spec: dict[str, Any], state: provider_status.ProviderState) -> None:
+    """Run a provider's setup then build its real handlers, flipping ``state``.
+
+    Mirrors ``bootstrap_provider`` semantics: a setup failure is logged but does
+    not stop handler construction (package/REST handlers don't need setup, and a
+    code provider may still import already-present modules).  Only a failure to
+    build the handlers themselves marks the provider ``FAILED``.
+    """
+    source_path = spec.get("_config_path", "<unknown>")
+    try:
+        run_provider_setup(spec)
+    except Exception as exc:
+        print(
+            f"Provider {source_path}: setup failed ({exc}). "
+            "Tools are registered but may not work until the "
+            "build / requirements / setup_commands are fixed (see the editor)."
+        )
+        traceback.print_exc()
+    try:
+        state.handlers = {
+            name: handler for name, (_spec, handler) in build_tool_handlers(spec).items()
+        }
+        state.status = provider_status.READY
+        print(f"Provider '{state.name}' ready ({len(state.handlers)} tool(s)).")
+    except Exception as exc:
+        state.status = provider_status.FAILED
+        state.error = str(exc)
+        print(f"Provider '{state.name}' failed to initialize: {exc}")
+        traceback.print_exc()
+
+
+def _background_bootstrap(
+    specs: list[dict[str, Any]],
+    states: dict[str, provider_status.ProviderState],
+) -> None:
+    """Resolve every provider sequentially off the request path."""
+    for spec in specs:
+        source_path = spec.get("_config_path", "<unknown>")
+        provider_name = Path(source_path).stem if source_path != "<unknown>" else ""
+        state = states.get(provider_name)
+        if state is None:
+            continue
+        _resolve_provider(spec, state)
+
+
+# Specs whose background setup __main__ kicks off after the server is listening.
+_PENDING_SPECS: list[dict[str, Any]] = []
+_PENDING_STATES: dict[str, provider_status.ProviderState] = {}
+
+if _background_setup_enabled():
+    for provider_spec in load_provider_specs(CONFIG_DIR):
+        _source_path = provider_spec.get("_config_path", "<unknown>")
+        _provider_name = Path(_source_path).stem if _source_path != "<unknown>" else ""
+        _state = provider_status.ProviderState(name=_provider_name)
+        provider_status.set_state(_state)
+        register_gated_provider(provider_spec, _state)
+        _PENDING_SPECS.append(provider_spec)
+        _PENDING_STATES[_provider_name] = _state
+else:
+    # Opt-out: original synchronous behaviour (setup blocks server startup).
+    for provider_spec in load_provider_specs(CONFIG_DIR):
+        bootstrap_provider(provider_spec)
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1014,21 @@ if __name__ == "__main__":
         ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
         ui_thread.start()
         print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")
+        if _PENDING_SPECS:
+            # Run provider setup (pip / build / setup_commands) in the background
+            # so the MCP server below starts serving immediately.  Until each
+            # provider is ready its tools return a retry directive.
+            bootstrap_thread = threading.Thread(
+                target=_background_bootstrap,
+                args=(_PENDING_SPECS, _PENDING_STATES),
+                daemon=True,
+                name="provider-bootstrap",
+            )
+            bootstrap_thread.start()
+            print(
+                f"Installing dependencies for {len(_PENDING_SPECS)} provider(s) "
+                "in the background; tools return a retry directive until ready."
+            )
         if _warm_remote_enabled():
             warm_thread = threading.Thread(
                 target=_warm_remote_providers, daemon=True, name="remote-warmup"

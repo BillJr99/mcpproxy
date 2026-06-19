@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir uv
 ENV PATH="/root/.local/bin:$PATH"
 
-COPY server.py config.py process_runner.py builtin_tools.py tool_registry.py rest_provider.py oauth_bootstrap.py catalog.py ./
+COPY server.py config.py process_runner.py builtin_tools.py tool_registry.py provider_status.py rest_provider.py oauth_bootstrap.py catalog.py ./
 COPY frontend/ ./frontend/
 COPY handlers/ ./handlers/
 
@@ -30,6 +30,12 @@ ENV MCP_ENV_FILE=/app/.env
 ENV MCPPROXY_FILES_DIR=/app/files
 ENV MCPPROXY_REPOS_DIR=/app/repos
 ENV MCPPROXY_REST_AUTH_DIR=/app/.rest-auth
+
+# Pin the pip / uv wheel caches to the persisted /root/.cache volume
+# (see docker-compose.yml) so ephemeral containers reuse downloaded wheels
+# across restarts instead of re-fetching them every startup.
+ENV PIP_CACHE_DIR=/root/.cache/pip
+ENV UV_CACHE_DIR=/root/.cache/uv
 
 EXPOSE 8888 8889
 

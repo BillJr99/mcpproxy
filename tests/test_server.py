@@ -1146,6 +1146,139 @@ class TestBuildCommandTimeout:
 
 
 # ---------------------------------------------------------------------------
+# Gated (non-blocking) startup — stubs, retry directive, background resolution
+# ---------------------------------------------------------------------------
+
+import provider_status
+from server import (
+    _make_gate_handler,
+    _resolve_provider,
+    register_gated_provider,
+)
+
+
+class TestRegisterGatedProvider:
+    def _spec(self, tmp_path):
+        return {
+            "_config_path": str(tmp_path / "demo.yaml"),
+            "code": "async def ping(context):\n    return {'ok': True}\n",
+            "tools": [
+                {
+                    "name": "ping", "function": "ping", "description": "x",
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+                {
+                    "name": "off", "function": "off", "description": "x", "enabled": False,
+                    "input_schema": {"type": "object", "properties": {}, "required": []},
+                },
+            ],
+        }
+
+    def test_registers_stubs_without_running_setup_or_code(self, tmp_path: Path):
+        names: list[str] = []
+
+        def fake_decorator(**kwargs):
+            names.append(kwargs.get("name"))
+            return lambda fn: fn
+
+        state = provider_status.ProviderState(name="demo")
+        with patch("server.mcp") as mock_mcp, \
+             patch("server.run_provider_setup") as mock_setup, \
+             patch("server.exec_provider_code") as mock_exec:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_gated_provider(self._spec(tmp_path), state)
+
+        # Only the enabled tool is registered, and neither setup nor the code
+        # block was executed (stubs come from the YAML alone).
+        assert names == ["demo__ping"]
+        mock_setup.assert_not_called()
+        mock_exec.assert_not_called()
+
+
+class TestGateHandler:
+    @pytest.mark.asyncio
+    async def test_pending_returns_retry_directive(self):
+        state = provider_status.ProviderState(name="demo")  # PENDING by default
+        gate = _make_gate_handler(state, "demo__ping")
+        result = await gate(context={})
+        assert result["ok"] is False
+        assert result["status"] == "initializing"
+        assert isinstance(result["retry_after_seconds"], int)
+        assert "demo" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_failed_returns_error(self):
+        state = provider_status.ProviderState(
+            name="demo", status=provider_status.FAILED, error="pip exploded"
+        )
+        gate = _make_gate_handler(state, "demo__ping")
+        result = await gate(context={})
+        assert result["ok"] is False
+        assert result["status"] == "failed"
+        assert "pip exploded" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_ready_delegates_to_real_handler(self):
+        calls = []
+
+        async def real(context, **kwargs):
+            calls.append((context, kwargs))
+            return {"ok": True, "v": 1}
+
+        state = provider_status.ProviderState(name="demo", status=provider_status.READY)
+        state.handlers = {"demo__ping": real}
+        gate = _make_gate_handler(state, "demo__ping")
+        result = await gate(context={"a": 1}, msg="hi")
+        assert result == {"ok": True, "v": 1}
+        assert calls[0][1] == {"msg": "hi"}
+
+
+class TestResolveProvider:
+    def _spec(self, tmp_path):
+        return {
+            "_config_path": str(tmp_path / "demo.yaml"),
+            "code": "async def ping(context):\n    return {'ok': True}\n",
+            "tools": [{
+                "name": "ping", "function": "ping", "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+
+    def test_pending_flips_to_ready_with_handlers(self, tmp_path: Path):
+        state = provider_status.ProviderState(name="demo")
+        with patch("server.run_provider_setup") as mock_setup:
+            _resolve_provider(self._spec(tmp_path), state)
+        mock_setup.assert_called_once()
+        assert state.status == provider_status.READY
+        assert "demo__ping" in state.handlers
+        assert callable(state.handlers["demo__ping"])
+
+    def test_setup_failure_still_builds_handlers(self, tmp_path: Path):
+        state = provider_status.ProviderState(name="demo")
+        with patch("server.run_provider_setup", side_effect=RuntimeError("pip failed")):
+            _resolve_provider(self._spec(tmp_path), state)
+        # Setup failure is non-fatal: handlers still built, provider ready.
+        assert state.status == provider_status.READY
+        assert "demo__ping" in state.handlers
+
+    def test_handler_build_failure_marks_failed(self, tmp_path: Path):
+        # Code block that references a missing function → build_tool_handlers raises.
+        spec = {
+            "_config_path": str(tmp_path / "demo.yaml"),
+            "code": "x = 1\n",
+            "tools": [{
+                "name": "ping", "function": "missing", "description": "x",
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }],
+        }
+        state = provider_status.ProviderState(name="demo")
+        with patch("server.run_provider_setup"):
+            _resolve_provider(spec, state)
+        assert state.status == provider_status.FAILED
+        assert state.error
+
+
+# ---------------------------------------------------------------------------
 # bootstrap_provider — setup runs before registration
 # ---------------------------------------------------------------------------
 

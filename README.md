@@ -214,6 +214,57 @@ All paths are validated against the whitelisted roots (directory-traversal and
 symlink-escape attempts are rejected), and uploads stream to disk with a size cap
 (`MCPPROXY_MAX_UPLOAD_BYTES`, default 50 MB).
 
+### Provider status badges
+
+While background setup is running, the left-panel provider list shows live badges:
+
+| Badge | Meaning |
+|---|---|
+| **⏳ initializing** (yellow) | Provider's dependencies are still installing — tools are advertised but return a retry directive until setup finishes. Badge disappears automatically once the provider is ready, however long that takes. |
+| **✗ setup failed** (red, with tooltip) | An actual error occurred during setup — hover the badge to read the error. All other providers are unaffected. |
+| *(no status badge)* | Provider is ready. |
+
+The badges are updated every 4 seconds via `GET /api/provider-status`. A provider stays
+marked **⏳ initializing** for as long as it needs — it is never changed to "failed" because
+of timing alone; only an actual exception during setup produces the red badge.
+
+### Registered tools list
+
+The **📋 Tools** navbar button opens a read-only panel showing every tool currently
+exposed by the proxy, grouped by provider. Each provider section shows:
+
+- A status badge (⏳ initializing / ✓ ready / ✗ failed)
+- The number of tools it contributes
+- Each tool's short name and description
+
+A filter box narrows results by tool name or description. This panel is useful for a
+quick audit of what the LLM can currently see, especially during startup when some
+providers may still be initializing.
+
+Under the hood it reads the same `GET /v1/tools` endpoint as the tool tester, plus
+`GET /api/provider-status` for the readiness information.
+
+```
+GET /api/provider-status
+```
+
+Returns per-provider initialization state:
+
+```json
+{
+  "ok": true,
+  "providers": {
+    "playwright": {"status": "pending", "error": null},
+    "github":     {"status": "ready",   "error": null},
+    "myflaky":    {"status": "failed",  "error": "pip install returned exit code 1 …"}
+  }
+}
+```
+
+`status` is one of `"pending"` (still installing), `"ready"` (setup complete), or
+`"failed"` (setup threw an error). Returns `{"ok": true, "providers": {}}` when
+`MCPPROXY_BACKGROUND_SETUP=0` (synchronous mode, nothing to track).
+
 ### Tool tester
 
 The **🧪 Test Tools** navbar button lists every registered tool, grouped by provider,

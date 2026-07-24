@@ -49,6 +49,12 @@ AUTH_INIT_TIMEOUT = float(os.environ.get("MCPPROXY_AUTH_INIT_TIMEOUT", "300"))
 # server) polls this so it can show the link while a spawn is blocked on auth.
 pending_auth_urls: dict[str, str] = {}
 
+# Commands whose MCP initialize handshake has completed successfully in this
+# process. Provider-status APIs use this to distinguish dependency setup from
+# a live authenticated remote bridge. No tokens or authorization URLs live in
+# this set.
+authenticated_commands: set[str] = set()
+
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 # Lines that hint mcp-remote (or a similar bridge) is asking the user to
 # authorize.  Matched case-insensitively against each stderr line.
@@ -159,6 +165,9 @@ class ProcessSession:
         return text[-max_bytes:]
 
     async def _start(self) -> None:
+        # A new spawn must prove its current credentials before it is reported
+        # as authenticated. A later successful handshake adds it back below.
+        authenticated_commands.discard(self.command)
         env = self._build_env()
         self._proc = await asyncio.create_subprocess_exec(
             *self._parts,
@@ -188,6 +197,7 @@ class ProcessSession:
         await self._recv(timeout=AUTH_INIT_TIMEOUT)   # initialize response
         # Handshake completed → any pending authorization is resolved.
         self._clear_pending_auth()
+        authenticated_commands.add(self.command)
         # notifications/initialized (no response expected)
         await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 

@@ -53,6 +53,7 @@ is added automatically when the tool is registered.
 |---|---|
 | **8888** | MCP endpoint — `http://localhost:8888/mcp` |
 | **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
+| **8887** | Loopback-only OAuth callback for containerized `mcp-remote` bridges |
 
 ## Non-blocking startup
 
@@ -220,9 +221,9 @@ While background setup is running, the left-panel provider list shows live badge
 
 | Badge | Meaning |
 |---|---|
-| **⏳ initializing** (yellow) | Provider's dependencies are still installing — tools are advertised but return a retry directive until setup finishes. Badge disappears automatically once the provider is ready, however long that takes. |
-| **✗ setup failed** (red, with tooltip) | An actual error occurred during setup — hover the badge to read the error. All other providers are unaffected. |
-| *(no status badge)* | Provider is ready. |
+| **⏳ initializing** (yellow) | Provider dependencies are still installing; tools are advertised but return a retry directive until setup finishes. |
+| **✗ setup failed** (red, with tooltip) | Provider setup failed. Hover the badge for the setup error. Other providers remain available. |
+| *(no setup badge)* | Provider setup completed. For remote OAuth bridges, this does not by itself prove account authentication; inspect `auth_status` or call a read-only identity tool. |
 
 The badges are updated every 4 seconds via `GET /api/provider-status`. A provider stays
 marked **⏳ initializing** for as long as it needs — it is never changed to "failed" because
@@ -248,22 +249,35 @@ Under the hood it reads the same `GET /v1/tools` endpoint as the tool tester, pl
 GET /api/provider-status
 ```
 
-Returns per-provider initialization state:
+Returns per-provider setup state and, for `mcp-remote` bridges, authentication state:
 
 ```json
 {
   "ok": true,
   "providers": {
-    "playwright": {"status": "pending", "error": null},
-    "github":     {"status": "ready",   "error": null},
-    "myflaky":    {"status": "failed",  "error": "pip install returned exit code 1 …"}
+    "playwright": {
+      "status": "ready",
+      "setup_status": "ready",
+      "auth_status": null,
+      "error": null
+    },
+    "asana": {
+      "status": "ready",
+      "setup_status": "ready",
+      "auth_status": "authorization_required",
+      "error": null
+    }
   }
 }
 ```
 
-`status` is one of `"pending"` (still installing), `"ready"` (setup complete), or
-`"failed"` (setup threw an error). Returns `{"ok": true, "providers": {}}` when
-`MCPPROXY_BACKGROUND_SETUP=0` (synchronous mode, nothing to track).
+`status` remains the backward-compatible setup value: `"pending"`, `"ready"`, or
+`"failed"`. `setup_status` makes that meaning explicit. `auth_status` is `null` for
+ordinary providers and one of `"unknown"`, `"authorization_required"`, or
+`"authenticated"` for `mcp-remote` providers. `"authenticated"` means a live MCP
+initialize handshake succeeded in the current proxy process; use a read-only identity
+tool for end-to-end account verification. The endpoint returns
+`{"ok": true, "providers": {}}` when no background states are registered.
 
 ### Tool tester
 
@@ -508,8 +522,10 @@ docker pull ghcr.io/billjr99/mcpproxy:latest
 
 ```bash
 docker run -d --rm \
-  -p 8888:8888 -p 8889:8889 \
+  -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
   --env-file .env \
+  -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
+  -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
   -v "$(pwd)/tools":/app/tools \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
@@ -520,8 +536,10 @@ package caches, and provider output files survive container restarts:
 
 ```bash
 docker run -d --rm \
-  -p 8888:8888 -p 8889:8889 \
+  -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
   --env-file .env \
+  -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
+  -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
   -v "$(pwd)/tools":/app/tools \
   -v mcpproxy-files:/app/files \
   -v mcpproxy-repos:/app/repos \
@@ -537,9 +555,10 @@ docker run -d --rm \
 
 The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
 providers (e.g. the official Asana MCP). Persist it and you authorize once, then the
-token refreshes silently; drop it and you re-authorize on every fresh container. Also
-map the OAuth callback port (`-p 3334:3334`) the first time you authorize. Omit both if
-you have no OAuth-bridge providers.
+token refreshes silently; drop it and you re-authorize on every fresh container. The
+callback is published only on host loopback (`127.0.0.1:8887`) and forwarded inside
+the container to `mcp-remote`'s loopback-only listener. Omit the callback mapping and
+forwarder setting if you have no OAuth-bridge providers.
 
 Every volume above is optional — omit any subset and that path falls back to the
 container's ephemeral writable layer. See **[Volumes & caching](#volumes--caching)**
@@ -565,9 +584,11 @@ mkdir -p ~/.mcpproxy/tools
 touch ~/.mcpproxy/.env
 
 docker run -d \
-  -p 8888:8888 -p 8889:8889 \
+  -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
   --env-file "$HOME/.mcpproxy/.env" \
   -e MCP_ENV_FILE=/app/.env \
+  -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
+  -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
   -v "$HOME/.mcpproxy/tools:/app/tools" \
   -v "$HOME/.mcpproxy/.env:/app/.env" \
   -v mcpproxy-files:/app/files \
@@ -617,9 +638,11 @@ Notes:
 > ```bash
 > docker run -d \
 >   --restart unless-stopped \
->   -p 8888:8888 -p 8889:8889 \
+>   -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
 >   --env-file "$HOME/.mcpproxy/.env" \
 >   -e MCP_ENV_FILE=/run/secrets/mcpproxy.env \
+>   -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
+>   -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
 >   -v "$HOME/.mcpproxy/tools:/app/tools" \
 >   -v "$HOME/.mcpproxy/.env:/run/secrets/mcpproxy.env:ro" \
 >   -v mcpproxy-files:/app/files \
@@ -641,9 +664,9 @@ Notes:
 > if you want live edits to persist.
 
 The `mcpproxy-mcp-auth` volume holds the OAuth token cache for `mcp-remote` bridge
-providers (e.g. the official Asana MCP); persist it and you authorize once. Map the OAuth
-callback port (`-p 3334:3334`) the first time you authorize. Omit any volume you don't need
-— each falls back to the container's ephemeral writable layer.
+providers (e.g. the official Asana MCP); persist it and you authorize once. Keep the
+callback mapping bound to host loopback. Omit any volume you don't need; each falls
+back to the container's ephemeral writable layer.
 
 Available tags:
 
@@ -720,7 +743,7 @@ MCP_HOST_PORT=9000 UI_HOST_PORT=9001 docker compose up
 
 ### Volumes & caching
 
-`docker-compose.yml` declares seven named volumes. Only the first is required —
+`docker-compose.yml` declares eight named volumes. Only the first is required —
 the rest persist caches, artefacts, and OAuth tokens that would otherwise be
 re-downloaded, re-built, or re-authorized on every fresh container.
 
@@ -733,6 +756,7 @@ re-downloaded, re-built, or re-authorized on every fresh container.
 | `/root/.npm` | `mcpproxy-npm` | npm/npx package cache | npx re-downloads packages from the npm registry on first call. |
 | `/root/.local/share/uv` | `mcpproxy-uv-tools` | uvx per-tool venvs | uvx re-creates per-tool venvs from cached wheels. |
 | `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens aren't exposed via `mcpproxy__getfile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
+| `/app/.rest-auth` | `mcpproxy-rest-auth` | OAuth token cache for REST `authorization_code` providers. | Re-authorize REST OAuth providers on every fresh container. |
 
 The image pins `PIP_CACHE_DIR=/root/.cache/pip` and `UV_CACHE_DIR=/root/.cache/uv`
 so the pip and uv wheel caches always land inside the persisted `mcpproxy-cache`
@@ -1170,87 +1194,96 @@ call to it. The process is reused across calls (started lazily on the first tool
 
 ### Part 3.25 — a remote, OAuth-protected server (e.g. the official Asana MCP)
 
-Some MCP servers aren't stdio packages at all — they're **remote, OAuth-protected HTTP
-endpoints**. The official Asana server is one: it lives at `https://mcp.asana.com/v2/mcp`
-(Streamable HTTP) and is reached through an OAuth 2.1 authorization-code (PKCE) flow — there's
-no static API key. mcpproxy speaks stdio to its upstreams, so these are bridged with the
-community [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) adapter, which is itself just
-a `package:` command.
+Some MCP servers are remote, OAuth-protected HTTP endpoints rather than stdio packages.
+The official Asana V2 MCP endpoint is `https://mcp.asana.com/v2/mcp`. mcpproxy reaches it
+through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) stdio bridge.
 
-The easiest way to add one is the web UI's **+ New Provider → 🌐 Remote MCP Server** option:
-paste the server URL (e.g. `https://mcp.asana.com/v2/mcp`) and mcpproxy builds the
-`npx -y mcp-remote <url>` command, introspects the tool list, and walks you through the OAuth
-flow. The equivalent YAML it produces (which you can also write by hand) is:
+Asana V2 does **not** support dynamic client registration for custom clients. Create an
+Asana MCP app first, register the exact callback URI
+`http://localhost:8887/oauth/callback`, and keep its app credentials in an untracked file:
+
+```text
+tools/
+└── secrets/
+    └── asana/
+        └── client_info.json
+```
+
+```json
+{
+  "client_id": "<ASANA_MCP_CLIENT_ID>",
+  "client_secret": "<ASANA_MCP_CLIENT_SECRET>"
+}
+```
+
+Set the file to owner-readable only (`chmod 600` on POSIX hosts). Never put the values in
+the provider YAML, command line, image, README, or Git. The `tools/` tree is gitignored by
+this repository and must be mounted at runtime.
+
+Use a pinned bridge version, the static client-info file, an explicit protected resource,
+and the fixed callback port:
 
 ```yaml
-# Paste into your tools/ config dir, or use the wizard's "Remote MCP Server"
-# option (just paste the URL — it builds this command for you).
 package:
-  command: npx -y mcp-remote https://mcp.asana.com/v2/mcp
+  command: >-
+    npx -y mcp-remote@0.1.38
+    https://mcp.asana.com/v2/mcp
+    8887
+    --static-oauth-client-info @/app/tools/secrets/asana/client_info.json
+    --resource https://mcp.asana.com/v2
+    --auth-timeout 600
 
 tools:
-  - name: get_me      # advertised as asana__get_me; the rest are auto-introspected
+  - name: get_me      # advertised as asana__get_me; add/introspect the remaining tools
     description: Return the Asana user that the authorized token belongs to.
     input_schema: { type: object, properties: {} }
 ```
 
-**`mcp-remote` performs the OAuth walkthrough and refreshes the token for you** — mcpproxy
-itself stays a thin stdio proxy:
+`mcp-remote` reads the JSON file directly, so the client secret does not appear in the
+process argument list. On first use it prints an authorization URL and waits for the
+callback. After authorization it refreshes the access token automatically.
 
-- **First run** (or after the refresh token expires / is revoked): `mcp-remote` prints an
-  authorization URL and blocks the MCP handshake until you authorize. When you introspect the
-  server in the **+ New Provider → Remote MCP Server** (or **Package**) wizard, mcpproxy scrapes
-  that URL from stderr and shows a clickable **🔐 Authorize** link (it's also logged as
-  `authorization required … visit:`). Open it, approve access in Asana, and the localhost
-  callback (`:3334`) completes the flow — introspection then continues automatically and the
-  tool list populates.
-- **Afterwards** the OAuth token cache is written under `MCP_REMOTE_CONFIG_DIR` and **the access
-  token is refreshed silently** on every expiry. You don't authorize again until the refresh
-  token itself lapses.
+#### Docker callback forwarding
 
-#### Persisting the token cache (so you authorize once)
+`mcp-remote@0.1.38` intentionally listens on `127.0.0.1` inside the container. Ordinary
+Docker port publishing reaches the container's non-loopback interface, so a mapping alone
+cannot reach that listener. mcpproxy's callback forwarder bridges the published container
+interface port to the same port on container loopback.
 
-`docker-compose.yml` wires this up: it sets `MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth`, mounts the
-`mcpproxy-mcp-auth` volume there (kept **out** of `/app/files` so tokens are never exposed via
-`mcpproxy__getfile`), and maps the OAuth callback port `3334`. Keep that volume and the refresh
-token survives restarts. In dev, `docker-compose.override.yml` bind-mounts `./.mcp-auth`
-(gitignored).
-
-#### Headless / one-time bootstrap
-
-The OAuth redirect targets `localhost:3334`, so that port must be reachable from the
-machine running your browser (the default `docker-compose.yml` maps it). The **first**
-grant always needs a human in a browser once — there's no static key — but mcpproxy
-automates everything around it so you rarely touch a host shell:
-
-**1. Automatic refresh on restart.** On startup the proxy *warms* every `mcp-remote`
-bridge it finds in your configs: with a valid cache the token refreshes silently before
-the first tool call; if re-authorization is needed, the authorization URL is logged and
-surfaced as a banner in the UI. Disable with `MCPPROXY_WARM_REMOTE=0`.
-
-**2. Bootstrap from the browser (no host shell / `docker exec`).** The UI has a built-in
-terminal. In **+ New Provider → Remote MCP Server**, click **🖥 Bootstrap / Authorize in
-terminal** to run `npx -y mcp-remote <url>` live, watch its output, click the auth link,
-and complete the flow — the token cache is written under `MCP_REMOTE_CONFIG_DIR`. An
-existing provider whose refresh token has lapsed shows a **🔐 Re-authorize** button in its
-editor that does the same. The terminal is gated by `MCPPROXY_WEB_TERMINAL` (default on);
-set it to `0` to disable. *(It's a real shell in the container — keep the UI on a trusted
-network, as you already must for the secrets editor and command introspection.)*
-
-**3. Pre-populate on the host.** If you'd rather warm the cache before the container ever
-starts, run the flow once on the host (deriving URLs from your configs) and start the proxy
-with the same dir mounted:
+The deployment must include both settings:
 
 ```bash
-./run_local.sh --bootstrap-auth                       # every configured mcp-remote provider
-./run_local.sh --bootstrap-auth https://mcp.asana.com/v2/mcp   # or an explicit URL
-# equivalently: MCP_REMOTE_CONFIG_DIR=./.mcp-auth python3 bootstrap_auth.py
-# authorize in the browser, then `docker compose up` — tools work with no further prompts
+-p 127.0.0.1:8887:8887 \
+-e MCPPROXY_CALLBACK_FORWARD_PORTS=8887
 ```
 
-> **Pin the bridge** for reproducible builds once you've settled on a version, e.g.
-> `npx -y mcp-remote@<version> …`. Add `--debug` to write a detailed auth/refresh log under
-> `MCP_REMOTE_CONFIG_DIR`.
+Keep the host mapping on `127.0.0.1`; do not publish OAuth callback ports on all interfaces.
+`docker-compose.yml` includes the mapping and forwarder setting by default.
+
+#### Persisting the token cache
+
+Set `MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth` and mount the `mcpproxy-mcp-auth` volume there.
+This directory contains live access and refresh tokens and is intentionally separate from
+`/app/files` and `tools/secrets`. Keep the volume across container recreation so a new image
+does not require another grant.
+
+#### One-time authorization and headless use
+
+1. Trigger an Asana tool or let startup warm the bridge. mcpproxy surfaces the authorization
+   link in its UI and logs.
+2. Open the link in a browser running on the same machine as Docker, approve access, and let
+   Asana redirect to `http://localhost:8887/oauth/callback`.
+3. If authorization is completed on another device, its `localhost` is that device, not the
+   Docker host. Copy the final callback URL into a browser on the Docker host while the bridge
+   is still waiting. Treat that URL as a secret because it contains a short-lived code.
+4. Verify `asana__get_me`, then recreate the container with the same auth volume and verify it
+   again without reauthorization.
+
+On startup mcpproxy warms configured `mcp-remote` bridges. With a valid cache, refresh is
+silent. If authorization is required, the UI shows a pending-auth banner. A provider's
+**ready** setup badge means dependencies loaded successfully; it does not by itself prove
+that the remote account is authenticated. Verify authentication with a harmless read-only
+tool such as `get_me`.
 
 ---
 

@@ -38,9 +38,9 @@ services:
     ports:
       - "${MCP_HOST_PORT:-8888}:8888"
       - "${UI_HOST_PORT:-8889}:8889"
-      # OAuth callback for mcp-remote bridges (e.g. Asana). Only needed while
-      # authorizing in a browser the first time; harmless to leave mapped.
-      - "${MCP_OAUTH_CALLBACK_PORT:-3334}:3334"
+      # OAuth callback for mcp-remote bridges (e.g. Asana). Keep this bound to
+      # host loopback: authorization codes must never be exposed on the LAN.
+      - "127.0.0.1:${MCP_OAUTH_CALLBACK_PORT:-8887}:8887"
     env_file:
       - ./.env
     environment:
@@ -51,6 +51,9 @@ services:
       # Where mcp-remote caches OAuth tokens (access + refresh). Persisted via
       # the mcpproxy-mcp-auth volume so you authorize once and refresh silently.
       MCP_REMOTE_CONFIG_DIR: "/app/.mcp-auth"
+      # mcp-remote listens on container loopback. Bridge published Docker
+      # traffic from the container interface to the same loopback port.
+      MCPPROXY_CALLBACK_FORWARD_PORTS: "8887"
       # Where REST providers cache OAuth tokens for the authorization_code flow.
       MCPPROXY_REST_AUTH_DIR: "/app/.rest-auth"
     volumes:

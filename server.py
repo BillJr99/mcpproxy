@@ -1011,6 +1011,12 @@ def _run_ui() -> None:
 
 if __name__ == "__main__":
     try:
+        # mcp-remote binds OAuth callbacks to container loopback. Published
+        # Docker traffic arrives on a non-loopback interface, so opt-in
+        # forwarders bridge the published port to that loopback listener.
+        from callback_forwarder import start_callback_forwarders_from_env
+
+        _callback_forwarders = start_callback_forwarders_from_env()
         ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
         ui_thread.start()
         print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")

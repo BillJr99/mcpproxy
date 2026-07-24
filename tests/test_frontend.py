@@ -1928,6 +1928,50 @@ class TestProviderStatus:
         assert entry["error"] == "pip install returned exit code 1"
         provider_status.clear()
 
+    def test_remote_provider_reports_authorization_required(self, client, tools_dir):
+        import process_runner
+        import provider_status
+
+        command = "npx -y mcp-remote@0.1.38 https://mcp.asana.com/v2/mcp 8887"
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+        provider_status.clear()
+        provider_status.set_state(
+            provider_status.ProviderState(name="asana", status=provider_status.READY)
+        )
+        process_runner.pending_auth_urls[command] = "https://app.asana.com/oauth"
+        process_runner.authenticated_commands.discard(command)
+        try:
+            entry = client.get("/api/provider-status").json()["providers"]["asana"]
+            assert entry["setup_status"] == "ready"
+            assert entry["auth_status"] == "authorization_required"
+        finally:
+            process_runner.pending_auth_urls.pop(command, None)
+            provider_status.clear()
+
+    def test_remote_provider_reports_successful_handshake(self, client, tools_dir):
+        import process_runner
+        import provider_status
+
+        command = "npx -y mcp-remote@0.1.38 https://mcp.asana.com/v2/mcp 8887"
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+        provider_status.clear()
+        provider_status.set_state(
+            provider_status.ProviderState(name="asana", status=provider_status.READY)
+        )
+        process_runner.pending_auth_urls.pop(command, None)
+        process_runner.authenticated_commands.add(command)
+        try:
+            entry = client.get("/api/provider-status").json()["providers"]["asana"]
+            assert entry["setup_status"] == "ready"
+            assert entry["auth_status"] == "authenticated"
+        finally:
+            process_runner.authenticated_commands.discard(command)
+            provider_status.clear()
+
     def test_multiple_providers(self, client):
         import provider_status
         provider_status.clear()

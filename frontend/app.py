@@ -1361,22 +1361,46 @@ def create_app(
 
     @app.get("/api/provider-status")
     async def provider_status_api() -> dict:
-        """Return per-provider initialization status from the background startup.
+        """Return provider setup status and remote-bridge authentication status.
 
-        Each entry maps a provider name to its current readiness state:
-        ``status`` is ``"pending"`` (still installing), ``"ready"`` (setup done),
-        or ``"failed"`` (setup threw an error).  ``error`` is ``null`` unless
-        ``status == "failed"``, in which case it holds the failure message.
+        ``status`` remains the backward-compatible setup state. ``setup_status``
+        repeats it explicitly. For mcp-remote providers, ``auth_status`` is
+        ``"authorization_required"``, ``"authenticated"``, or ``"unknown"``.
+        Non-remote providers return ``null`` for ``auth_status``.
 
         Returns ``{"ok": True, "providers": {}}`` when the background-startup
         module is not loaded (e.g. ``MCPPROXY_BACKGROUND_SETUP=0``).
         """
         try:
             import provider_status as _ps  # same in-process dict server.py populates
+            import process_runner as _pr
+
+            def _entry(name: str, state) -> dict:
+                auth_status = None
+                path = _config_dir / f"{name}.yaml"
+                try:
+                    spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                    command = ((_get_package_spec(spec).get("command") or "").strip())
+                except (OSError, yaml.YAMLError):
+                    command = ""
+                if command and "mcp-remote" in command:
+                    if command in _pr.pending_auth_urls:
+                        auth_status = "authorization_required"
+                    elif command in _pr.authenticated_commands:
+                        auth_status = "authenticated"
+                    else:
+                        auth_status = "unknown"
+                return {
+                    "status": state.status,
+                    "setup_status": state.status,
+                    "auth_status": auth_status,
+                    "error": state.error,
+                }
+
             return {
                 "ok": True,
                 "providers": {
-                    name: {"status": s.status, "error": s.error}
+                    name: _entry(name, s)
                     for name, s in _ps.all_states().items()
                 },
             }

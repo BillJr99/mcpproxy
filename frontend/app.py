@@ -1380,7 +1380,8 @@ def create_app(
                 path = _config_dir / f"{name}.yaml"
                 try:
                     spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                    command = ((_get_package_spec(spec).get("command") or "").strip())
+                    package = _get_package_spec(spec) or {}
+                    command = ((package.get("command") or "").strip())
                 except (OSError, yaml.YAMLError):
                     command = ""
                 if command and "mcp-remote" in command:

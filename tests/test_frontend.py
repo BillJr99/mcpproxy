@@ -1928,6 +1928,23 @@ class TestProviderStatus:
         assert entry["error"] == "pip install returned exit code 1"
         provider_status.clear()
 
+    def test_code_provider_has_no_auth_status(self, client, tools_dir):
+        import provider_status
+
+        (tools_dir / "local-code.yaml").write_text(
+            yaml.safe_dump({"code": "def ping(): return 'pong'", "tools": []})
+        )
+        provider_status.clear()
+        provider_status.set_state(
+            provider_status.ProviderState(name="local-code", status=provider_status.READY)
+        )
+        try:
+            entry = client.get("/api/provider-status").json()["providers"]["local-code"]
+            assert entry["setup_status"] == "ready"
+            assert entry["auth_status"] is None
+        finally:
+            provider_status.clear()
+
     def test_remote_provider_reports_authorization_required(self, client, tools_dir):
         import process_runner
         import provider_status

@@ -160,6 +160,13 @@ class TestResolveEnvDefaults:
         result = resolve_env_defaults({}, {"x": 1})
         assert result == {"x": 1}
 
+    def test_omits_none_for_optional_upstream_arguments(self):
+        result = resolve_env_defaults(
+            {},
+            {"offset": None, "text": "", "limit": 0, "completed": False},
+        )
+        assert result == {"text": "", "limit": 0, "completed": False}
+
     def test_secret_injected_from_env(self, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "abc123")
         tool = {"secrets": {"env": {"api_key": "MY_API_KEY"}}}

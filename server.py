@@ -178,9 +178,14 @@ def exec_provider_code(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Inject secrets from environment variables into kwargs."""
+    """Omit absent optionals and inject secrets from environment variables."""
     try:
-        resolved = dict(kwargs)
+        # FastMCP invokes generated tool functions with ``None`` for omitted
+        # optional parameters.  Forwarding those nulls changes MCP semantics:
+        # upstream servers commonly validate an optional string as a string
+        # when present, so ``{"offset": null}`` fails where omission succeeds.
+        # Preserve meaningful falsey values while dropping only ``None``.
+        resolved = {key: value for key, value in kwargs.items() if value is not None}
         env_map = (tool_spec.get("secrets") or {}).get("env", {})
         for arg_name, env_name in env_map.items():
             secret_value = os.environ.get(env_name)

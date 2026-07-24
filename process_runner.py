@@ -22,6 +22,7 @@ import re
 import shlex
 import traceback
 from typing import Any
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # OAuth-bridge (mcp-remote) support
@@ -70,6 +71,16 @@ def _extract_auth_url(line: str) -> str | None:
         return None
     m = _URL_RE.search(line)
     return m.group(0) if m else None
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Return whether *url* points at a local callback listener."""
+    try:
+        return (urlparse(url).hostname or "").lower() in {
+            "127.0.0.1", "localhost", "::1",
+        }
+    except ValueError:
+        return False
 
 
 class ProcessSession:
@@ -139,11 +150,20 @@ class ProcessSession:
                     del self._stderr_tail[:-50]
                 url = _extract_auth_url(line)
                 if url:
+                    # mcp-remote prints both the provider authorization URL and
+                    # its localhost callback-listener URL. Never let the latter
+                    # replace the external URL the user actually needs to open.
+                    if (
+                        self.pending_auth_url
+                        and not _is_loopback_url(self.pending_auth_url)
+                        and _is_loopback_url(url)
+                    ):
+                        continue
                     self.pending_auth_url = url
                     pending_auth_urls[self.command] = url
                     print(
                         f"[mcpproxy] authorization required for "
-                        f"'{self.command}' — visit: {url}",
+                        f"'{self.command}' — authorization URL captured",
                         flush=True,
                     )
         except Exception:

@@ -155,6 +155,31 @@ class TestConsumeStderr:
         assert "booting mcp-remote" in "\n".join(session._stderr_tail)
 
     @pytest.mark.asyncio
+    async def test_callback_listener_url_does_not_replace_authorization_url(self):
+        lines = [
+            b"Please authorize by visiting: https://app.asana.com/-/oauth_authorize?c=1\n",
+            b"OAuth callback server listening at http://127.0.0.1:8887\n",
+            b"",
+        ]
+
+        class FakeStderr:
+            async def readline(self):
+                return lines.pop(0) if lines else b""
+
+        cmd = "npx -y mcp-remote https://mcp.asana.com/v2/mcp"
+        session = process_runner.ProcessSession(cmd)
+
+        class _Proc:
+            stderr = FakeStderr()
+
+        session._proc = _Proc()
+        await session._consume_stderr()
+
+        expected = "https://app.asana.com/-/oauth_authorize?c=1"
+        assert session.pending_auth_url == expected
+        assert process_runner.pending_auth_urls[cmd] == expected
+
+    @pytest.mark.asyncio
     async def test_clear_pending_auth_removes_registry_entry(self):
         cmd = "some-cmd"
         session = process_runner.ProcessSession(cmd)

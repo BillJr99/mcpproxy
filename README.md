@@ -560,6 +560,23 @@ callback is published only on host loopback (`127.0.0.1:8887`) and forwarded ins
 the container to `mcp-remote`'s loopback-only listener. Omit the callback mapping and
 forwarder setting if you have no OAuth-bridge providers.
 
+**Safe image upgrades:** pull `ghcr.io/billjr99/mcpproxy:latest`, recreate the
+container with the same mounts, named volumes, environment settings, and port mappings,
+then verify ports `8888`, `8889`, and loopback-only `8887`. Reusing
+`mcpproxy-mcp-auth:/app/.mcp-auth` is what preserves OAuth authorization across the
+replacement. Confirm the deployed source revision without reading environment values:
+
+```bash
+docker inspect mcpproxy \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+docker ps --filter name=mcpproxy \
+  --format '{{.Names}} {{.State}} {{.Ports}}'
+```
+
+If a stopped old container is retained temporarily for rollback, disable its restart
+policy or remove it after verification. Host watchdogs that start every stopped
+container can otherwise restart the rollback copy and cause port conflicts.
+
 Every volume above is optional — omit any subset and that path falls back to the
 container's ephemeral writable layer. See **[Volumes & caching](#volumes--caching)**
 below for what each one covers and the cold-start speedup it provides.
@@ -1270,7 +1287,7 @@ does not require another grant.
 #### One-time authorization and headless use
 
 1. Trigger an Asana tool or let startup warm the bridge. mcpproxy surfaces the authorization
-   link in its UI and logs.
+   link in the pending-auth UI without writing the sensitive URL to normal logs.
 2. Open the link in a browser running on the same machine as Docker, approve access, and let
    Asana redirect to `http://localhost:8887/oauth/callback`.
 3. If authorization is completed on another device, its `localhost` is that device, not the

@@ -342,14 +342,15 @@ single call can't flood the model's context — tune or disable via `MCPPROXY_RE
 
 ### Authentication
 
-The `auth.type` field selects how requests are authenticated. Secrets are referenced by
-**environment-variable name** (the `*_env` fields) and filled in via the Secrets UI / `.env` —
-never written into the YAML.
+The `auth.type` field selects how requests are authenticated. Secrets are normally referenced
+by **environment-variable name** (the `*_env` fields) and filled in via the Secrets UI / `.env`.
+Bearer tokens may instead be read from a protected file with `token_file`. Secret values are
+never written directly into provider YAML.
 
 | `auth.type` | Fields | Behaviour |
 |---|---|---|
 | `none` | — | No authentication. |
-| `bearer` | `token_env` | Sends `Authorization: Bearer <env>`. |
+| `bearer` | Exactly one of `token_env` or `token_file` | Adds the standard bearer `Authorization` header. `token_file` is read at request time and surrounding whitespace is removed. |
 | `api_key` | `value_env`, plus either `header` (default `X-Api-Key`) or `in: query` + `name` | Sends the secret in a custom header, or as a query parameter when `in: query`. |
 | `client_credentials` | `token_url`, `client_id_env`, `client_secret_env`, `scopes` | OAuth2 client-credentials. Token is fetched, cached, and auto-refreshed on expiry/401. |
 | `authorization_code` | `authorize_url`, `token_url`, `client_id_env`, `client_secret_env` (optional for PKCE), `scopes` | Interactive OAuth2 + PKCE. Click **🔐 Authorize** in the editor to complete the browser flow; tokens are cached and refreshed automatically. |

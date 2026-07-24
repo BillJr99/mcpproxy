@@ -353,6 +353,18 @@ class TestResolveRestAuth:
         headers, _ = self._apply({"type": "bearer", "token_env": "MY_TOKEN"})
         assert headers["Authorization"] == "Bearer xyz"
 
+    def test_bearer_sets_authorization_from_protected_file(self, tmp_path):
+        token_file = tmp_path / "token"
+        token_file.write_text("file-token\n", encoding="utf-8")
+        headers, _ = self._apply({"type": "bearer", "token_file": str(token_file)})
+        assert headers["Authorization"] == "Bearer file-token"
+
+    def test_bearer_rejects_empty_token_file(self, tmp_path):
+        token_file = tmp_path / "token"
+        token_file.write_text("\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="empty"):
+            self._apply({"type": "bearer", "token_file": str(token_file)})
+
     def test_api_key_sets_custom_header_from_env(self, monkeypatch):
         monkeypatch.setenv("MY_KEY", "k1")
         headers, _ = self._apply({"type": "api_key", "header": "X-Api-Key", "value_env": "MY_KEY"})

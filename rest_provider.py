@@ -90,6 +90,31 @@ def _require_env(env_name: str) -> str:
     return value
 
 
+def _require_bearer_token(auth: dict[str, Any]) -> str:
+    """Resolve a bearer token from exactly one environment variable or file.
+
+    File-backed tokens let deployments mount a protected secret without copying
+    its value into YAML, command arguments, or the container environment.
+    """
+    env_name = auth.get("token_env")
+    file_name = auth.get("token_file")
+    if bool(env_name) == bool(file_name):
+        raise RuntimeError(
+            "Bearer auth requires exactly one of token_env or token_file"
+        )
+    if env_name:
+        return _require_env(env_name)
+
+    path = Path(str(file_name))
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read bearer token file: {path}") from exc
+    if not value:
+        raise RuntimeError(f"Bearer token file is empty: {path}")
+    return value
+
+
 def _loop_lock(holder: Any) -> asyncio.Lock:
     """Return an ``asyncio.Lock`` bound to the *current* running loop.
 
@@ -397,7 +422,7 @@ class _AuthResolver:
         if self.type == "none":
             return
         if self.type == "bearer":
-            headers["Authorization"] = f"Bearer {_require_env(self.auth['token_env'])}"
+            headers["Authorization"] = f"Bearer {_require_bearer_token(self.auth)}"
         elif self.type == "api_key":
             if self.auth.get("in") == "query":
                 return  # handled by apply_query

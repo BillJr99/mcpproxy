@@ -895,6 +895,21 @@ def _remote_bridge_commands() -> list[tuple[str, str, list[str]]]:
     return bridges
 
 
+def _declared_callback_ports() -> list[int]:
+    """Callback ports the configured mcp-remote bridges ask for.  Never raises."""
+    ports: list[int] = []
+    try:
+        from oauth_callback_relay import callback_port_from_command
+
+        for _name, command, _env_keys in _remote_bridge_commands():
+            port = callback_port_from_command(command)
+            if port and port not in ports:
+                ports.append(port)
+    except Exception as exc:  # noqa: BLE001 — forwarding is best-effort
+        print(f"[mcpproxy] could not read declared callback ports: {exc}")
+    return ports
+
+
 def _warm_remote_providers() -> None:
     """Introspect each mcp-remote bridge once at startup.
 
@@ -933,6 +948,58 @@ def _warm_remote_providers() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"_warm_remote_providers error: {exc}")
         traceback.print_exc()
+
+
+# How often to silently re-warm mcp-remote bridges.  mcp-remote refreshes an
+# access token when it is used, so a bridge nobody calls for days can let its
+# refresh token lapse and require a browser round-trip that a periodic touch
+# would have avoided.  0 disables the loop.
+REFRESH_INTERVAL_SECONDS = float(os.environ.get("MCPPROXY_REFRESH_INTERVAL", "3600"))
+
+
+def _refresh_remote_providers_forever() -> None:
+    """Keep mcp-remote bridges authenticated without the user noticing.
+
+    Each pass re-spawns every bridge that is not already mid-flow; mcp-remote
+    renews from its cached refresh token and exits quietly.  Only when it cannot
+    does it print an authorization URL, which is what surfaces the banner — so a
+    prompt reaching the user means autonomous renewal genuinely failed, not that
+    nothing was tried.
+
+    Bridges currently awaiting authorization are skipped rather than restarted:
+    re-spawning one would invalidate the link the user is part-way through and
+    strand the callback they are about to deliver.
+    """
+    import asyncio
+    import time
+
+    from process_runner import (
+        ConcurrentSpawnError,
+        introspect,
+        pending_auth_urls,
+    )
+
+    async def _refresh_all() -> None:
+        for name, command, env_keys in _remote_bridge_commands():
+            if command in pending_auth_urls:
+                continue  # a human is mid-flow; leave their link valid
+            try:
+                await introspect(command, env_keys=env_keys)
+            except ConcurrentSpawnError:
+                pass  # another spawn is already doing this work
+            except Exception as exc:  # noqa: BLE001 — best-effort renewal
+                print(f"[mcpproxy] refresh for provider '{name}' did not complete: {exc}")
+
+    while True:
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+        try:
+            asyncio.run(_refresh_all())
+        except Exception as exc:  # noqa: BLE001
+            print(f"_refresh_remote_providers_forever error: {exc}")
+
+
+def _refresh_remote_enabled() -> bool:
+    return _warm_remote_enabled() and REFRESH_INTERVAL_SECONDS > 0
 
 
 def _warm_remote_enabled() -> bool:
@@ -1048,10 +1115,21 @@ if __name__ == "__main__":
         # forwarders bridge the published port to that loopback listener.
         from callback_forwarder import start_callback_forwarders_from_env
 
-        _callback_forwarders = start_callback_forwarders_from_env()
+        # The UI first: starting a thread is instant, whereas the forwarder setup
+        # below resolves this host's addresses and can stall on DNS.  The web app
+        # must come up immediately and stay responsive while everything else
+        # initializes.
         ui_thread = threading.Thread(target=_run_ui, daemon=True, name="ui-server")
         ui_thread.start()
         print(f"UI server starting on http://{UI_HOST}:{UI_PORT}")
+        # Then the callback forwarders — still before anything slow (dependency
+        # installs, provider bootstrap, bridge warm-up), so a callback arriving
+        # during startup has a listener to reach.  Ports come from the
+        # environment *and* from what the providers declare, so the two cannot
+        # silently disagree.
+        _callback_forwarders = start_callback_forwarders_from_env(
+            _declared_callback_ports()
+        )
         if _PENDING_SPECS:
             # Run provider setup (pip / build / setup_commands) in the background
             # so the MCP server below starts serving immediately.  Until each
@@ -1072,6 +1150,12 @@ if __name__ == "__main__":
                 target=_warm_remote_providers, daemon=True, name="remote-warmup"
             )
             warm_thread.start()
+            if _refresh_remote_enabled():
+                threading.Thread(
+                    target=_refresh_remote_providers_forever,
+                    daemon=True,
+                    name="remote-refresh",
+                ).start()
             rest_warm_thread = threading.Thread(
                 target=_warm_rest_providers, daemon=True, name="rest-warmup"
             )

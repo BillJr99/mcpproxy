@@ -17,10 +17,34 @@ import select
 import socket
 import socketserver
 import threading
+import time
 from collections.abc import Iterable
 
 
 DEFAULT_IDLE_TIMEOUT_SECONDS = 30.0
+
+# How long to keep an arriving callback waiting for the loopback listener to
+# appear.  The forwarder binds at startup, but mcp-remote binds its callback
+# port only once its bridge reaches the OAuth step — so a callback that lands
+# while dependencies are still installing would otherwise hit an accepted
+# socket with nothing behind it and be dropped without trace.
+DEFAULT_UPSTREAM_WAIT_SECONDS = float(
+    os.environ.get("MCPPROXY_CALLBACK_WAIT_SECONDS", "60")
+)
+
+# Served when the wait elapses, so the browser shows a reason instead of an
+# empty reply.  A bare TCP close looks like a network fault to the user.
+_UNAVAILABLE_RESPONSE = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b"<h3>No authorization is in progress</h3>"
+    b"<p>mcpproxy is forwarding this port, but no bridge is currently waiting "
+    b"for a callback. Start the authorization again from the mcpproxy UI, then "
+    b"retry - or copy this page's URL and use "
+    b"<b>Paste callback URL</b> there.</p>"
+)
 
 # Forwarders currently relaying, for diagnostics only.  ``start_callback_forwarders``
 # is the sole registrar: a ``CallbackForwarder`` constructed directly (as the unit
@@ -100,20 +124,44 @@ class CallbackForwarder:
         port: int,
         *,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
+        upstream_wait: float = DEFAULT_UPSTREAM_WAIT_SECONDS,
     ) -> None:
         self.bind_host = bind_host
         self.port = port
         self.idle_timeout = idle_timeout
+        self.upstream_wait = upstream_wait
         target_port = port
         timeout = idle_timeout
+        wait = upstream_wait
 
         class Handler(socketserver.BaseRequestHandler):
+            def _connect_upstream(self) -> socket.socket | None:
+                """Connect to the loopback listener, waiting for it to appear.
+
+                An authorization code is single-use and short-lived: failing
+                fast here loses it outright, whereas the browser will happily
+                hold the connection for a few seconds while the bridge starts.
+                """
+                deadline = time.monotonic() + wait
+                delay = 0.05
+                while True:
+                    try:
+                        return socket.create_connection(
+                            ("127.0.0.1", target_port), timeout=timeout
+                        )
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            return None
+                        time.sleep(delay)
+                        delay = min(delay * 2, 1.0)
+
             def handle(self) -> None:
-                try:
-                    upstream = socket.create_connection(
-                        ("127.0.0.1", target_port), timeout=timeout
-                    )
-                except OSError:
+                upstream = self._connect_upstream()
+                if upstream is None:
+                    try:
+                        self.request.sendall(_UNAVAILABLE_RESPONSE)
+                    except OSError:
+                        pass
                     return
                 with upstream:
                     self.request.setblocking(False)
@@ -175,9 +223,21 @@ def start_callback_forwarders(ports: Iterable[int]) -> list[CallbackForwarder]:
     return started
 
 
-def start_callback_forwarders_from_env() -> list[CallbackForwarder]:
-    """Start ports named by ``MCPPROXY_CALLBACK_FORWARD_PORTS``."""
+def start_callback_forwarders_from_env(
+    extra_ports: Iterable[int] = (),
+) -> list[CallbackForwarder]:
+    """Start forwarders for ``MCPPROXY_CALLBACK_FORWARD_PORTS`` plus *extra_ports*.
+
+    *extra_ports* are the callback ports the configured providers actually
+    declare.  Forwarding those by default removes a standing trap: the port in a
+    provider's YAML, the published Docker port and this environment variable are
+    three independent settings, and nothing used to notice when they disagreed —
+    the callback simply never arrived.
+    """
     ports = parse_forward_ports(os.environ.get("MCPPROXY_CALLBACK_FORWARD_PORTS", ""))
+    for port in extra_ports:
+        if port not in ports:
+            ports.append(port)
     if not ports:
         return []
     forwarders = start_callback_forwarders(ports)

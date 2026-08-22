@@ -73,7 +73,12 @@ provider's `requirements`, and running its `setup_commands` (e.g.
 MCP server until all of that finishes, mcpproxy **registers every tool up front
 and runs the setup in the background**:
 
-- The MCP endpoint on `8888` and the UI on `8889` come up **immediately**.
+- The MCP endpoint on `8888` and the UI on `8889` come up **immediately**, and the UI
+  stays responsive throughout: slow work started from it (dependency installs, repository
+  clones, build commands) runs on worker threads rather than the request loop that also
+  serves the provider list, status polling and the pending-auth banner.
+- The OAuth callback forwarders bind before any of that, so an authorization callback
+  arriving mid-startup still has somewhere to land.
 - Every tool is advertised right away, so MCP clients see the full tool list at
   once.
 - A call to a tool whose provider is **still installing** returns a structured
@@ -1384,6 +1389,13 @@ The deployment must include both settings:
 Keep the host mapping on `127.0.0.1`; do not publish OAuth callback ports on all interfaces.
 `docker-compose.yml` includes the mapping and forwarder setting by default.
 
+Forwarders also start for any callback port a provider's command declares, so the YAML and
+`MCPPROXY_CALLBACK_FORWARD_PORTS` cannot silently disagree. They are started before dependency
+installs, provider bootstrap or bridge warm-up, and a callback arriving before its bridge has
+bound the port is held (up to `MCPPROXY_CALLBACK_WAIT_SECONDS`, default 60) rather than dropped —
+an authorization code is single-use, so failing fast would lose it. If the wait elapses, the
+browser gets a page explaining what happened instead of an empty reply.
+
 #### Verifying the callback chain
 
 `GET /api/oauth-callback-status` (also rendered under **Callback listener diagnostics** in the
@@ -1430,6 +1442,13 @@ does not require another grant.
    [Manual OAuth callback](#manual-oauth-callback).
 4. Verify `asana__get_me`, then recreate the container with the same auth volume and verify it
    again without reauthorization.
+
+mcpproxy also re-warms these bridges on an interval (`MCPPROXY_REFRESH_INTERVAL`, default
+3600 seconds; `0` disables). mcp-remote renews an access token when it is used, so a bridge
+nobody calls for days can let its refresh token lapse and force a browser round-trip that a
+periodic touch avoids. A bridge that is mid-authorization is skipped rather than restarted, so
+a link you are part-way through stays valid. Renewal only surfaces a prompt when it genuinely
+could not complete on its own.
 
 On startup mcpproxy warms configured `mcp-remote` bridges. With a valid cache, refresh is
 silent. If authorization is required, the UI shows a pending-auth banner. A provider's

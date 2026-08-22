@@ -374,6 +374,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     if rest_sub is not None:
         ptype = "rest"
         command = ""
+        pkg_env_keys = []
         repo_url = ""
         repo_ref = ""
         build_commands = []
@@ -388,6 +389,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         }
     elif repo_sub is not None:
         ptype = "repository"
+        pkg_env_keys = list((pkg_sub or {}).get("env_keys") or [])
         command = (pkg_sub.get("command") if pkg_sub else "") or ""
         command = command.strip()
         repo_url = (repo_sub.get("url") or "").strip()
@@ -398,6 +400,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     elif pkg_sub is not None:
         ptype = "package"
         command = (pkg_sub.get("command") or "").strip()
+        pkg_env_keys = list(pkg_sub.get("env_keys") or [])
         repo_url = ""
         repo_ref = ""
         build_commands = []
@@ -406,6 +409,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
     else:
         ptype = "code"
         command = ""
+        pkg_env_keys = []
         repo_url = ""
         repo_ref = ""
         build_commands = []
@@ -424,11 +428,28 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "repo_ref": repo_ref,
         "build_commands": build_commands,
         "repo_env_keys": repo_env_keys,
+        "pkg_env_keys": pkg_env_keys,
         "workdir": workdir,
         "rest": rest_out,
         "oauth": dict(spec.get("oauth") or {}),
         "tools": tools_out,
     }
+
+
+def _package_block(provider: dict[str, Any]) -> dict[str, Any]:
+    """Build the ``package:`` block, preserving declared env keys.
+
+    ``env_keys`` names variables re-read from MCP_ENV_FILE before each spawn —
+    needed when the command interpolates a secret itself, e.g.
+    ``mcp-remote --header Authorization:${TOKEN}``, where mcp-remote does the
+    substitution inside the child process.  It must survive an editor round-trip:
+    dropping it here silently breaks the provider on the next save.
+    """
+    block: dict[str, Any] = {"command": (provider.get("command") or "").strip()}
+    env_keys = [k for k in (provider.get("pkg_env_keys") or []) if k]
+    if env_keys:
+        block["env_keys"] = env_keys
+    return block
 
 
 def _structured_to_yaml(provider: dict[str, Any]) -> str:
@@ -466,9 +487,9 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
             rest_block["endpoints"] = endpoints
         spec["rest"] = rest_block
     elif ptype == "package":
-        spec["package"] = {"command": (provider.get("command") or "").strip()}
+        spec["package"] = _package_block(provider)
     elif ptype == "repository":
-        spec["package"] = {"command": (provider.get("command") or "").strip()}
+        spec["package"] = _package_block(provider)
         repo_block: dict[str, Any] = {
             "url": (provider.get("repo_url") or "").strip(),
         }
@@ -931,7 +952,8 @@ def create_app(
 
         pm = _detect_package_manager(command)
 
-        try:
+        def _prepare() -> None:
+            """Install requirements and run setup commands (blocking)."""
             # 1. Install pip requirements
             for req in requirements:
                 if not req:
@@ -940,12 +962,17 @@ def create_app(
                     [sys.executable, "-m", "pip", "install", req],
                     check=True,
                 )
-
             # 2. Run setup commands (in cwd when one is supplied — e.g. a repo workdir)
             for cmd in setup_commands:
                 if not cmd:
                     continue
                 subprocess.run(shlex.split(cmd), check=True, cwd=cwd)
+
+        try:
+            # Off the event loop: a pip install can take minutes, and the UI
+            # serves the provider list, status polling and the pending-auth
+            # banner from this same loop — blocking it freezes the whole page.
+            await asyncio.to_thread(_prepare)
 
             # 3. Introspect the MCP server
             from process_runner import introspect
@@ -1386,7 +1413,8 @@ def create_app(
         # caused by missing .env values, and the user needs the discovered
         # env_keys back so they can populate secrets and retry on next
         # restart (when materialize_repository writes .env first).
-        try:
+        def _clone() -> None:
+            """Clone or fast-forward the repo (blocking)."""
             Path(workdir).parent.mkdir(parents=True, exist_ok=True)
             if (Path(workdir) / ".git").exists():
                 subprocess.run(["git", "-C", workdir, "pull", "--ff-only"], check=True)
@@ -1394,6 +1422,10 @@ def create_app(
                 subprocess.run(["git", "clone", url, workdir], check=True)
             if ref:
                 subprocess.run(["git", "-C", workdir, "checkout", ref], check=True)
+
+        try:
+            # Cloning a large repo would otherwise stall every other UI request.
+            await asyncio.to_thread(_clone)
         except Exception as exc:
             traceback.print_exc()
             return {
@@ -1420,7 +1452,9 @@ def create_app(
             if not cmd:
                 continue
             try:
-                subprocess.run(shlex.split(cmd), check=True, cwd=workdir)
+                await asyncio.to_thread(
+                    subprocess.run, shlex.split(cmd), check=True, cwd=workdir
+                )
             except Exception as exc:
                 traceback.print_exc()
                 return {
@@ -2295,6 +2329,20 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             style="font-size:.875em"
             onblur="discoverFunctions().catch(() => {})">
           <div class="mt-2 text-muted" style="font-size:.8em">Any command that spawns a stdio MCP server: <code>npx</code>, <code>uvx</code>, <code>python -m</code>, or an installed binary. The process is started on demand and kept alive between calls.</div>
+          <div class="mt-3">
+            <label class="form-label d-flex justify-content-between align-items-center">
+              <span>Environment variables <span class="text-muted fw-normal" style="text-transform:none">— names only; values live in 🔑 Secrets</span></span>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="addPkgEnvKey()">+ Add variable</button>
+            </label>
+            <div id="pkg-env-keys-container"></div>
+            <div class="text-muted mt-1" style="font-size:.8em">
+              Re-read from <code>.env</code> before every spawn, so a value you change in
+              <b>🔑 Secrets</b> takes effect on the next spawn instead of only after a container
+              restart. Needed when the command interpolates a secret itself — e.g.
+              <code>mcp-remote --header Authorization:${TOKEN}</code>, where mcp-remote does the
+              substitution inside the child process and so reads the child's own environment.
+            </div>
+          </div>
         </div>
 
         <!-- Repository box -->
@@ -3466,7 +3514,8 @@ async function discoverFunctions() {
         requirements: currentProvider.requirements || [],
         setup_commands: currentProvider.setup_commands || [],
         cwd: isRepo ? (currentProvider.workdir || '') : '',
-        env_keys: isRepo ? (currentProvider.repo_env_keys || []) : [],
+        env_keys: [...(isRepo ? (currentProvider.repo_env_keys || []) : []),
+                   ...(currentProvider.pkg_env_keys || [])].filter(k => k && k.trim()),
       });
       if (!r.ok) throw new Error(r.error || 'introspection failed');
       knownFunctions = (r.tools || []).map(t => t.name).filter(Boolean);
@@ -3588,6 +3637,7 @@ function renderProvider(p) {
 
   if (isPkg) {
     document.getElementById('f-command').value = p.command || '';
+    renderPkgEnvKeys(p.pkg_env_keys || []);
     const isRemote = /\bmcp-remote\b/.test(p.command || '');
     document.getElementById('reauth-btn').style.display =
       (isRemote && webTerminalEnabled) ? '' : 'none';
@@ -3956,6 +4006,35 @@ function renderEnvKeys(keys) {
     </div>`).join('');
 }
 
+function renderPkgEnvKeys(keys) {
+  const c = document.getElementById('pkg-env-keys-container');
+  if (!keys.length) { c.innerHTML = ''; return; }
+  c.innerHTML = keys.map((k, i) => `
+    <div class="list-row" id="pk-row-${i}">
+      <input class="form-control form-control-sm font-monospace" placeholder="MY_API_TOKEN"
+        value="${esc(k)}" oninput="updatePkgEnvKey(${i},this.value)">
+      <button class="btn-icon" onclick="removePkgEnvKey(${i})" title="Remove">✕</button>
+    </div>`).join('');
+}
+
+function addPkgEnvKey() {
+  ensureProvider();
+  currentProvider.pkg_env_keys = currentProvider.pkg_env_keys || [];
+  currentProvider.pkg_env_keys.push('');
+  renderPkgEnvKeys(currentProvider.pkg_env_keys);
+}
+
+function removePkgEnvKey(i) {
+  ensureProvider();
+  currentProvider.pkg_env_keys.splice(i, 1);
+  renderPkgEnvKeys(currentProvider.pkg_env_keys);
+}
+
+function updatePkgEnvKey(i, val) {
+  ensureProvider();
+  currentProvider.pkg_env_keys[i] = val.trim();
+}
+
 function addEnvKey() {
   ensureProvider();
   currentProvider.repo_env_keys = currentProvider.repo_env_keys || [];
@@ -4267,8 +4346,10 @@ function collectProvider() {
     p.repo_ref = document.getElementById('f-repo-ref').value.trim();
     p.build_commands = (currentProvider.build_commands || []).filter(c => c.trim());
     p.repo_env_keys = (currentProvider.repo_env_keys || []).filter(k => k.trim());
+    p.pkg_env_keys = (currentProvider.pkg_env_keys || []).filter(k => k.trim());
   } else if (p.type === 'package') {
     p.command = document.getElementById('f-command').value.trim();
+    p.pkg_env_keys = (currentProvider.pkg_env_keys || []).filter(k => k.trim());
   } else if (p.type === 'rest') {
     // auth + endpoints are carried in currentProvider.rest; base URL comes from
     // the field, and the header rows are serialized back into a plain object.

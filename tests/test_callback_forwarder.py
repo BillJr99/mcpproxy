@@ -2,6 +2,7 @@
 
 import socket
 import threading
+import time
 
 import pytest
 
@@ -151,3 +152,119 @@ class TestActiveForwarderRegistry:
         finally:
             blocker.close()
         assert active_forwarders() == []
+
+
+class TestUpstreamWait:
+    """An authorization code is single-use and short-lived. The forwarder binds
+    at startup but mcp-remote binds its callback port only once its bridge
+    reaches the OAuth step, so failing fast loses the code outright."""
+
+    def _free_port(self) -> int:
+        with socket.socket() as probe:
+            probe.bind(("", 0))
+            return probe.getsockname()[1]
+
+    def test_waits_for_a_listener_that_appears_late(self):
+        bind_host = non_loopback_ipv4_addresses()[0]
+        port = self._free_port()
+        forwarder = CallbackForwarder(bind_host, port, upstream_wait=5).start()
+        received: list[bytes] = []
+
+        def serve_late():
+            time.sleep(0.75)          # bridge is still starting
+            target = socket.socket()
+            target.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            target.bind(("127.0.0.1", port))
+            target.listen(1)
+            conn, _ = target.accept()
+            with conn:
+                received.append(conn.recv(1024))
+                conn.sendall(b"callback-ok")
+            target.close()
+
+        thread = threading.Thread(target=serve_late, daemon=True)
+        thread.start()
+        try:
+            with socket.create_connection((bind_host, port), timeout=10) as client:
+                client.sendall(b"GET /oauth/callback?code=abc HTTP/1.1\r\n\r\n")
+                assert client.recv(1024) == b"callback-ok"
+            thread.join(timeout=5)
+            assert b"code=abc" in received[0]
+        finally:
+            forwarder.stop()
+
+    def test_explains_itself_when_nothing_ever_listens(self):
+        bind_host = non_loopback_ipv4_addresses()[0]
+        port = self._free_port()
+        forwarder = CallbackForwarder(bind_host, port, upstream_wait=0.2).start()
+        try:
+            with socket.create_connection((bind_host, port), timeout=5) as client:
+                client.sendall(b"GET /oauth/callback?code=abc HTTP/1.1\r\n\r\n")
+                body = b""
+                while True:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    body += chunk
+            # A bare TCP close reads as a network fault; say what happened.
+            assert b"503" in body
+            assert b"Paste callback URL" in body
+        finally:
+            forwarder.stop()
+
+
+class TestDeclaredPortForwarding:
+    def test_env_and_declared_ports_are_unioned(self, monkeypatch):
+        created = []
+
+        class FakeForwarder:
+            def __init__(self, host, port):
+                self.bind_host = host
+                self.port = port
+                created.append(port)
+
+            def start(self):
+                return self
+
+            def stop(self):
+                callback_forwarder._active_forwarders.remove(self)
+
+        monkeypatch.setattr("callback_forwarder.CallbackForwarder", FakeForwarder)
+        monkeypatch.setattr(
+            "callback_forwarder.non_loopback_ipv4_addresses", lambda: ["172.18.0.2"]
+        )
+        monkeypatch.setenv("MCPPROXY_CALLBACK_FORWARD_PORTS", "8887")
+        started = callback_forwarder.start_callback_forwarders_from_env([8887, 9100])
+        try:
+            # 8887 is declared in both places and must not be started twice.
+            assert created == [8887, 9100]
+        finally:
+            for f in started:
+                f.stop()
+
+    def test_declared_ports_alone_are_enough(self, monkeypatch):
+        created = []
+
+        class FakeForwarder:
+            def __init__(self, host, port):
+                self.bind_host = host
+                self.port = port
+                created.append(port)
+
+            def start(self):
+                return self
+
+            def stop(self):
+                callback_forwarder._active_forwarders.remove(self)
+
+        monkeypatch.setattr("callback_forwarder.CallbackForwarder", FakeForwarder)
+        monkeypatch.setattr(
+            "callback_forwarder.non_loopback_ipv4_addresses", lambda: ["172.18.0.2"]
+        )
+        monkeypatch.delenv("MCPPROXY_CALLBACK_FORWARD_PORTS", raising=False)
+        started = callback_forwarder.start_callback_forwarders_from_env([8887])
+        try:
+            assert created == [8887]
+        finally:
+            for f in started:
+                f.stop()

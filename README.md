@@ -359,6 +359,27 @@ For `authorization_code`, register the redirect URI **`<MCPPROXY_OAUTH_REDIRECT_
 (default `http://localhost:8889/oauth/callback`) with your OAuth provider. Tokens are cached
 under `MCPPROXY_REST_AUTH_DIR` (default `/app/.rest-auth`, gitignored).
 
+Both bearer credential sources are editable in the UI — the provider editor and the **New
+Provider** wizard each offer a *Token env var* and a *…or token file* field, and exactly one
+must be set.
+
+Filling in the credentials: the **🔑 Secrets** dialog lists a REST provider's auth secrets
+alongside its per-tool ones, so `token_env` / `value_env` / `client_id_env` /
+`client_secret_env` can be written to `.env` from the browser. When a provider uses
+`token_file`, the same dialog shows the declared path with a ✓/✗ indicator and writes the
+value there directly (mode `0600`) — the path always comes from the provider YAML, never
+from the browser, and must resolve inside a mounted root (`tools` / `files` / `repos`) or
+`MCPPROXY_REST_AUTH_DIR`.
+
+**⟳ Refresh auth** (next to 🔑 Secrets, and in the Secrets dialog) forces the credential to be
+re-resolved on demand:
+
+| Auth | What the button does |
+|---|---|
+| `client_credentials`, `authorization_code` | Fetches a fresh token immediately. If re-consent is needed, it returns the authorize URL and opens it rather than failing. |
+| `bearer`, `api_key` | Nothing to refresh — but the env var or token file is re-read, so you get a straight answer about whether the credential is actually readable. |
+| top-level `oauth:` block | Exchanges the stored `refresh_token` for a new access token and rewrites `token_file` in place. |
+
 ### Example
 
 ```yaml

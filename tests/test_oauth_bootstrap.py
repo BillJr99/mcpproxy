@@ -260,6 +260,74 @@ class TestCompleteGoogle:
 # Dispatch through AuthCodeTokenStore.complete_authorization (shared callback)
 # ---------------------------------------------------------------------------
 
+class TestRefreshProvider:
+    """`refresh_provider` swaps the stored refresh_token for a new access token
+    and rewrites token_file in the same shape the code exchange writes."""
+
+    def _seed_token(self, oauth_cfg, **overrides):
+        record = {
+            "token": "old-at",
+            "refresh_token": "rt-456",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "abc.apps.googleusercontent.com",
+            "client_secret": "shhh",
+            "scopes": list(oauth_cfg["scopes"]),
+            "universe_domain": "googleapis.com",
+            "account": "",
+            "expiry": "2020-01-01T00:00:00.000000Z",
+        }
+        record.update(overrides)
+        path = Path(oauth_cfg["token_file"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path
+
+    def test_refreshes_and_rewrites_token_file(self, oauth_cfg, http_recorder):
+        token_file = self._seed_token(oauth_cfg)
+        http_recorder["responses"].append(FakeResponse(json_data={
+            "access_token": "at-new", "expires_in": 3600,
+            "scope": " ".join(oauth_cfg["scopes"]),
+        }))
+        result = asyncio.run(oauth_bootstrap.refresh_provider("gmail-filters", oauth_cfg))
+
+        call = http_recorder["calls"][0]
+        assert call["url"] == "https://oauth2.googleapis.com/token"
+        assert call["data"]["grant_type"] == "refresh_token"
+        assert call["data"]["refresh_token"] == "rt-456"
+        assert call["data"]["client_secret"] == "shhh"
+
+        record = json.loads(token_file.read_text())
+        assert record["token"] == "at-new"
+        # a refresh response omits refresh_token — the old one must survive
+        assert record["refresh_token"] == "rt-456"
+        assert record["client_id"] == "abc.apps.googleusercontent.com"
+        assert record["expiry"].endswith("Z")
+        assert result["expiry"] == record["expiry"]
+
+    def test_rotated_refresh_token_is_stored(self, oauth_cfg, http_recorder):
+        token_file = self._seed_token(oauth_cfg)
+        http_recorder["responses"].append(FakeResponse(json_data={
+            "access_token": "at-new", "refresh_token": "rt-rotated", "expires_in": 3600,
+        }))
+        asyncio.run(oauth_bootstrap.refresh_provider("gmail-filters", oauth_cfg))
+        assert json.loads(token_file.read_text())["refresh_token"] == "rt-rotated"
+
+    def test_missing_token_file_points_at_authorize(self, oauth_cfg):
+        with pytest.raises(RuntimeError, match="Authorize"):
+            asyncio.run(oauth_bootstrap.refresh_provider("gmail-filters", oauth_cfg))
+
+    def test_no_refresh_token_points_at_authorize(self, oauth_cfg):
+        self._seed_token(oauth_cfg, refresh_token="")
+        with pytest.raises(RuntimeError, match="refresh_token"):
+            asyncio.run(oauth_bootstrap.refresh_provider("gmail-filters", oauth_cfg))
+
+    def test_unsupported_type_rejected(self, oauth_cfg):
+        with pytest.raises(ValueError):
+            asyncio.run(
+                oauth_bootstrap.refresh_provider("x", {**oauth_cfg, "type": "dropbox"})
+            )
+
+
 class TestCallbackDispatch:
     def test_google_flow_routed_to_oauth_bootstrap(self, oauth_cfg):
         state, _ = _begin_and_get_flow(oauth_cfg)

@@ -2360,6 +2360,12 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
     title="Authorizing from another machine? Paste the callback URL here">📋 Paste callback URL</button>
 </div>
 
+<!-- Provider bridge failures (credential rejected, dependency missing, …) -->
+<div id="bridge-banner" class="restart-bar" style="display:none;background:#2a1a1a;border-color:#f38ba860;border-radius:0;margin:0">
+  <span style="color:var(--red)">⚠</span>
+  <span id="bridge-banner-msg" style="color:#cdd6f4;font-size:.875em"></span>
+</div>
+
 <!-- Toast -->
 <div class="toast-container position-fixed top-0 end-0 p-3" style="z-index:9999">
   <div id="toast" class="toast text-white border-0" role="alert">
@@ -3517,6 +3523,7 @@ async function pollProviderStatus() {
   } catch { return; }
   // Remove ⏳ badges the moment a provider flips to READY, however long it took.
   updateStatusBadges();
+  updateBridgeBanner();
   // Stop polling once every provider has settled. Setup state never returns to
   // pending without a restart, but bridge health does move on its own — a spawn
   // can recover or fail after setup settles — so keep ticking while any bridge
@@ -3527,6 +3534,19 @@ async function pollProviderStatus() {
     clearInterval(_statusPollTimer);
     _statusPollTimer = null;
   }
+}
+
+function updateBridgeBanner() {
+  const banner = document.getElementById('bridge-banner');
+  const broken = Object.entries(_providerStatus)
+    .filter(([, st]) => st && st.bridge_error)
+    .map(([name, st]) => `<b>${esc(name)}</b>: ${esc(st.bridge_error)}`);
+  if (!broken.length) { banner.style.display = 'none'; return; }
+  // A badge on a row is easy to miss when the provider is not selected; a
+  // credential that is silently wrong should be visible on arrival.
+  document.getElementById('bridge-banner-msg').innerHTML =
+    `${broken.length} provider(s) could not start: ${broken.join(' · ')}`;
+  banner.style.display = '';
 }
 
 function updateStatusBadges() {

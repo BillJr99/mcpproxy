@@ -11,6 +11,18 @@ import pytest
 import process_runner
 
 
+class _NullStdin:
+    """Accepts writes and drains instantly — the tests below exercise the read
+    side, but _request has to send before it can wait."""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        return None
+
+
+
 class TestProcessSessionCwd:
     def test_session_stores_cwd(self):
         s = process_runner.ProcessSession("echo hi", cwd="/some/path")
@@ -93,20 +105,19 @@ class TestIntrospectStderrCapture:
 
     @pytest.mark.asyncio
     async def test_eof_error_includes_stderr_tail(self):
-        class FakeStdout:
-            async def readline(self):
-                return b""
+        import asyncio
+
+        reader = asyncio.StreamReader(limit=process_runner.STREAM_LIMIT)
+        reader.feed_eof()
 
         session = process_runner.ProcessSession("does-not-matter")
-        # Simulate what the background reader would have captured.
+        # Simulate what the background stderr reader would have captured.
         session._stderr_tail = ["Environment validation failed: KEY: Required"]
-        class _Proc:
-            stdout = FakeStdout()
-            stderr = None
-        session._proc = _Proc()
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
 
         with pytest.raises(EOFError) as exc_info:
-            await session._recv(timeout=1.0)
+            await session._request("tools/list", {}, timeout=5)
         assert "Environment validation failed" in str(exc_info.value)
 
 
@@ -318,8 +329,9 @@ class TestStreamLimit:
         reader.feed_data(payload.encode() + b"\n")
 
         session = process_runner.ProcessSession("irrelevant")
-        session._proc = SimpleNamespace(stdout=reader)
-        message = await session._recv(timeout=5)
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
+        message = await session._request("tools/list", {}, timeout=5)
         assert len(message["result"]["x"]) == size
 
     @pytest.mark.asyncio
@@ -340,9 +352,10 @@ class TestStreamLimit:
         reader.feed_data(b"z" * 8192 + b"\n")
 
         session = process_runner.ProcessSession("irrelevant")
-        session._proc = SimpleNamespace(stdout=reader)
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
         with pytest.raises(RuntimeError, match="MCPPROXY_STREAM_LIMIT"):
-            await session._recv(timeout=5)
+            await session._request("tools/list", {}, timeout=5)
 
     @pytest.mark.asyncio
     async def test_spawn_passes_the_raised_limit(self, monkeypatch):
@@ -728,3 +741,198 @@ class TestRefreshDoesNotBlankHealthyStatus:
             assert cmd in process_runner.authenticated_commands
         finally:
             await session.close()
+
+
+class TestResponseCorrelation:
+    """A line off stdout is not necessarily the reply to the request just sent.
+    Reading positionally made the first line the "response", and every later
+    call was then answered by the previous call's reply — permanently."""
+
+    @staticmethod
+    def _session(feed: bytes, eof: bool = False) -> process_runner.ProcessSession:
+        reader = asyncio.StreamReader(limit=process_runner.STREAM_LIMIT)
+        reader.feed_data(feed)
+        if eof:
+            reader.feed_eof()
+        session = process_runner.ProcessSession("correlation-test")
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_a_notification_is_not_mistaken_for_the_reply(self):
+        # Servers emit logging/progress notifications whenever they like.
+        feed = (
+            b'{"jsonrpc":"2.0","method":"notifications/message",'
+            b'"params":{"level":"info","data":"working"}}\n'
+            b'{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"real"}]}}\n'
+        )
+        session = self._session(feed)
+        result = await session._request("tools/list", {}, timeout=5)
+        assert result["result"]["tools"][0]["name"] == "real"
+
+    @pytest.mark.asyncio
+    async def test_non_json_output_does_not_break_the_call(self):
+        # A wrapper script writing a banner to stdout used to raise
+        # JSONDecodeError straight out of whichever call was in flight.
+        feed = (
+            b"npm notice New major version of npm available!\n"
+            b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
+        )
+        session = self._session(feed)
+        result = await session._request("tools/list", {}, timeout=5)
+        assert result["result"]["ok"] is True
+        assert session._stdout_noise  # kept for diagnostics, bounded
+
+    @pytest.mark.asyncio
+    async def test_replies_are_matched_by_id_not_by_arrival_order(self):
+        # Out-of-order replies must each reach their own caller.
+        reader = asyncio.StreamReader(limit=process_runner.STREAM_LIMIT)
+        session = process_runner.ProcessSession("out-of-order")
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
+
+        first_call = asyncio.ensure_future(session._request("a", {}, timeout=5))
+        second_call = asyncio.ensure_future(session._request("b", {}, timeout=5))
+        # Feed only once both are actually waiting; a real server cannot reply
+        # before the request is sent, so pre-feeding would test nothing.
+        while len(session._pending) < 2:
+            await asyncio.sleep(0)
+
+        reader.feed_data(b'{"jsonrpc":"2.0","id":2,"result":{"which":"second"}}\n')
+        reader.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{"which":"first"}}\n')
+        first, second = await asyncio.gather(first_call, second_call)
+        assert first["result"]["which"] == "first"
+        assert second["result"]["which"] == "second"
+
+    @pytest.mark.asyncio
+    async def test_a_reply_that_arrives_after_a_timeout_is_discarded(self):
+        # The off-by-one that never recovered: a late reply must not become the
+        # next caller's answer.
+        reader = asyncio.StreamReader(limit=process_runner.STREAM_LIMIT)
+        session = process_runner.ProcessSession("late-reply")
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await session._request("slow", {}, timeout=0.1)
+
+        # id 1's reply turns up now, unwanted; id 2 is the live request.
+        reader.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{"which":"stale"}}\n')
+        await asyncio.sleep(0.05)
+        reader.feed_data(b'{"jsonrpc":"2.0","id":2,"result":{"which":"fresh"}}\n')
+        result = await session._request("next", {}, timeout=5)
+        assert result["result"]["which"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_stdout_closing_fails_everyone_still_waiting(self):
+        session = self._session(b"", eof=True)
+        with pytest.raises(EOFError):
+            await session._request("tools/list", {}, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_closing_the_session_releases_a_waiting_caller(self):
+        reader = asyncio.StreamReader(limit=process_runner.STREAM_LIMIT)
+        session = process_runner.ProcessSession("closed-mid-call")
+        session._proc = SimpleNamespace(stdout=reader, stdin=_NullStdin())
+        session._start_stdout_reader()
+
+        async def close_soon():
+            await asyncio.sleep(0.05)
+            session._fail_pending(EOFError("MCP session closed"))
+
+        asyncio.ensure_future(close_soon())
+        with pytest.raises(EOFError, match="closed"):
+            await session._request("tools/list", {}, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_noise_buffer_is_bounded(self):
+        session = process_runner.ProcessSession("noisy")
+        for i in range(50):
+            session._note_noise(f"line {i}")
+        assert len(session._stdout_noise) == 10
+
+
+GH_COMMAND = (
+    "npx -y mcp-remote https://api.githubcopilot.com/mcp/ "
+    "--header Authorization:${GITHUB_MCP_AUTH_HEADER} --header X-MCP-Toolsets:all"
+)
+
+
+class TestHeaderCredentialChecks:
+    """mcp-remote warns only when a variable is unset. Set-but-empty and
+    quote-wrapped values both reach the server as a broken header, and the 401
+    comes back disguised as an unrelated OAuth failure."""
+
+    def test_finds_the_variables_a_command_interpolates(self):
+        assert process_runner.header_env_vars(GH_COMMAND) == [
+            ("Authorization", "GITHUB_MCP_AUTH_HEADER")
+        ]
+
+    def test_a_command_with_no_interpolated_headers(self):
+        assert process_runner.header_env_vars("npx -y mcp-remote https://x/mcp") == []
+
+    def test_unset_is_reported(self):
+        msg = process_runner.check_header_credentials(GH_COMMAND, {})
+        assert "GITHUB_MCP_AUTH_HEADER is not set" in msg
+        assert "package.env_keys" in msg
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_set_but_empty_is_reported(self, value):
+        msg = process_runner.check_header_credentials(
+            GH_COMMAND, {"GITHUB_MCP_AUTH_HEADER": value}
+        )
+        assert "set but empty" in msg
+
+    @pytest.mark.parametrize("value", ['"Bearer ghp_x"', "'Bearer ghp_x'"])
+    def test_quoted_values_are_reported(self, value):
+        msg = process_runner.check_header_credentials(
+            GH_COMMAND, {"GITHUB_MCP_AUTH_HEADER": value}
+        )
+        assert "wrapped in quotes" in msg
+
+    def test_a_usable_value_passes(self):
+        assert process_runner.check_header_credentials(
+            GH_COMMAND, {"GITHUB_MCP_AUTH_HEADER": "Bearer ghp_realtoken"}
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_a_broken_credential_fails_before_spawning(self, monkeypatch):
+        spawned = []
+
+        async def fake_exec(*args, **kwargs):
+            spawned.append(args)
+            raise AssertionError("should not have spawned")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.delenv("GITHUB_MCP_AUTH_HEADER", raising=False)
+        session = process_runner.ProcessSession(GH_COMMAND)
+        try:
+            with pytest.raises(RuntimeError, match="is not set"):
+                await session._start()
+            assert spawned == []
+            assert "GITHUB_MCP_AUTH_HEADER" in process_runner.bridge_errors[GH_COMMAND]
+        finally:
+            process_runner.bridge_errors.pop(GH_COMMAND, None)
+
+
+class TestRejectedCredentialClassification:
+    """A bridge that already sends a credential and then falls back to OAuth was
+    told to register an OAuth client — which is the wrong direction entirely."""
+
+    DCR = (
+        "Fatal error: Error: Incompatible auth server: does not support "
+        "dynamic client registration"
+    )
+
+    def test_names_the_credential_when_the_bridge_sends_one(self):
+        msg = process_runner._classify_failure([self.DCR], GH_COMMAND)
+        assert "rejected the credential" in msg
+        assert "GITHUB_MCP_AUTH_HEADER" in msg
+        assert "static-oauth-client-info" not in msg
+
+    def test_still_suggests_a_static_client_when_there_is_no_credential(self):
+        msg = process_runner._classify_failure(
+            [self.DCR], "npx -y mcp-remote https://mcp.example.com/mcp"
+        )
+        assert "--static-oauth-client-info" in msg

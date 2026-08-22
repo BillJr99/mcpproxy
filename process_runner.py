@@ -140,7 +140,45 @@ _FAILURE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
-def _classify_failure(lines: list[str]) -> str | None:
+# `--header Authorization:${TOKEN}` — mcp-remote substitutes ${...} itself,
+# inside the child, so the variable has to be in the child's environment.
+_HEADER_ENV_RE = re.compile(r"--header[=\s]+([A-Za-z0-9-]+):\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def header_env_vars(command: str) -> list[tuple[str, str]]:
+    """Return ``(header_name, env_var)`` for every header the command fills in."""
+    return _HEADER_ENV_RE.findall(command)
+
+
+def check_header_credentials(command: str, env: dict[str, str]) -> str | None:
+    """Return an actionable complaint about a header credential, or None.
+
+    mcp-remote warns only when a variable is *unset*.  Set-but-empty sends an
+    empty header, and a value the shell never unquoted sends the quotes along —
+    both of which the server rejects with a 401 that mcp-remote then reports as
+    an unrelated OAuth failure.
+    """
+    for header, var in header_env_vars(command):
+        value = env.get(var)
+        if value is None:
+            return (
+                f"{var} is not set, so the {header} header would be sent empty. "
+                "Add it to .env and declare it under the provider's package.env_keys."
+            )
+        if not value.strip():
+            return (
+                f"{var} is set but empty, so the {header} header carries no "
+                "credential. Put the full header value in it."
+            )
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            return (
+                f"{var} is wrapped in quotes, which are sent as part of the "
+                f"{header} header. Store the value without surrounding quotes."
+            )
+    return None
+
+
+def _classify_failure(lines: list[str], command: str = "") -> str | None:
     """Return an actionable explanation for a bridge failure, if one is known.
 
     Patterns are tried in table order, not log order, because the last error a
@@ -153,6 +191,20 @@ def _classify_failure(lines: list[str]) -> str | None:
         for line in lines:
             m = pattern.search(line)
             if m:
+                if "dynamic client registration" in pattern.pattern and header_env_vars(
+                    command
+                ):
+                    # This bridge does send a credential, so falling back to
+                    # OAuth means the server rejected it.  Telling the user to
+                    # register an OAuth client would send them the wrong way.
+                    names = ", ".join(var for _h, var in header_env_vars(command))
+                    return (
+                        "The server rejected the credential and fell back to "
+                        f"OAuth, which it does not support. Check the value of "
+                        f"{names}: it must be the complete header value (for a "
+                        "bearer token, including the 'Bearer ' prefix), unexpired, "
+                        "and scoped for this server."
+                    )
                 return template.format(*m.groups())
     return None
 
@@ -236,6 +288,11 @@ class ProcessSession:
         self._stderr_task: asyncio.Task | None = None
         # Authorization URL most recently printed by the subprocess, if any.
         self.pending_auth_url: str | None = None
+        # Replies are matched to requests by JSON-RPC id, so a notification or a
+        # late reply cannot be mistaken for the answer to the current call.
+        self._pending: dict[int, asyncio.Future] = {}
+        self._stdout_task: asyncio.Task | None = None
+        self._stdout_noise: list[str] = []
         # mcp-remote holds the handshake open for its own --auth-timeout.
         # Abandoning initialize before then kills the OAuth callback listener
         # out from under a user who is still authorizing — and out from under
@@ -270,25 +327,97 @@ class ProcessSession:
             suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
             raise EOFError(f"MCP process exited {stage}{suffix}") from None
 
-    async def _recv(self, timeout: float = 30.0) -> dict[str, Any]:
+    async def _read_stdout(self) -> None:
+        """Route every stdout line to whichever request is waiting for its id.
+
+        One MCP message is one line, but a line is not necessarily the reply to
+        the request just sent: servers emit notifications (logging, progress,
+        cancellation) whenever they like, and a reply that arrives after its
+        caller timed out is still queued behind it.  Reading positionally made
+        the first of those the "response", and every later call was then
+        answered by the previous call's reply — permanently, and silently.
+        """
         assert self._proc and self._proc.stdout
         try:
-            line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
-        except ValueError as exc:
-            # readline() raises this when one line exceeds the stream limit.
-            # asyncio's wording ("chunk is longer than limit") names no remedy.
-            raise RuntimeError(
-                f"MCP server sent a message longer than {STREAM_LIMIT} bytes "
-                f"({exc}). Raise MCPPROXY_STREAM_LIMIT."
-            ) from None
-        if not line:
-            # The subprocess closed stdout — usually means it crashed.  Drain
-            # stderr (best-effort, non-blocking) so the caller sees the actual
-            # cause rather than a bare "closed stdout".
-            stderr_tail = await self._drain_stderr_tail()
-            suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
-            raise EOFError(f"MCP process closed stdout{suffix}")
-        return json.loads(line)
+            while True:
+                try:
+                    line = await self._proc.stdout.readline()
+                except ValueError as exc:
+                    # readline() raises this when one line exceeds the stream
+                    # limit.  asyncio's wording names no remedy.
+                    self._fail_pending(
+                        RuntimeError(
+                            f"MCP server sent a message longer than {STREAM_LIMIT} "
+                            f"bytes ({exc}). Raise MCPPROXY_STREAM_LIMIT."
+                        )
+                    )
+                    return
+                if not line:
+                    break
+                text = line.decode(errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    # A wrapper script writing a banner to stdout is not fatal —
+                    # it used to raise straight out of whichever call was in
+                    # flight and leave the session desynchronized.
+                    self._note_noise(text)
+                    continue
+                if not isinstance(message, dict):
+                    self._note_noise(text)
+                    continue
+                rid = message.get("id")
+                if rid is None:
+                    continue  # a notification: nothing is waiting on it
+                waiter = self._pending.pop(rid, None)
+                if waiter is None:
+                    # A reply whose caller already gave up.  Dropping it here is
+                    # the point: it must not become the next caller's answer.
+                    continue
+                if not waiter.done():
+                    waiter.set_result(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the reader must not die silently
+            self._fail_pending(exc)
+            return
+        # stdout closed: the process is gone.
+        stderr_tail = await self._drain_stderr_tail()
+        suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
+        self._fail_pending(EOFError(f"MCP process closed stdout{suffix}"))
+
+    def _note_noise(self, text: str) -> None:
+        """Record a non-JSON stdout line for diagnostics, bounded."""
+        self._stdout_noise.append(text[:500])
+        if len(self._stdout_noise) > 10:
+            del self._stdout_noise[:-10]
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        for waiter in list(self._pending.values()):
+            if not waiter.done():
+                waiter.set_exception(exc)
+        self._pending.clear()
+
+    def _start_stdout_reader(self) -> None:
+        if self._stdout_task is None or self._stdout_task.done():
+            self._stdout_task = asyncio.ensure_future(self._read_stdout())
+
+    async def _request(self, method: str, params: Any, timeout: float) -> dict[str, Any]:
+        """Send a request and wait for the reply carrying its own id."""
+        rid = self._new_id()
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[rid] = waiter
+        try:
+            await self._send(
+                {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+            )
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        finally:
+            # Whether we timed out or failed to send, stop waiting for this id so
+            # a late reply is discarded by the reader rather than mismatched.
+            self._pending.pop(rid, None)
 
     async def _consume_stderr(self) -> None:
         """Continuously read subprocess stderr.
@@ -355,7 +484,7 @@ class ProcessSession:
             # ready and the cause reaches the server's stdout and nowhere else.
             authenticated_commands.discard(self.command)
             bridge_errors[self.command] = (
-                _classify_failure(self._stderr_tail)
+                _classify_failure(self._stderr_tail, self.command)
                 or (self._stderr_tail[-1] if self._stderr_tail else str(exc))
             )
             # A process that outlived a failed handshake is not usable: _alive()
@@ -376,6 +505,12 @@ class ProcessSession:
         # fails clears it in _start's handler instead.
         bridge_errors.pop(self.command, None)
         env = self._build_env()
+        complaint = check_header_credentials(self.command, env)
+        if complaint is not None:
+            # Caught before the spawn: mcp-remote would send the broken header,
+            # get a 401, and report it as an unrelated OAuth failure.
+            bridge_errors[self.command] = complaint
+            raise RuntimeError(complaint)
         self._proc = await asyncio.create_subprocess_exec(
             *self._parts,
             stdin=asyncio.subprocess.PIPE,
@@ -389,21 +524,20 @@ class ProcessSession:
         # captured even though the initialize response below blocks until the
         # user finishes authorizing.
         self._start_stderr_reader()
-        # initialize handshake
-        rid = self._new_id()
-        await self._send({
-            "jsonrpc": "2.0", "id": rid, "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "mcpproxy", "version": "1.0"},
-            },
-        })
+        self._start_stdout_reader()
         # A generous timeout: an OAuth bridge (mcp-remote) holds the handshake
         # open until the interactive browser authorization completes.  With a
         # valid cached token this returns immediately.  self.init_timeout
         # honours the command's own --auth-timeout so we never give up first.
-        await self._recv(timeout=self.init_timeout)   # initialize response
+        await self._request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "mcpproxy", "version": "1.0"},
+            },
+            timeout=self.init_timeout,
+        )
         # Handshake completed → any pending authorization is resolved.
         self._clear_pending_auth()
         bridge_errors.pop(self.command, None)
@@ -449,21 +583,18 @@ class ProcessSession:
         async with self._lock:
             if not self._alive():
                 await self._start()
-            rid = self._new_id()
-            await self._send({"jsonrpc": "2.0", "id": rid, "method": "tools/list", "params": {}})
-            resp = await self._recv()
+            resp = await self._request("tools/list", {}, timeout=30.0)
         return resp.get("result", {}).get("tools", [])
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         async with self._lock:
             if not self._alive():
                 await self._start()
-            rid = self._new_id()
-            await self._send({
-                "jsonrpc": "2.0", "id": rid, "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            })
-            resp = await self._recv(timeout=120)
+            resp = await self._request(
+                "tools/call",
+                {"name": tool_name, "arguments": arguments},
+                timeout=120.0,
+            )
 
         if "error" in resp:
             err = resp["error"]
@@ -489,9 +620,12 @@ class ProcessSession:
 
     async def close(self) -> None:
         self._clear_pending_auth()
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
-            self._stderr_task = None
+        self._fail_pending(EOFError("MCP session closed"))
+        for task in (self._stderr_task, self._stdout_task):
+            if task is not None:
+                task.cancel()
+        self._stderr_task = None
+        self._stdout_task = None
         if self._proc:
             try:
                 self._proc.stdin.close()  # type: ignore[union-attr]

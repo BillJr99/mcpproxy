@@ -53,7 +53,7 @@ is added automatically when the tool is registered.
 |---|---|
 | **8888** | MCP endpoint — `http://localhost:8888/mcp` |
 | **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
-| **8887** | Loopback-only OAuth callback for containerized `mcp-remote` bridges |
+| **8887** | Loopback-only OAuth callback for containerized `mcp-remote` bridges. Bound by `mcp-remote` itself, not by mcpproxy, and only while a flow is pending — see [Manual OAuth callback](#manual-oauth-callback). |
 
 ## Non-blocking startup
 
@@ -166,6 +166,38 @@ Click **+ New Provider** and choose a provider type. Each mode card carries a sh
 
 After the provider step, the wizard shows a **Secrets** step: any `secrets.env` entries
 in the provider are listed, and you can fill in their values to save them directly to `.env`.
+
+### Manual OAuth callback
+
+OAuth providers redirect the approving browser to a `localhost` callback. That resolves to
+whichever machine the *browser* is on — so authorizing from a laptop while mcpproxy runs on a
+server leaves the authorization code stranded in an address bar that failed to load.
+
+Every place the UI asks you to authorize also offers a manual path: the pending-auth banner, the
+**🔐 Re-authorize** button on a package provider, the **🔐 Authorize** buttons for REST and
+`oauth:` providers, and the New Provider wizard. Each opens the same dialog:
+
+1. Pick the provider.
+2. Paste the whole URL from the browser's address bar (a bare `code=…&state=…` works too).
+3. Press **Deliver callback**.
+
+What happens next depends on which flow it is, because the two differ in who holds the PKCE
+verifier:
+
+- **`mcp-remote` bridges** hold their own, so mcpproxy cannot exchange the code. It replays the
+  callback against the loopback listener the bridge is still waiting on inside the container.
+- **REST `authorization_code` providers and `oauth:` blocks** keep their state in mcpproxy, so
+  the code is exchanged in process.
+
+An authorization link and its callback listener expire together, and the banner disappears with
+them. **🔄 Restart & get a new link** re-spawns the bridge and hands back a fresh link — use it
+whenever a link went stale before you got to it.
+
+The dialog also exposes [callback listener diagnostics](#verifying-the-callback-chain).
+
+> The pasted URL contains a live, single-use authorization code. mcpproxy never logs it, never
+> returns it, and clears the field as soon as it is submitted — but it is a secret in transit, and
+> codes expire in about a minute, so paste promptly.
 
 ### Browse providers catalog
 
@@ -1282,6 +1314,11 @@ tools:
 process argument list. On first use it prints an authorization URL and waits for the
 callback. After authorization it refreshes the access token automatically.
 
+mcpproxy waits out the command's own `--auth-timeout` (plus a small margin) before giving up
+on the handshake, so a slow browser flow does not get its callback listener killed underneath
+it. With no such flag the wait is `MCPPROXY_AUTH_INIT_TIMEOUT` (default 300s), which also acts
+as a floor.
+
 #### Docker callback forwarding
 
 `mcp-remote@0.1.38` intentionally listens on `127.0.0.1` inside the container. Ordinary
@@ -1299,6 +1336,30 @@ The deployment must include both settings:
 Keep the host mapping on `127.0.0.1`; do not publish OAuth callback ports on all interfaces.
 `docker-compose.yml` includes the mapping and forwarder setting by default.
 
+#### Verifying the callback chain
+
+`GET /api/oauth-callback-status` (also rendered under **Callback listener diagnostics** in the
+manual-callback dialog) reports what each configured bridge's callback port is, where that port
+came from, and whether anything is actually listening on it.
+
+Read `listening` against `pending_authorization`:
+
+| listening | pending | meaning |
+|---|---|---|
+| yes | yes | the bridge is waiting — both the automatic redirect and a manual paste will work |
+| no | yes | the URL was printed but the listener is gone (handshake given up, window expired, spawn restarting) — restart the flow, then act promptly |
+| yes | no | something holds the port but this command has no pending flow: a stale bridge, another provider on the same port, or a flow that already finished. A replay is refused. |
+| no | no | idle and healthy |
+
+A port that is `configured` for forwarding but missing from `forwarders` means published Docker
+traffic cannot reach the listener at all — only the automatic redirect is affected; a manual
+paste still works.
+
+Note that **curling the published port proves nothing**: the forwarder binds the container
+interface unconditionally and only then discovers whether anything is behind it, so a dead
+listener shows up as an empty reply rather than a refused connection. The probe that means
+something is against `127.0.0.1:<port>` *inside* the container, which is what this endpoint does.
+
 #### Persisting the token cache
 
 Set `MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth` and mount the `mcpproxy-mcp-auth` volume there.
@@ -1313,8 +1374,12 @@ does not require another grant.
 2. Open the link in a browser running on the same machine as Docker, approve access, and let
    Asana redirect to `http://localhost:8887/oauth/callback`.
 3. If authorization is completed on another device, its `localhost` is that device, not the
-   Docker host. Copy the final callback URL into a browser on the Docker host while the bridge
-   is still waiting. Treat that URL as a secret because it contains a short-lived code.
+   Docker host. Click **📋 Paste callback URL** in the pending-auth banner, pick the provider,
+   paste the whole URL from the browser's address bar, and press **Deliver callback** — mcpproxy
+   replays it against the bridge's loopback listener inside the container. (Pasting the URL into
+   a browser on the Docker host still works if you have one.) Treat that URL as a secret because
+   it contains a short-lived code; mcpproxy never logs it. See
+   [Manual OAuth callback](#manual-oauth-callback).
 4. Verify `asana__get_me`, then recreate the container with the same auth volume and verify it
    again without reauthorization.
 

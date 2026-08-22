@@ -124,9 +124,84 @@ class TestAuthUrlExtraction:
         assert process_runner._extract_auth_url("authorization pending…") is None
 
 
+class TestCallbackPortExtraction:
+    """mcp-remote announces the loopback port it binds; the manual-callback
+    replay aims at whatever it says, which is the only way to know the port when
+    the provider YAML leaves it for mcp-remote to choose."""
+
+    @pytest.mark.parametrize(
+        "line,expected",
+        [
+            ("Using specified callback port: 8887", 8887),
+            ("Using automatically selected callback port: 3334", 3334),
+            ("OAuth callback server listening at http://127.0.0.1:8887", 8887),
+            ("Callback server port: 65535", 65535),
+        ],
+    )
+    def test_extracts_announced_port(self, line, expected):
+        assert process_runner._extract_callback_port(line) == expected
+
+    def test_ignores_non_loopback_urls(self):
+        # The provider's own authorize URL must never be read as a local port.
+        assert process_runner._extract_callback_port(
+            "Please authorize by visiting: https://app.asana.com:443/-/oauth"
+        ) is None
+
+    @pytest.mark.parametrize(
+        "line", ["booting mcp-remote", "callback port: 0", "callback port: 70000"]
+    )
+    def test_returns_none_otherwise(self, line):
+        assert process_runner._extract_callback_port(line) is None
+
+
+class TestAuthTimeoutFromCommand:
+    """mcp-remote holds the handshake open for its own --auth-timeout; giving up
+    first kills the callback listener out from under the user."""
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ("npx -y mcp-remote https://x/mcp 8887 --auth-timeout 600", 600.0),
+            ("npx -y mcp-remote https://x/mcp --auth-timeout=600", 600.0),
+        ],
+    )
+    def test_reads_the_declared_timeout(self, command, expected):
+        assert process_runner._auth_timeout_from_command(command.split()) == expected
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "npx -y mcp-remote https://x/mcp 8887",
+            "npx -y mcp-remote https://x/mcp --auth-timeout abc",
+            "npx -y mcp-remote https://x/mcp --auth-timeout -5",
+            "npx -y mcp-remote https://x/mcp --auth-timeout 999999",
+        ],
+    )
+    def test_returns_none_for_absent_or_nonsense_values(self, command):
+        assert process_runner._auth_timeout_from_command(command.split()) is None
+
+    def test_session_waits_at_least_as_long_as_the_bridge(self):
+        session = process_runner.ProcessSession(
+            "npx -y mcp-remote https://x/mcp 8887 --auth-timeout 600"
+        )
+        assert session.init_timeout >= 630
+
+    def test_session_falls_back_to_the_configured_default(self):
+        session = process_runner.ProcessSession("npx @playwright/mcp@latest")
+        assert session.init_timeout == process_runner.AUTH_INIT_TIMEOUT
+
+    def test_declared_timeout_never_shortens_the_wait(self):
+        # The env var stays a floor: a tiny --auth-timeout must not undercut it.
+        session = process_runner.ProcessSession(
+            "npx -y mcp-remote https://x/mcp 8887 --auth-timeout 5"
+        )
+        assert session.init_timeout == process_runner.AUTH_INIT_TIMEOUT
+
+
 class TestConsumeStderr:
     def teardown_method(self):
         process_runner.pending_auth_urls.clear()
+        process_runner.callback_listener_ports.clear()
 
     @pytest.mark.asyncio
     async def test_consume_stderr_captures_auth_url_and_tail(self):
@@ -178,6 +253,32 @@ class TestConsumeStderr:
         expected = "https://app.asana.com/-/oauth_authorize?c=1"
         assert session.pending_auth_url == expected
         assert process_runner.pending_auth_urls[cmd] == expected
+        # The loopback URL is no longer merely discarded: its port is recorded
+        # so a pasted callback knows where to be delivered.
+        assert process_runner.callback_listener_ports[cmd] == 8887
+
+    @pytest.mark.asyncio
+    async def test_port_announcement_alone_does_not_look_like_an_auth_prompt(self):
+        lines = [
+            b"Using automatically selected callback port: 3334\n",
+            b"",
+        ]
+
+        class FakeStderr:
+            async def readline(self):
+                return lines.pop(0) if lines else b""
+
+        cmd = "npx -y mcp-remote https://mcp.linear.app/sse"
+        session = process_runner.ProcessSession(cmd)
+
+        class _Proc:
+            stderr = FakeStderr()
+
+        session._proc = _Proc()
+        await session._consume_stderr()
+
+        assert process_runner.callback_listener_ports[cmd] == 3334
+        assert cmd not in process_runner.pending_auth_urls
 
     @pytest.mark.asyncio
     async def test_clear_pending_auth_removes_registry_entry(self):

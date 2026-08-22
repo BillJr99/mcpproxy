@@ -1,4 +1,5 @@
 """Unit tests for the HTTP frontend (frontend/app.py)."""
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -2249,3 +2250,349 @@ class TestProviderStatusAndToolsListUI:
         assert "badge-status-pending" in html
         assert "badge-status-ready" in html
         assert "badge-status-failed" in html
+
+
+# ---------------------------------------------------------------------------
+# Manual OAuth callback (authorizing from a machine that can't reach this host)
+# ---------------------------------------------------------------------------
+
+ASANA_CMD = (
+    "npx -y mcp-remote@0.1.38 https://mcp.asana.com/v2/mcp 8887 "
+    "--static-oauth-client-info @/app/tools/secrets/asana/client_info.json "
+    "--auth-timeout 600"
+)
+
+
+@pytest.fixture()
+def pending_remote(tools_dir):
+    """A configured mcp-remote provider that is waiting for authorization."""
+    import process_runner
+
+    (tools_dir / "asana.yaml").write_text(
+        yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+    )
+    process_runner.pending_auth_urls[ASANA_CMD] = "https://app.asana.com/-/oauth"
+    try:
+        yield ASANA_CMD
+    finally:
+        process_runner.pending_auth_urls.pop(ASANA_CMD, None)
+        process_runner.callback_listener_ports.pop(ASANA_CMD, None)
+        process_runner.authenticated_commands.discard(ASANA_CMD)
+
+
+class TestManualOAuthCallback:
+    def test_unknown_target_is_rejected(self, client):
+        r = client.post(
+            "/api/oauth-manual-callback",
+            json={"target": "nobody", "callback": "?code=abc&state=xyz"},
+        )
+        assert r.status_code == 404
+
+    def test_a_target_that_is_not_pending_is_rejected(self, client, tools_dir):
+        # Nothing is waiting, so there is no listener to replay into — refusing
+        # here is what stops a replay reaching an unrelated process.
+        (tools_dir / "idle.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        r = client.post(
+            "/api/oauth-manual-callback",
+            json={"target": "idle", "callback": "?code=abc&state=xyz"},
+        )
+        assert r.status_code == 404
+
+    def test_malformed_callback_is_rejected_without_echoing_it(
+        self, client, pending_remote
+    ):
+        r = client.post(
+            "/api/oauth-manual-callback",
+            json={"target": "asana", "callback": "SECRETNOISE"},
+        )
+        assert r.status_code == 400
+        assert "SECRETNOISE" not in r.text
+
+    def test_replays_to_the_bridge_by_provider_name(self, client, pending_remote):
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={
+                    "target": "asana",
+                    "callback": "http://localhost:8887/oauth/callback?code=abc&state=xyz",
+                },
+            )
+        body = r.json()
+        assert body["ok"] is True
+        assert body["mode"] == "bridge-replay"
+        assert body["port"] == 8887
+        deliver.assert_awaited_once_with(
+            8887, "/oauth/callback", {"code": "abc", "state": "xyz"}
+        )
+
+    def test_replays_to_the_bridge_by_spawn_command(self, client, pending_remote):
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": pending_remote, "callback": "?code=abc&state=xyz"},
+            )
+        assert r.json()["ok"] is True
+        deliver.assert_awaited_once()
+
+    def test_uses_the_port_the_bridge_announced(self, client, pending_remote):
+        import process_runner
+
+        # mcp-remote chose its own port; that beats the one in the command.
+        process_runner.callback_listener_ports[pending_remote] = 3334
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": "?code=abc&state=xyz"},
+            )
+        assert r.json()["port"] == 3334
+        assert deliver.await_args.args[0] == 3334
+
+    def test_undeterminable_port_asks_for_the_missing_argument(
+        self, client, tools_dir
+    ):
+        import process_runner
+
+        command = "npx -y mcp-remote https://example.com/mcp"
+        (tools_dir / "noport.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+        process_runner.pending_auth_urls[command] = "https://example.com/authorize"
+        try:
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "noport", "callback": "?code=abc&state=xyz"},
+            )
+        finally:
+            process_runner.pending_auth_urls.pop(command, None)
+        assert r.status_code == 409
+        assert "second argument" in r.json()["detail"]
+
+    def test_delivery_failure_is_reported_without_raising(self, client, pending_remote):
+        import oauth_callback_relay as relay
+
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.side_effect = relay.CallbackDeliveryError("Nothing is listening")
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": "?code=abc&state=xyz"},
+            )
+        assert r.status_code == 200
+        assert r.json() == {"ok": False, "error": "Nothing is listening"}
+
+    def test_never_echoes_the_authorization_code(self, client, pending_remote):
+        secret = "SECRET" + "CODE"
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            ok = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": f"?code={secret}&state=xyz"},
+            )
+        assert secret not in ok.text
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            import oauth_callback_relay as relay
+
+            deliver.side_effect = relay.CallbackDeliveryError("boom")
+            bad = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": f"?code={secret}&state=xyz"},
+            )
+        assert secret not in bad.text
+
+    def test_in_process_flow_is_completed_from_the_state(self, client):
+        # REST authorization_code and oauth: blocks keep their PKCE verifier
+        # here, so a pasted code is exchanged directly instead of replayed.
+        from rest_provider import AuthCodeTokenStore
+
+        AuthCodeTokenStore._pending_flows["st8"] = {"kind": "rest", "created": 1e12}
+        try:
+            with patch.object(
+                AuthCodeTokenStore,
+                "complete_authorization",
+                new_callable=AsyncMock,
+            ) as complete:
+                r = client.post(
+                    "/api/oauth-manual-callback",
+                    json={"callback": "?code=abc&state=st8"},
+                )
+            body = r.json()
+            assert body["ok"] is True
+            assert body["mode"] == "in-process"
+            complete.assert_awaited_once_with("st8", "abc")
+        finally:
+            AuthCodeTokenStore._pending_flows.pop("st8", None)
+
+    def test_in_process_exchange_failure_is_reported_generically(self, client):
+        from rest_provider import AuthCodeTokenStore
+
+        AuthCodeTokenStore._pending_flows["st9"] = {"kind": "rest", "created": 1e12}
+        try:
+            with patch.object(
+                AuthCodeTokenStore, "complete_authorization", new_callable=AsyncMock
+            ) as complete:
+                # A provider/httpx error can quote the request URL, code included.
+                complete.side_effect = RuntimeError("GET ...?code=LEAKED failed")
+                r = client.post(
+                    "/api/oauth-manual-callback",
+                    json={"callback": "?code=LEAKED&state=st9"},
+                )
+        finally:
+            AuthCodeTokenStore._pending_flows.pop("st9", None)
+        assert r.json()["ok"] is False
+        assert "LEAKED" not in r.text
+
+    def test_unmatched_state_without_a_target_is_rejected(self, client):
+        r = client.post(
+            "/api/oauth-manual-callback", json={"callback": "?code=abc&state=unknown"}
+        )
+        assert r.status_code == 400
+
+
+class TestOAuthReauthorize:
+    def test_unknown_provider_is_rejected(self, client):
+        assert client.post("/api/oauth-reauthorize", json={"target": "nope"}).status_code == 404
+
+    def test_target_is_required(self, client):
+        assert client.post("/api/oauth-reauthorize", json={}).status_code == 400
+
+    def test_returns_the_existing_link_without_respawning(self, client, pending_remote):
+        # A second bridge would collide on the callback port, so a flow that is
+        # still waiting hands back the link it already printed.
+        with patch("process_runner.introspect", new_callable=AsyncMock) as spawn:
+            r = client.post("/api/oauth-reauthorize", json={"target": "asana"})
+        spawn.assert_not_awaited()
+        body = r.json()
+        assert body["restarted"] is False
+        assert body["auth_url"] == "https://app.asana.com/-/oauth"
+        assert body["port"] == 8887
+
+    def test_respawns_a_lapsed_flow_and_returns_the_new_link(self, client, tools_dir):
+        import process_runner
+
+        command = ASANA_CMD
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+
+        async def fake_introspect(cmd, **kwargs):
+            # Stand in for the bridge printing a fresh URL to stderr.
+            process_runner.pending_auth_urls[cmd] = "https://app.asana.com/-/oauth?new=1"
+            process_runner.callback_listener_ports[cmd] = 8887
+            await asyncio.sleep(30)
+
+        try:
+            with patch("process_runner.introspect", fake_introspect):
+                r = client.post("/api/oauth-reauthorize", json={"target": "asana"})
+            body = r.json()
+            assert body["ok"] is True
+            assert body["restarted"] is True
+            assert body["auth_url"] == "https://app.asana.com/-/oauth?new=1"
+            assert body["port"] == 8887
+        finally:
+            process_runner.pending_auth_urls.pop(command, None)
+            process_runner.callback_listener_ports.pop(command, None)
+
+    def test_reports_a_silent_success_when_the_cache_was_still_good(
+        self, client, tools_dir
+    ):
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        with patch("process_runner.introspect", new_callable=AsyncMock) as spawn:
+            spawn.return_value = []
+            r = client.post("/api/oauth-reauthorize", json={"target": "asana"})
+        body = r.json()
+        assert body["ok"] is True
+        assert body["auth_url"] is None
+        assert "cached token" in body["message"]
+
+
+class TestOAuthCallbackStatus:
+    def test_reports_listener_and_forwarder_state(
+        self, client, pending_remote, monkeypatch
+    ):
+        monkeypatch.setenv("MCPPROXY_CALLBACK_FORWARD_PORTS", "8887")
+        monkeypatch.setattr("oauth_callback_relay.probe_loopback_port", lambda p, **k: True)
+        body = client.get("/api/oauth-callback-status").json()
+
+        assert body["configured_forward_ports"] == [8887]
+        entry = next(p for p in body["providers"] if p["provider"] == "asana")
+        assert entry["port"] == 8887
+        assert entry["port_source"] == "command"
+        assert entry["listening"] is True
+        assert entry["pending_authorization"] is True
+        assert entry["authenticated"] is False
+        # The summary keeps the bridge and URL but drops the credential-file flag.
+        assert "client_info.json" not in entry["command_summary"]
+        assert "https://mcp.asana.com/v2/mcp" in entry["command_summary"]
+
+    def test_a_dead_listener_is_visible(self, client, pending_remote, monkeypatch):
+        monkeypatch.setattr("oauth_callback_relay.probe_loopback_port", lambda p, **k: False)
+        body = client.get("/api/oauth-callback-status").json()
+        entry = next(p for p in body["providers"] if p["provider"] == "asana")
+        # Pending but not listening: the bridge gave up and must be restarted.
+        assert entry["pending_authorization"] is True
+        assert entry["listening"] is False
+
+    def test_unforwarded_port_is_flagged(self, client, pending_remote, monkeypatch):
+        monkeypatch.setenv("MCPPROXY_CALLBACK_FORWARD_PORTS", "")
+        monkeypatch.setattr("oauth_callback_relay.probe_loopback_port", lambda p, **k: True)
+        body = client.get("/api/oauth-callback-status").json()
+        port = next(p for p in body["ports"] if p["port"] == 8887)
+        assert port["configured"] is False
+        assert port["forwarded"] is False
+
+    def test_bad_forward_port_configuration_is_surfaced(self, client, monkeypatch):
+        monkeypatch.setenv("MCPPROXY_CALLBACK_FORWARD_PORTS", "not-a-port")
+        body = client.get("/api/oauth-callback-status").json()
+        assert body["configured_forward_ports"] == []
+        assert "not-a-port" in body["forward_ports_error"]
+
+    def test_non_remote_providers_are_not_listed(self, client, tools_dir):
+        (tools_dir / "pw.yaml").write_text(
+            yaml.safe_dump({"package": {"command": "npx @playwright/mcp"}, "tools": []})
+        )
+        body = client.get("/api/oauth-callback-status").json()
+        assert [p["provider"] for p in body["providers"]] == []
+
+
+class TestManualCallbackUI:
+    def test_index_contains_the_manual_callback_modal(self, client):
+        html = client.get("/").text
+        for needle in (
+            "mcb-modal",
+            "openManualCallback(",
+            "mcbSubmit",
+            "mcbRestart",
+            "mcb-target",
+            "mcb-url",
+            "mcb-diag",
+            "/api/oauth-manual-callback",
+            "/api/oauth-callback-status",
+            "/api/oauth-reauthorize",
+        ):
+            assert needle in html, needle
+
+    def test_every_authorize_surface_offers_manual_entry(self, client):
+        html = client.get("/").text
+        # banner, package-command box, and the shared link helper used by the
+        # REST / oauth: / wizard status lines
+        assert 'id="reauth-manual-btn"' in html
+        assert "function mcbLink(" in html
+        assert html.count("mcbLink(") >= 5

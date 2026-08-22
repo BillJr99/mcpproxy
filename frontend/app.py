@@ -20,6 +20,8 @@ POST /api/files/upload          — multipart upload (root, path, file)
 GET  /api/files/download        — download a file (?root=&path=)
 DELETE /api/files               — delete a file/dir (?root=&path=&recursive=)
 POST /api/oauth-bootstrap       — begin a provider-declared OAuth consent flow {name}
+POST /api/oauth-manual-callback — finish a flow from a pasted callback URL {target, callback}
+GET  /api/oauth-callback-status — callback listener / forwarder diagnostics
 POST /api/restart               — send SIGTERM to restart server
 GET  /api/config                — UI feature flags (e.g. web_terminal)
 GET  /api/provider-status       — per-provider init state {providers: {name: {status, error}}}
@@ -264,6 +266,45 @@ def _detect_package_manager(command: str) -> str:
 # ---------------------------------------------------------------------------
 # Structured ↔ YAML conversion
 # ---------------------------------------------------------------------------
+
+# In-flight re-authorization spawns, keyed by command, so a double click cannot
+# start two bridges racing for the same callback port.
+_reauth_tasks: dict[str, "asyncio.Task"] = {}
+
+# How long to wait for a re-spawned bridge to print its authorization URL.
+REAUTH_URL_WAIT_SECONDS = float(os.environ.get("MCPPROXY_REAUTH_URL_WAIT", "45"))
+
+
+def _swallow_reauth_result(task: "asyncio.Task") -> None:
+    """Retrieve a background re-auth spawn's outcome.
+
+    The spawn failing is the normal ending — it runs until the user finishes
+    authorizing or mcp-remote's own timeout fires.  Reading the result here keeps
+    asyncio from logging "exception was never retrieved" for the ordinary case.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+def _summarize_remote_command(command: str) -> str:
+    """Condense an mcp-remote spawn command for display.
+
+    Drops the npx preamble and the flags — which carry credential-file paths and
+    other noise nobody needs in a diagnostics table — keeping the bridge, the
+    server URL, and the callback port.
+    """
+    parts = command.split()
+    for i, token in enumerate(parts):
+        if "mcp-remote" in token:
+            parts = parts[i:]
+            break
+    kept = [parts[0]] if parts else []
+    for token in parts[1:]:
+        if token.startswith("-"):
+            break
+        kept.append(token)
+    return " ".join(kept)
+
 
 def _get_package_spec(spec: dict[str, Any]) -> dict[str, Any] | None:
     """Return the subprocess sub-dict (package:), or None for code providers."""
@@ -933,6 +974,136 @@ def create_app(
         merged = {**pending_auth_urls, **pending_rest_auth}
         return {"ok": True, "pending": merged, "rest_pending": dict(pending_rest_auth)}
 
+    def _remote_command(target: str) -> str | None:
+        """Resolve *target* to an mcp-remote spawn command, pending or not.
+
+        Accepts the command itself or the provider name whose YAML declares it.
+        """
+        if "mcp-remote" in target:
+            return target
+        command = _provider_command(target)
+        return command if command and "mcp-remote" in command else None
+
+    def _pending_remote_command(target: str) -> str | None:
+        """Like ``_remote_command``, but only if that bridge is awaiting authorization.
+
+        Returning None for anything else is the gate that stops a replay being
+        aimed at an unrelated process that merely happens to hold the port.
+        """
+        from process_runner import pending_auth_urls
+
+        command = _remote_command(target)
+        return command if command in pending_auth_urls else None
+
+    @app.post("/api/oauth-manual-callback")
+    async def oauth_manual_callback(request: Request) -> dict:
+        """Complete a pending OAuth flow from a callback URL the user pastes.
+
+        Needed whenever authorization happens on a different machine than the one
+        running mcpproxy: the provider redirects to ``localhost:<port>`` on the
+        *browser's* host, where nothing is listening, and the code is stranded in
+        the address bar.
+
+        Body: ``{ target, callback }``.  ``callback`` may be the full URL, a bare
+        ``?code=…&state=…``, or just ``code=…&state=…``.
+
+        Two completion strategies, because the two OAuth systems differ in who
+        holds the PKCE verifier:
+
+        * mcp-remote bridges hold their own, so mcpproxy cannot exchange the code
+          — it replays the callback against the loopback listener the bridge is
+          still waiting on inside this container.
+        * REST ``authorization_code`` providers and ``oauth:`` blocks keep their
+          state in ``AuthCodeTokenStore``, so those complete in-process.
+
+        The body carries a live authorization code: it is never logged, echoed in
+        a response, or included in an error message, and the replay target host is
+        a hardcoded literal with a port taken only from server-side state.
+        """
+        import oauth_callback_relay as relay
+        from rest_provider import AuthCodeTokenStore, pending_rest_auth
+
+        body = await request.json()
+        target = (body.get("target") or "").strip()
+        try:
+            path, params = relay.parse_callback_input(body.get("callback") or "")
+        except relay.CallbackInputError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+        state = params.get("state", "")
+
+        # ── in-process flows (REST authorization_code, oauth: blocks) ────────
+        # An unnamed target is accepted only when the state matches a flow we
+        # are holding: that value is unguessable, so it identifies itself.
+        in_process = target in pending_rest_auth or (
+            not target and state in AuthCodeTokenStore._pending_flows
+        )
+        if in_process:
+            if not state:
+                raise HTTPException(
+                    400,
+                    "This provider's flow requires a state parameter — paste the "
+                    "whole callback URL, not just the code.",
+                )
+            try:
+                await AuthCodeTokenStore.complete_authorization(state, params["code"])
+            except Exception:
+                # Deliberately fixed text: the underlying httpx/provider error
+                # can quote the request URL, and with it the code.
+                return {
+                    "ok": False,
+                    "error": "Token exchange failed — the code may already be used "
+                    "or expired. Start the authorization again.",
+                }
+            label = target or "the pending provider"
+            return {
+                "ok": True,
+                "mode": "in-process",
+                "target": target,
+                "port": None,
+                "message": f"Authorization completed for {label}.",
+            }
+
+        # ── mcp-remote bridges ──────────────────────────────────────────────
+        if not target:
+            raise HTTPException(400, "target is required")
+        command = _pending_remote_command(target)
+        if command is None:
+            raise HTTPException(
+                404,
+                f"No authorization is currently pending for '{target}'. Start the "
+                "flow with the Authorize link first, then paste the callback URL.",
+            )
+        port, _source = relay.resolve_callback_port(command)
+        if port is None:
+            raise HTTPException(
+                409,
+                "Could not determine this bridge's callback port. Add it as the "
+                "second argument after the server URL in the package command "
+                "(e.g. 'mcp-remote https://example.com/mcp 8887').",
+            )
+        try:
+            await relay.deliver_to_bridge(port, path, params)
+        except relay.CallbackDeliveryError as exc:
+            return {"ok": False, "error": str(exc)}
+        # One log line, and no code in it.
+        print(
+            f"[mcpproxy] manual OAuth callback delivered for '{target}' "
+            f"-> 127.0.0.1:{port}",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "mode": "bridge-replay",
+            "target": target,
+            "port": port,
+            "message": (
+                f"Callback delivered to the bridge on 127.0.0.1:{port}. The token "
+                "exchange happens inside mcp-remote — watch the banner, it clears "
+                "when it succeeds."
+            ),
+        }
+
     # ── REST / OpenAPI ───────────────────────────────────────────────────────
 
     @app.post("/api/introspect-openapi")
@@ -1550,6 +1721,28 @@ def create_app(
         """Expose UI feature flags so the front end can hide disabled features."""
         return {"ok": True, "web_terminal": _web_terminal_enabled()}
 
+    def _provider_command(name: str) -> str:
+        """Return a provider's package spawn command, or "" if it has none."""
+        try:
+            spec = yaml.safe_load(
+                (_config_dir / f"{name}.yaml").read_text(encoding="utf-8")
+            ) or {}
+        except (OSError, yaml.YAMLError):
+            return ""
+        return ((_get_package_spec(spec) or {}).get("command") or "").strip()
+
+    def _remote_auth_status(command: str) -> str | None:
+        """Authentication tri-state for an mcp-remote bridge; None if not one."""
+        import process_runner as _pr
+
+        if not command or "mcp-remote" not in command:
+            return None
+        if command in _pr.pending_auth_urls:
+            return "authorization_required"
+        if command in _pr.authenticated_commands:
+            return "authenticated"
+        return "unknown"
+
     @app.get("/api/provider-status")
     async def provider_status_api() -> dict:
         """Return provider setup status and remote-bridge authentication status.
@@ -1567,25 +1760,10 @@ def create_app(
             import process_runner as _pr
 
             def _entry(name: str, state) -> dict:
-                auth_status = None
-                path = _config_dir / f"{name}.yaml"
-                try:
-                    spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                    package = _get_package_spec(spec) or {}
-                    command = ((package.get("command") or "").strip())
-                except (OSError, yaml.YAMLError):
-                    command = ""
-                if command and "mcp-remote" in command:
-                    if command in _pr.pending_auth_urls:
-                        auth_status = "authorization_required"
-                    elif command in _pr.authenticated_commands:
-                        auth_status = "authenticated"
-                    else:
-                        auth_status = "unknown"
                 return {
                     "status": state.status,
                     "setup_status": state.status,
-                    "auth_status": auth_status,
+                    "auth_status": _remote_auth_status(_provider_command(name)),
                     "error": state.error,
                 }
 
@@ -1598,6 +1776,168 @@ def create_app(
             }
         except ImportError:
             return {"ok": True, "providers": {}}
+
+    @app.post("/api/oauth-reauthorize")
+    async def oauth_reauthorize(request: Request) -> dict:
+        """Restart a lapsed mcp-remote authorization and return a fresh link.
+
+        Body: ``{ target }`` — a provider name or its spawn command.
+
+        An authorization URL is only valid while the bridge that printed it is
+        still running: once it gives up (or the container restarts) both the link
+        and its loopback callback listener are gone, and the pending-auth banner
+        disappears with them.  Re-spawning the bridge is the only way back, so
+        this does exactly what the startup warm-up does — a throwaway introspect —
+        and waits just long enough to hand back the new link.
+
+        The spawn is left running in the background: it holds the handshake open
+        until the browser flow completes (or the command's own ``--auth-timeout``
+        elapses), which is what makes the pasted callback have something to land on.
+        """
+        from process_runner import introspect, pending_auth_urls
+        import oauth_callback_relay as relay
+
+        body = await request.json()
+        target = (body.get("target") or "").strip()
+        if not target:
+            raise HTTPException(400, "target is required")
+        command = _remote_command(target)
+        if command is None:
+            raise HTTPException(404, f"No mcp-remote provider named '{target}'")
+
+        def _reply(restarted: bool) -> dict:
+            port, source = relay.resolve_callback_port(command)
+            return {
+                "ok": True,
+                "restarted": restarted,
+                "auth_url": pending_auth_urls[command],
+                "port": port,
+                "port_source": source,
+            }
+
+        # Already waiting: a second bridge would collide on the callback port.
+        if command in pending_auth_urls:
+            return _reply(False)
+
+        task = _reauth_tasks.get(command)
+        if task is None or task.done():
+            task = asyncio.ensure_future(introspect(command))
+            task.add_done_callback(_swallow_reauth_result)
+            _reauth_tasks[command] = task
+
+        # mcp-remote has to boot and reach its OAuth step before it prints anything.
+        deadline = REAUTH_URL_WAIT_SECONDS
+        while deadline > 0:
+            if command in pending_auth_urls:
+                return _reply(True)
+            if task.done():
+                # It finished without ever asking: the cached token was still good.
+                return {
+                    "ok": True,
+                    "restarted": True,
+                    "auth_url": None,
+                    "port": None,
+                    "message": "The bridge authorized from its cached token — "
+                    "no browser step needed.",
+                }
+            await asyncio.sleep(0.25)
+            deadline -= 0.25
+        return {
+            "ok": False,
+            "error": "The bridge did not print an authorization URL in time. "
+            "Check the server log for its output, then try again.",
+        }
+
+    @app.get("/api/oauth-callback-status")
+    async def oauth_callback_status() -> dict:
+        """Report the health of the OAuth callback chain for mcp-remote bridges.
+
+        mcpproxy runs no server on the callback port — ``mcp-remote`` binds it on
+        container loopback, and only while a flow is pending.  Under Docker the
+        published port is fronted by ``callback_forwarder``, whose bind accepts
+        unconditionally and only then discovers whether anything is behind it, so
+        curling the published port proves nothing.  ``listening`` here is a probe
+        of ``127.0.0.1:<port>`` from inside the container, which is the check that
+        actually means something.
+
+        Read ``listening`` against ``pending_authorization``:
+
+        =========  =======  =========================================================
+        listening  pending  meaning
+        =========  =======  =========================================================
+        yes        yes      the bridge is waiting; automatic and manual both work
+        no         yes      URL printed but the listener is gone (handshake given up,
+                            window expired, spawn restarting) — re-authorize, then
+                            paste promptly
+        yes        no       something holds the port but this command has no pending
+                            flow: a stale bridge, another provider on the same port,
+                            or a flow that already finished.  Replay is refused.
+        no         no       idle and healthy
+        =========  =======  =========================================================
+
+        Separately, a port that is ``configured`` for forwarding but absent from
+        ``forwarders`` means published Docker traffic cannot reach the listener at
+        all — only the automatic path is affected, manual paste still works.
+        """
+        import callback_forwarder
+        import oauth_callback_relay as relay
+        import process_runner as _pr
+        from rest_provider import AuthCodeTokenStore, oauth_redirect_uri
+
+        out: dict[str, Any] = {"ok": True, "redirect_uri": oauth_redirect_uri()}
+        raw_ports = os.environ.get("MCPPROXY_CALLBACK_FORWARD_PORTS", "")
+        try:
+            configured = callback_forwarder.parse_forward_ports(raw_ports)
+        except ValueError as exc:
+            configured = []
+            out["forward_ports_error"] = str(exc)
+        out["configured_forward_ports"] = configured
+        out["forwarders"] = [
+            {"bind_host": f.bind_host, "port": f.port}
+            for f in callback_forwarder.active_forwarders()
+        ]
+        out["in_process_pending_flows"] = len(AuthCodeTokenStore._pending_flows)
+
+        # Snapshot the cross-thread registries before iterating: they are written
+        # from the MCP event loop while this runs on the UI one.
+        pending = dict(_pr.pending_auth_urls)
+
+        providers: list[dict[str, Any]] = []
+        for path in sorted(_config_dir.glob("*.yaml")):
+            command = _provider_command(path.stem)
+            if not command or "mcp-remote" not in command:
+                continue
+            port, source = relay.resolve_callback_port(command)
+            providers.append({
+                "provider": path.stem,
+                "command_summary": _summarize_remote_command(command),
+                "port": port,
+                "port_source": source,
+                "pending_authorization": command in pending,
+                "authenticated": command in _pr.authenticated_commands,
+            })
+
+        # Probe each distinct port once — per-provider ports and every configured
+        # forward port, so a mismatch between the two shows up as its own row.
+        ports = {p["port"] for p in providers if p["port"]} | set(configured)
+        probes = {
+            port: await asyncio.to_thread(relay.probe_loopback_port, port)
+            for port in sorted(ports)
+        }
+        forwarded_ports = {f["port"] for f in out["forwarders"]}
+        for entry in providers:
+            entry["listening"] = probes.get(entry["port"], False)
+        out["providers"] = providers
+        out["ports"] = [
+            {
+                "port": port,
+                "listening": listening,
+                "configured": port in configured,
+                "forwarded": port in forwarded_ports,
+            }
+            for port, listening in probes.items()
+        ]
+        return out
 
     # ── Interactive web terminal (PTY over WebSocket) ──────────────────────────
 
@@ -1823,6 +2163,10 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
 <div id="auth-banner" class="restart-bar" style="display:none;background:#2a2518;border-color:#f9e2af60;border-radius:0;margin:0">
   <span style="color:var(--yellow)">🔐</span>
   <span id="auth-banner-msg" style="color:#cdd6f4;font-size:.875em"></span>
+  <!-- Static: pollPendingAuth only rewrites #auth-banner-msg, so a button here
+       survives the 5s refresh (an inline input would be wiped mid-paste). -->
+  <button class="btn btn-sm btn-outline-warning py-0 px-2 ms-2" onclick="openManualCallback()"
+    title="Authorizing from another machine? Paste the callback URL here">📋 Paste callback URL</button>
 </div>
 
 <!-- Toast -->
@@ -1902,6 +2246,9 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <button class="btn btn-sm btn-outline-warning py-0" id="reauth-btn" style="display:none"
               onclick="reauthorizeProvider()"
               title="Re-run the mcp-remote OAuth flow in a terminal to refresh a lapsed token">🔐 Re-authorize</button>
+            <button class="btn btn-sm btn-outline-secondary py-0" id="reauth-manual-btn" style="display:none"
+              onclick="openManualCallback(currentName)"
+              title="Approved on another machine? Paste the callback URL instead of waiting for the redirect">📋 Paste callback URL</button>
           </div>
           <input id="f-command" class="form-control font-monospace"
             placeholder="npx @playwright/mcp@latest --isolated  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github  ·  mcp-server-github"
@@ -2520,6 +2867,66 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Manual OAuth callback: complete a flow when the browser that approved it
+     could not reach this host's callback listener (authorizing from a laptop
+     while mcpproxy runs on a server). -->
+<div class="modal fade" id="mcb-modal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title">🔐 Complete authorization manually</h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted" style="font-size:.85em">
+          After you approve access, the provider redirects your browser to
+          <code>localhost</code> — which is <b>your</b> machine, not necessarily the one running
+          mcpproxy. If that page failed to load, copy the whole URL out of the address bar and paste
+          it below; mcpproxy delivers it to the listener waiting here.
+        </p>
+        <p class="text-muted" style="font-size:.85em">
+          An authorization link is only good while the bridge that printed it is still
+          waiting. If it expired — or the banner vanished before you got to it — use
+          <b>Restart &amp; get a new link</b> to spawn a fresh one.
+        </p>
+        <label class="form-label" style="font-size:.85em">Provider awaiting authorization</label>
+        <select id="mcb-target" class="form-select form-select-sm mb-3"></select>
+        <label class="form-label" style="font-size:.85em">Callback URL</label>
+        <textarea id="mcb-url" class="form-control font-monospace" rows="3"
+          autocomplete="off" autocorrect="off" spellcheck="false"
+          placeholder="http://localhost:8887/oauth/callback?code=…&amp;state=…"
+          style="font-size:.8em"></textarea>
+        <div class="text-muted mt-1" style="font-size:.78em">
+          ⚠ Treat this URL as a secret — it contains a short-lived authorization code. It is never
+          logged. Codes expire quickly, so paste promptly.
+        </div>
+        <div class="mt-3 d-flex align-items-center gap-2">
+          <button class="btn btn-sm btn-warning" id="mcb-submit" onclick="mcbSubmit()">Deliver callback</button>
+          <button class="btn btn-sm btn-outline-warning" id="mcb-restart" onclick="mcbRestart()"
+            title="The link and its listener expire together — this re-spawns the bridge and gives you a fresh link">🔄 Restart &amp; get a new link</button>
+          <div id="mcb-result" class="fn-status"></div>
+        </div>
+        <details class="mt-3">
+          <summary class="text-muted" style="font-size:.85em;cursor:pointer">Callback listener diagnostics</summary>
+          <div class="mt-2 d-flex justify-content-end">
+            <button class="btn btn-sm btn-outline-secondary py-0 px-2" onclick="mcbLoadDiagnostics()"
+              title="Re-probe the callback listeners">↻</button>
+          </div>
+          <div id="mcb-diag" style="font-size:.8em"></div>
+          <div class="text-muted mt-2" style="font-size:.78em">
+            mcpproxy runs no server on the callback port — <code>mcp-remote</code> binds it on
+            container loopback, and only while a flow is pending. <b>Listening + pending</b> means
+            both the automatic and the manual path work. <b>Pending without listening</b> means the
+            bridge gave up: re-authorize, then paste promptly. <b>Configured but not forwarded</b>
+            means published Docker traffic cannot reach the listener — set
+            <code>MCPPROXY_CALLBACK_FORWARD_PORTS</code>; manual paste still works.
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -2535,6 +2942,7 @@ let codeEditor = null;        // CodeMirror instance for the code block
 let secretsModal = null, wizModal = null, termModal = null;
 let catalogModal = null, catalogEntries = [];
 let filesModal = null, ttModal = null, tlModal = null;
+let mcbModal = null;
 let filesRoot = 'tools', filesPath = '', filesRoots = ['tools', 'files', 'repos'];
 let ttTools = [], ttSelected = null;  // tool tester: /v1/tools entries + selected name
 let tlTools = [], tlStatus = {};      // tools list: /v1/tools entries + provider status
@@ -2580,6 +2988,12 @@ window.addEventListener('DOMContentLoaded', () => {
   ttModal      = new bootstrap.Modal('#tooltest-modal');
   tlModal      = new bootstrap.Modal('#toolslist-modal');
   document.getElementById('terminal-modal').addEventListener('hidden.bs.modal', closeTerminal);
+  document.getElementById('mcb-modal').addEventListener('hidden.bs.modal', () => {
+    // Don't leave a live authorization code sitting in the DOM.
+    document.getElementById('mcb-url').value = '';
+    document.getElementById('mcb-result').textContent = '';
+    document.getElementById('mcb-result').className = 'fn-status';
+  });
   document.getElementById('files-list').addEventListener('click', filesListClick);
   document.getElementById('tt-list').addEventListener('click', ttListClick);
   // Wizard: live function detection as the user types into the code textarea
@@ -2617,10 +3031,177 @@ async function pollPendingAuth() {
   if (!cmds.length) { banner.style.display = 'none'; return; }
   const links = cmds.map(cmd =>
     `<a href="${esc(pending[cmd])}" target="_blank" rel="noopener">authorize ${esc(cmd.replace(/^.*mcp-remote\s+/, '') || cmd)}</a>`
+    + ` (${mcbLink(cmd, 'paste callback URL')} · ${mcbLink(cmd, 'restart', {restart: true})})`
   ).join(' · ');
   document.getElementById('auth-banner-msg').innerHTML =
     `Authorization required for ${cmds.length} remote provider(s): ${links} — complete the browser flow; the token refreshes automatically afterwards.`;
   banner.style.display = '';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Manual OAuth callback (authorizing from a machine that can't reach this host)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Small link/button markup reused by every "authorize" surface, so manual entry
+// is always one click away from wherever the automatic flow was started.
+function mcbLink(target, label, opts) {
+  const arg = target
+    ? `'${esc(String(target)).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
+    : '';
+  const extra = (opts && opts.restart) ? `${arg ? '' : "''"},{restart:true}` : '';
+  return `<a href="#" onclick="openManualCallback(${arg}${extra});return false">${esc(label || 'enter the callback URL manually')}</a>`;
+}
+
+function openManualCallback(target, opts) {
+  mcbModal = mcbModal || new bootstrap.Modal(document.getElementById('mcb-modal'));
+  mcbModal.show();
+  // Populate first, then optionally act — mcbRestart reads the select.
+  mcbRefreshTargets(target)
+    .then(() => (opts && opts.restart) ? mcbRestart() : null)
+    .catch(() => {});
+  mcbLoadDiagnostics().catch(() => {});
+}
+
+// Options come from /api/pending-auth: keys also present in rest_pending are
+// provider names (mcpproxy completes those in-process); the rest are mcp-remote
+// spawn commands (replayed into the bridge's own listener).
+async function mcbRefreshTargets(preselect) {
+  const sel = document.getElementById('mcb-target');
+  let pending = {}, restPending = {}, bridges = [];
+  const [a, b] = await Promise.all([
+    api('GET', '/api/pending-auth').catch(() => null),
+    api('GET', '/api/oauth-callback-status').catch(() => null),
+  ]);
+  if (a) { pending = a.pending || {}; restPending = a.rest_pending || {}; }
+  if (b) bridges = b.providers || [];
+  // Every configured bridge is offered, not just the pending ones: a lapsed
+  // flow has no pending entry, and restarting it is exactly why you're here.
+  const opts = [];
+  const seen = new Set();
+  for (const k of Object.keys(pending)) {
+    seen.add(k);
+    opts.push({value: k, label: k.replace(/^.*mcp-remote\S*\s+/, ''),
+               note: (k in restPending) ? 'in-process · waiting' : 'mcp-remote · waiting'});
+  }
+  for (const p of bridges) {
+    if (seen.has(p.provider) || p.pending_authorization) continue;
+    opts.push({value: p.provider, label: p.provider,
+               note: p.authenticated ? 'mcp-remote · authenticated' : 'mcp-remote · not waiting'});
+  }
+  if (preselect && !opts.some(o => o.value === preselect)) {
+    opts.unshift({value: preselect, label: preselect.replace(/^.*mcp-remote\S*\s+/, ''), note: 'selected'});
+  }
+  if (!opts.length) {
+    sel.innerHTML = '<option value="">(no remote providers configured)</option>';
+    return;
+  }
+  sel.innerHTML = opts.map(o =>
+    `<option value="${esc(o.value)}"${o.value === preselect ? ' selected' : ''}>${esc(o.label)} — ${esc(o.note)}</option>`
+  ).join('');
+}
+
+// Re-spawn a bridge whose authorization link (and callback listener) expired.
+async function mcbRestart() {
+  const target = document.getElementById('mcb-target').value || '';
+  const out = document.getElementById('mcb-result');
+  if (!target) { out.className = 'fn-status error'; out.textContent = 'Pick a provider first.'; return; }
+  const btn = document.getElementById('mcb-restart');
+  btn.disabled = true;
+  out.className = 'fn-status busy';
+  out.textContent = 'Restarting the bridge — this can take a few seconds…';
+  try {
+    const r = await api('POST', '/api/oauth-reauthorize', {target});
+    if (!r.ok) throw new Error(r.error || 'could not restart');
+    if (!r.auth_url) {
+      out.className = 'fn-status ok';
+      out.textContent = r.message || 'Authorized from the cached token.';
+    } else {
+      out.className = 'fn-status ok';
+      out.innerHTML = (r.restarted ? 'New link ready — ' : 'Already waiting — ')
+        + `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">open the authorization page</a>, `
+        + `approve, then paste the callback URL above`
+        + (r.port ? ` (the bridge is listening on port ${esc(String(r.port))}).` : '.');
+      window.open(r.auth_url, '_blank', 'noopener');
+    }
+    pollPendingAuth();
+    mcbRefreshTargets(target).catch(() => {});
+    mcbLoadDiagnostics().catch(() => {});
+  } catch(e) {
+    out.className = 'fn-status error';
+    out.textContent = e.message || 'could not restart';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function mcbSubmit() {
+  const btn = document.getElementById('mcb-target');
+  const out = document.getElementById('mcb-result');
+  const field = document.getElementById('mcb-url');
+  const target = btn.value || '';
+  const callback = (field.value || '').trim();
+  if (!callback) { out.className = 'fn-status error'; out.textContent = 'Paste the callback URL first.'; return; }
+  out.className = 'fn-status busy';
+  out.textContent = 'Delivering…';
+  document.getElementById('mcb-submit').disabled = true;
+  try {
+    const r = await api('POST', '/api/oauth-manual-callback', {target, callback});
+    if (!r.ok) throw new Error(r.error || 'delivery failed');
+    out.className = 'fn-status ok';
+    out.textContent = r.message || 'Callback delivered.';
+    toast('Callback delivered');
+    pollPendingAuth();
+    // Auth can change after setup settles, and pollProviderStatus stops itself
+    // once nothing is pending — restart it so the badges catch up.
+    if (_statusPollTimer === null) {
+      pollProviderStatus();
+      _statusPollTimer = setInterval(pollProviderStatus, 4000);
+    }
+    setTimeout(() => { pollPendingAuth(); loadList().catch(() => {}); }, 3000);
+    mcbLoadDiagnostics().catch(() => {});
+  } catch(e) {
+    out.className = 'fn-status error';
+    out.textContent = e.message || 'delivery failed';
+  } finally {
+    // Whatever happened, don't keep the code in the DOM: it is single-use.
+    field.value = '';
+    document.getElementById('mcb-submit').disabled = false;
+  }
+}
+
+async function mcbLoadDiagnostics() {
+  const el = document.getElementById('mcb-diag');
+  el.innerHTML = '<span class="text-muted">Probing…</span>';
+  try {
+    mcbRenderDiag(await api('GET', '/api/oauth-callback-status'));
+  } catch(e) {
+    el.innerHTML = `<span class="text-danger">${esc(e.message || 'could not read callback status')}</span>`;
+  }
+}
+
+function mcbRenderDiag(d) {
+  const yes = v => v ? '<span style="color:var(--green)">yes</span>' : '<span class="text-muted">no</span>';
+  let html = '';
+  if (d.providers && d.providers.length) {
+    html += '<table class="table table-sm table-dark mb-2"><thead><tr>'
+      + '<th>Provider</th><th>Port</th><th>From</th><th>Listening</th><th>Pending</th></tr></thead><tbody>'
+      + d.providers.map(p => `<tr><td>${esc(p.provider)}</td>`
+        + `<td>${p.port ? esc(String(p.port)) : '<span class="text-danger">unknown</span>'}</td>`
+        + `<td class="text-muted">${esc(p.port_source || '—')}</td>`
+        + `<td>${yes(p.listening)}</td><td>${yes(p.pending_authorization)}</td></tr>`).join('')
+      + '</tbody></table>';
+  } else {
+    html += '<div class="text-muted mb-2">No mcp-remote bridges are configured.</div>';
+  }
+  const fwd = (d.forwarders || []).map(f => `${esc(f.bind_host)}:${esc(String(f.port))}`).join(', ');
+  html += `<div class="text-muted">Forward ports configured: ${esc((d.configured_forward_ports || []).join(', ') || 'none')}`
+    + ` · relaying: ${fwd || 'none'}</div>`;
+  html += `<div class="text-muted">In-process redirect URI: <code>${esc(d.redirect_uri || '')}</code>`
+    + ` · pending in-process flows: ${esc(String(d.in_process_pending_flows ?? 0))}</div>`;
+  if (d.forward_ports_error) {
+    html += `<div class="text-danger mt-1">MCPPROXY_CALLBACK_FORWARD_PORTS: ${esc(d.forward_ports_error)}</div>`;
+  }
+  document.getElementById('mcb-diag').innerHTML = html;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2955,6 +3536,9 @@ function renderProvider(p) {
     const isRemote = /\bmcp-remote\b/.test(p.command || '');
     document.getElementById('reauth-btn').style.display =
       (isRemote && webTerminalEnabled) ? '' : 'none';
+    // Pasting a callback URL needs no PTY, so this stays available even when
+    // the web terminal is disabled.
+    document.getElementById('reauth-manual-btn').style.display = isRemote ? '' : 'none';
   }
   if (isRepo) {
     document.getElementById('f-repo-url').value = p.repo_url || '';
@@ -3014,7 +3598,8 @@ async function authorizeOAuthProvider() {
     window.open(r.auth_url, '_blank', 'noopener');
     status.className = 'fn-status ok';
     status.innerHTML = `Opened the consent page. After approving, the token file is written automatically. ` +
-      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>`;
+      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>` +
+      ` · approved elsewhere? ${mcbLink(currentName, 'paste the callback URL')}`;
     // Refresh the list (and this summary) once the callback has likely landed.
     setTimeout(async () => { await loadList(); if (currentProvider) renderOauthSummary(currentProvider); }, 4000);
   } catch(e) {
@@ -3261,7 +3846,8 @@ async function authorizeRestProvider() {
     window.open(r.auth_url, '_blank', 'noopener');
     status.className = 'fn-status ok';
     status.innerHTML = `Opened the authorization page. After approving, tokens are cached automatically. ` +
-      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>`;
+      `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>` +
+      ` · approved elsewhere? ${mcbLink(currentName, 'paste the callback URL')}`;
   } catch(e) {
     status.className = 'fn-status error';
     status.textContent = e.message || 'authorization failed';
@@ -4492,7 +5078,8 @@ async function _wzIntrospectCommand(cmd, {requirements = [], setup_commands = []
       if (a && a.auth_url) {
         el.innerHTML = `<div class="text-warning" style="font-size:.875em">🔐 Authorization required — `
           + `<a href="${esc(a.auth_url)}" target="_blank" rel="noopener">click here to authorize</a>, `
-          + `then complete the browser flow. Introspection continues automatically once you finish.</div>`;
+          + `then complete the browser flow. Introspection continues automatically once you finish.<br>`
+          + `Approving on another machine? ${mcbLink(cmd, 'paste the callback URL here')}.</div>`;
       }
     } catch {}
   }, 1500);

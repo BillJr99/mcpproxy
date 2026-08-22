@@ -22,6 +22,19 @@ from collections.abc import Iterable
 
 DEFAULT_IDLE_TIMEOUT_SECONDS = 30.0
 
+# Forwarders currently relaying, for diagnostics only.  ``start_callback_forwarders``
+# is the sole registrar: a ``CallbackForwarder`` constructed directly (as the unit
+# tests do) stays out of the registry, so what the UI reports is exactly what the
+# server started.
+_active_forwarders: list["CallbackForwarder"] = []
+_registry_lock = threading.Lock()
+
+
+def active_forwarders() -> list["CallbackForwarder"]:
+    """Return a snapshot of the forwarders started by this process."""
+    with _registry_lock:
+        return list(_active_forwarders)
+
 
 def parse_forward_ports(value: str | None) -> list[int]:
     """Parse a comma/whitespace separated callback-port list."""
@@ -137,6 +150,9 @@ class CallbackForwarder:
         return self
 
     def stop(self) -> None:
+        with _registry_lock:
+            if self in _active_forwarders:
+                _active_forwarders.remove(self)
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=3)
@@ -148,10 +164,13 @@ def start_callback_forwarders(ports: Iterable[int]) -> list[CallbackForwarder]:
     try:
         for host in non_loopback_ipv4_addresses():
             for port in ports:
-                started.append(CallbackForwarder(host, port).start())
+                forwarder = CallbackForwarder(host, port).start()
+                started.append(forwarder)
+                with _registry_lock:
+                    _active_forwarders.append(forwarder)
     except Exception:
         for forwarder in started:
-            forwarder.stop()
+            forwarder.stop()  # also de-registers
         raise
     return started
 

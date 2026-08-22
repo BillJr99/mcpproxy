@@ -268,3 +268,18 @@ class TestDeclaredPortForwarding:
         finally:
             for f in started:
                 f.stop()
+
+
+class TestRelayResilience:
+    def test_a_spurious_readability_wake_does_not_drop_the_callback(self):
+        """Both sockets are non-blocking, so select() readability is advisory:
+        recv can legitimately raise BlockingIOError. Tearing down there would
+        lose a single-use authorization code mid-flight."""
+        import inspect
+
+        import callback_forwarder as cf
+
+        source = inspect.getsource(cf.CallbackForwarder.__init__)
+        # The bare `except (BlockingIOError, ...): return` used to abort the relay.
+        assert "except BlockingIOError:" in source
+        assert "continue" in source.split("except BlockingIOError:")[1][:200]

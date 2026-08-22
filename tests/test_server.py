@@ -1592,3 +1592,49 @@ class TestDeclaredCallbackPorts:
         (tmp_path / "bad.yaml").write_text("{[not yaml", encoding="utf-8")
         monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
         assert server._declared_callback_ports() == []
+
+
+class TestWarmUpWaitsForProviderSetup:
+    """A bridge can depend on its provider's setup_commands having run — the
+    file passed to --static-oauth-client-info, or a repo build that produces the
+    binary. Warming first fails for an unrelated reason, records a bridge_error
+    the UI displays, and is not retried until the refresh interval."""
+
+    def test_joins_the_bootstrap_thread_before_spawning(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        order = []
+
+        def slow_setup():
+            time.sleep(0.3)
+            order.append("setup-done")
+
+        bootstrap = threading.Thread(target=slow_setup)
+        bootstrap.start()
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            order.append("warmed")
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers(bootstrap)
+        bootstrap.join()
+
+        assert order[0] == "setup-done"
+        assert "warmed" in order
+
+    def test_still_warms_when_there_is_nothing_to_wait_for(self, tmp_path, monkeypatch):
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        seen = []
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            seen.append(command)
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers(None)
+        assert len(seen) == 2

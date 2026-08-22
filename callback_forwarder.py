@@ -176,7 +176,11 @@ class CallbackForwarder:
                         for source in readable:
                             try:
                                 data = source.recv(65536)
-                            except (BlockingIOError, ConnectionResetError, OSError):
+                            except BlockingIOError:
+                                # select() readability is advisory; a spurious
+                                # wake must not tear down a live callback.
+                                continue
+                            except (ConnectionResetError, OSError):
                                 return
                             if not data:
                                 return

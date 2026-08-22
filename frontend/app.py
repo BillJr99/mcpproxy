@@ -100,28 +100,57 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _write_env_file(path: Path, updates: dict[str, str]) -> None:
-    existing: dict[str, str] = {}
-    lines: list[str] = []
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#") and "=" in stripped:
-                key = stripped.partition("=")[0].strip()
-                existing[key] = line
-            lines.append(line)
-    new_lines = list(lines)
-    for key, val in updates.items():
-        new_line = f"{key}={val}"
-        if key in existing:
-            for i, line in enumerate(new_lines):
-                s = line.strip()
-                if s and not s.startswith("#") and s.partition("=")[0].strip() == key:
-                    new_lines[i] = new_line
-                    break
-        else:
-            new_lines.append(new_line)
-    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    """Upsert ``updates`` into a .env file.
 
+    Two things this has to get right, because every reader of the file — this
+    module, ``ProcessSession._build_env``, docker-compose's ``env_file``, dotenv
+    — takes the *last* occurrence of a key:
+
+    * A value containing a newline would write extra lines, letting a pasted
+      credential set arbitrary variables that are then injected into every
+      spawned subprocess. Such values are rejected.
+    * A file that already holds a duplicate key must have the *last* one
+      rewritten, not the first; rewriting the first left the stale later line
+      winning, so the UI reported "saved" and the value never took effect.
+    """
+    for key, value in updates.items():
+        if not isinstance(value, str):
+            raise ValueError(f"Value for {key} must be text")
+        if "\n" in value or "\r" in value:
+            raise ValueError(
+                f"Value for {key} contains a line break, which would corrupt the "
+                "env file and could define unrelated variables"
+            )
+
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    for key, value in updates.items():
+        replacement = f"{key}={value}"
+        # Walk backwards: the last assignment is the one that wins at read time.
+        target = None
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = lines[i].strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                if stripped.split("=", 1)[0].strip() == key:
+                    target = i
+                    break
+        if target is None:
+            lines.append(replacement)
+        else:
+            lines[target] = replacement
+            # Drop any earlier duplicates so the file stops being ambiguous.
+            lines = [
+                line
+                for i, line in enumerate(lines)
+                if i == target
+                or not (
+                    line.strip()
+                    and not line.strip().startswith("#")
+                    and "=" in line
+                    and line.strip().split("=", 1)[0].strip() == key
+                )
+            ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
     keys: list[str] = []
@@ -1150,10 +1179,12 @@ def create_app(
             await relay.deliver_to_bridge(port, path, params)
         except relay.CallbackDeliveryError as exc:
             return {"ok": False, "error": str(exc)}
-        # One log line, and no code in it.
+        # One log line: no code, and no command either. When the caller picks a
+        # pending flow the target *is* the spawn command, which carries header
+        # credentials and client-secret file paths.
         print(
-            f"[mcpproxy] manual OAuth callback delivered for '{target}' "
-            f"-> 127.0.0.1:{port}",
+            f"[mcpproxy] manual OAuth callback delivered for "
+            f"'{_summarize_remote_command(target)}' -> 127.0.0.1:{port}",
             flush=True,
         )
         return {
@@ -1938,19 +1969,20 @@ def create_app(
         if command is None:
             raise HTTPException(404, f"No mcp-remote provider named '{target}'")
 
-        def _reply(restarted: bool) -> dict:
+        def _reply(restarted: bool, auth_url: str) -> dict:
             port, source = relay.resolve_callback_port(command)
             return {
                 "ok": True,
                 "restarted": restarted,
-                "auth_url": pending_auth_urls[command],
+                "auth_url": auth_url,
                 "port": port,
                 "port_source": source,
             }
 
         # Already waiting: a second bridge would collide on the callback port.
-        if command in pending_auth_urls:
-            return _reply(False)
+        existing = pending_auth_urls.get(command)
+        if existing:
+            return _reply(False, existing)
 
         # Checked before scheduling, not with try/except around ensure_future:
         # introspect is a coroutine, so its guard raises when the task *runs*,
@@ -1975,8 +2007,9 @@ def create_app(
         # mcp-remote has to boot and reach its OAuth step before it prints anything.
         deadline = REAUTH_URL_WAIT_SECONDS
         while deadline > 0:
-            if command in pending_auth_urls:
-                return _reply(True)
+            published = pending_auth_urls.get(command)
+            if published:
+                return _reply(True, published)
             if task.done():
                 failure = None if task.cancelled() else task.exception()
                 if failure is not None:
@@ -3618,11 +3651,11 @@ async function loadList() {
       if (isRepo) { badgeClass = 'badge-repo'; badgeText = 'repo'; }
       else if (isPkg) { badgeClass = 'badge-pkg'; badgeText = 'pkg'; }
       return `
-      <div class="provider-item ${p.name === currentName ? 'active' : ''}" data-name="${esc(p.name)}" onclick="openProvider('${p.name}')">
+      <div class="provider-item ${p.name === currentName ? 'active' : ''}" data-name="${esc(p.name)}" onclick="openProvider('${esc(p.name)}')">
         <div style="min-width:0">
-          <div class="fw-semibold">${p.name}</div>
+          <div class="fw-semibold">${esc(p.name)}</div>
           <small class="text-muted d-block" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-            ${(p.tool_names || []).join(', ') || 'no tools'}
+            ${esc((p.tool_names || []).join(', ')) || 'no tools'}
           </small>
           ${alertRow}
         </div>
@@ -3633,7 +3666,7 @@ async function loadList() {
       </div>`;
     }).join('');
   } catch(e) {
-    document.getElementById('provider-list').innerHTML = `<div class="p-3 text-danger" style="font-size:.85em">${e.message}</div>`;
+    document.getElementById('provider-list').innerHTML = `<div class="p-3 text-danger" style="font-size:.85em">${esc(e.message)}</div>`;
   }
 }
 
@@ -4769,10 +4802,10 @@ async function openSecretsModal() {
       const isSet = !!existing[k];
       return `<div class="section-box ${isSet?'secret-set':'secret-unset'} mb-2">
         <div class="d-flex align-items-center gap-2 mb-1">
-          <span class="fw-semibold font-monospace" style="font-size:.9em">${k}</span>
+          <span class="fw-semibold font-monospace" style="font-size:.9em">${esc(k)}</span>
           ${isSet ? '<span style="color:var(--green);font-size:.8em">✓ set</span>' : '<span style="color:var(--yellow);font-size:.8em">not set</span>'}
         </div>
-        <input class="form-control form-control-sm" type="password" id="secret-${k}"
+        <input class="form-control form-control-sm" type="password" id="secret-${esc(k)}"
           placeholder="${isSet ? 'leave blank to keep existing' : 'enter value…'}">
       </div>`;
     }).join('');
@@ -5460,10 +5493,10 @@ async function wzGoSecrets(secretKeys) {
       const isSet = !!existing[k];
       return `<div class="section-box ${isSet?'secret-set':'secret-unset'} mb-2">
         <div class="d-flex align-items-center gap-2 mb-1">
-          <span class="fw-semibold font-monospace" style="font-size:.9em">${k}</span>
+          <span class="fw-semibold font-monospace" style="font-size:.9em">${esc(k)}</span>
           ${isSet ? '<span style="color:var(--green);font-size:.8em">✓ set</span>' : ''}
         </div>
-        <input class="form-control form-control-sm" type="password" id="secret-${k}"
+        <input class="form-control form-control-sm" type="password" id="secret-${esc(k)}"
           placeholder="${isSet ? 'leave blank to keep existing' : 'enter value…'}">
       </div>`;
     }).join('');
@@ -5975,7 +6008,11 @@ function tlRenderList() {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function esc(str) {
-  return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  // &#39; matters: esc() is interpolated into single-quoted attributes such as
+  // onclick="openProvider('...')", where an unescaped apostrophe closes the
+  // string and everything after it is executed.
+  return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function _schemaToParams(schema) {

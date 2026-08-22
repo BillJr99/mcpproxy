@@ -630,3 +630,101 @@ class TestSuccessfulHandshake:
         with patch.object(process_runner, "ProcessSession", return_value=session):
             await process_runner.introspect("stub-d")
         assert "stub-d" not in process_runner._spawning
+
+
+class TestSpawnGuardIsAlwaysReleased:
+    """A leaked guard entry is permanent: every later introspect and re-authorize
+    for that command reports a bridge that is "already starting" until restart."""
+
+    def teardown_method(self):
+        process_runner._spawning.clear()
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_command_does_not_strand_the_guard(self):
+        # shlex.split raises inside ProcessSession.__init__, which used to run
+        # outside the try that releases the guard.
+        bad = "npx -y mcp-remote 'https://unclosed"
+        with pytest.raises(RuntimeError):
+            await process_runner.introspect(bad)
+        assert bad not in process_runner._spawning
+
+        # And the next attempt must reach the real error, not the guard.
+        with pytest.raises(RuntimeError) as exc:
+            await process_runner.introspect(bad)
+        assert not isinstance(exc.value, process_runner.ConcurrentSpawnError)
+
+    @pytest.mark.asyncio
+    async def test_a_failure_in_close_does_not_strand_the_guard(self):
+        cmd = "stub-close-fail"
+
+        class Boom(process_runner.ProcessSession):
+            async def _start(self):
+                return None
+
+            async def list_tools(self):
+                return []
+
+            async def close(self):
+                raise RuntimeError("close blew up")
+
+        with patch.object(process_runner, "ProcessSession", Boom):
+            with pytest.raises(RuntimeError, match="close blew up"):
+                await process_runner.introspect(cmd)
+        assert cmd not in process_runner._spawning
+
+
+class TestFailedStartLeavesNothingUsable:
+    def teardown_method(self):
+        process_runner.bridge_errors.clear()
+        process_runner.authenticated_commands.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_process_that_outlived_a_failed_handshake_is_killed(self):
+        # _alive() is "returncode is None", so a surviving process would make the
+        # next call_tool skip _start and write to a bridge that never completed
+        # initialize — and read the stale initialize reply as its tool result.
+        session = process_runner.ProcessSession("stub-hang")
+        # A process that never answers: the handshake times out, it stays alive.
+        session._parts = ["python3", "-c", "import time; time.sleep(30)"]
+        session.init_timeout = 0.5
+        with pytest.raises(Exception):
+            await session._start()
+        assert session._proc is not None
+        await asyncio.wait_for(session._proc.wait(), timeout=5)
+        assert session._alive() is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_start_marks_the_command_unauthenticated(self):
+        cmd = "stub-fail-auth"
+        process_runner.authenticated_commands.add(cmd)
+        session = process_runner.ProcessSession(cmd)
+
+        async def boom():
+            raise EOFError("closed")
+
+        session._start_inner = boom
+        with pytest.raises(EOFError):
+            await session._start()
+        assert cmd not in process_runner.authenticated_commands
+
+
+class TestRefreshDoesNotBlankHealthyStatus:
+    """The hourly refresh spawns a throwaway session under the same command key
+    as a live one. Pre-emptively clearing the status made the UI report
+    "unknown" for the duration of every renewal."""
+
+    def teardown_method(self):
+        process_runner.authenticated_commands.clear()
+        process_runner.bridge_errors.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_respawn_never_blanks_the_status(self):
+        cmd = "stub-refresh"
+        process_runner.authenticated_commands.add(cmd)
+        session = process_runner.ProcessSession(cmd)
+        session._parts = ["python3", "-c", _STUB_SERVER]
+        await session._start()
+        try:
+            assert cmd in process_runner.authenticated_commands
+        finally:
+            await session.close()

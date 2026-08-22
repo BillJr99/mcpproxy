@@ -910,7 +910,7 @@ def _declared_callback_ports() -> list[int]:
     return ports
 
 
-def _warm_remote_providers() -> None:
+def _warm_remote_providers(wait_for: "threading.Thread | None" = None) -> None:
     """Introspect each mcp-remote bridge once at startup.
 
     A throwaway introspect spawns the bridge, which — with a valid cache —
@@ -927,6 +927,17 @@ def _warm_remote_providers() -> None:
     import asyncio
 
     from process_runner import bridge_errors, introspect
+
+    if wait_for is not None:
+        # A bridge can depend on its provider's setup_commands having run — the
+        # file passed to --static-oauth-client-info, or a repository build that
+        # produces the binary.  Warming before that finishes fails for a reason
+        # that has nothing to do with the bridge, records a bridge_error the UI
+        # then displays, and is not retried until the refresh interval (an hour
+        # by default).  Waiting costs nothing: this already runs off the
+        # serving path, on its own thread.
+        print("[mcpproxy] waiting for provider setup before warming remote bridges")
+        wait_for.join()
 
     async def _warm_one(name: str, command: str, env_keys: list[str]) -> None:
         print(f"[mcpproxy] warming mcp-remote bridge: {name}")
@@ -1169,7 +1180,10 @@ if __name__ == "__main__":
             )
         if _warm_remote_enabled():
             warm_thread = threading.Thread(
-                target=_warm_remote_providers, daemon=True, name="remote-warmup"
+                target=_warm_remote_providers,
+                args=(bootstrap_thread if _PENDING_SPECS else None,),
+                daemon=True,
+                name="remote-warmup",
             )
             warm_thread.start()
             if _refresh_remote_enabled():

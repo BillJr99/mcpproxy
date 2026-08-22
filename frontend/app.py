@@ -975,9 +975,24 @@ def create_app(
             await asyncio.to_thread(_prepare)
 
             # 3. Introspect the MCP server
-            from process_runner import introspect
+            from process_runner import ConcurrentSpawnError, introspect
             tools = await introspect(command, cwd=cwd, env_keys=env_keys)
             return {"ok": True, "tools": tools, "package_manager": pm}
+        except ConcurrentSpawnError as exc:
+            # Expected while the startup warm-up holds a spawn open for the whole
+            # authorization window: every editor open and command-field blur
+            # lands here. Report the state, with the link that unblocks it, and
+            # do not print a traceback for it.
+            from process_runner import pending_auth_urls
+
+            return {
+                "ok": False,
+                "error": str(exc),
+                "pending_auth": True,
+                "auth_url": pending_auth_urls.get(command),
+                "tools": [],
+                "package_manager": pm,
+            }
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "tools": [], "package_manager": pm}
@@ -1096,7 +1111,12 @@ def create_app(
 
         # ── mcp-remote bridges ──────────────────────────────────────────────
         if not target:
-            raise HTTPException(400, "target is required")
+            raise HTTPException(
+                400,
+                "Choose which provider this callback belongs to. Only a flow "
+                "mcpproxy runs itself can be identified from the pasted state "
+                "alone; an mcp-remote bridge has to be named.",
+            )
         command = _pending_remote_command(target)
         if command is None:
             raise HTTPException(
@@ -1907,7 +1927,7 @@ def create_app(
         until the browser flow completes (or the command's own ``--auth-timeout``
         elapses), which is what makes the pasted callback have something to land on.
         """
-        from process_runner import introspect, pending_auth_urls
+        from process_runner import introspect, is_spawning, pending_auth_urls
         import oauth_callback_relay as relay
 
         body = await request.json()
@@ -1932,6 +1952,18 @@ def create_app(
         if command in pending_auth_urls:
             return _reply(False)
 
+        # Checked before scheduling, not with try/except around ensure_future:
+        # introspect is a coroutine, so its guard raises when the task *runs*,
+        # and the failure would otherwise be swallowed and reported below as a
+        # successful silent renewal.
+        if is_spawning(command):
+            return {
+                "ok": False,
+                "error": "This bridge is already starting — usually the startup "
+                "warm-up, which holds it open while it waits for authorization. "
+                "Use the link it published rather than starting a second one.",
+            }
+
         task = _reauth_tasks.get(command)
         if task is None or task.done():
             task = asyncio.ensure_future(
@@ -1946,6 +1978,11 @@ def create_app(
             if command in pending_auth_urls:
                 return _reply(True)
             if task.done():
+                failure = None if task.cancelled() else task.exception()
+                if failure is not None:
+                    # Finishing is not the same as succeeding; reporting a crash
+                    # as a silent renewal would be worse than saying nothing.
+                    return {"ok": False, "error": str(failure)}
                 # It finished without ever asking: the cached token was still good.
                 return {
                     "ok": True,
@@ -2036,10 +2073,13 @@ def create_app(
         # Probe each distinct port once — per-provider ports and every configured
         # forward port, so a mismatch between the two shows up as its own row.
         ports = {p["port"] for p in providers if p["port"]} | set(configured)
-        probes = {
-            port: await asyncio.to_thread(relay.probe_loopback_port, port)
-            for port in sorted(ports)
-        }
+        # Concurrently: one await per port serialised the whole dialog behind
+        # them, and this endpoint is what the manual-callback dropdown waits on.
+        ordered = sorted(ports)
+        results = await asyncio.gather(
+            *(asyncio.to_thread(relay.probe_loopback_port, port) for port in ordered)
+        )
+        probes = dict(zip(ordered, results))
         forwarded_ports = {f["port"] for f in out["forwarders"]}
         for entry in providers:
             entry["listening"] = probes.get(entry["port"], False)
@@ -3264,45 +3304,61 @@ function openManualCallback(target, opts) {
   mcbRefreshTargets(target)
     .then(() => (opts && opts.restart) ? mcbRestart() : null)
     .catch(() => {});
+  // Independent: diagnostics probe every callback port, so they must not hold
+  // up the dropdown or the dialog.
   mcbLoadDiagnostics().catch(() => {});
 }
 
 // Options come from /api/pending-auth: keys also present in rest_pending are
 // provider names (mcpproxy completes those in-process); the rest are mcp-remote
 // spawn commands (replayed into the bridge's own listener).
+function _mcbRenderTargets(opts, preselect) {
+  const sel = document.getElementById('mcb-target');
+  if (!opts.length) {
+    sel.innerHTML = '<option value="" disabled selected>(no remote providers configured)</option>';
+    return;
+  }
+  const chosen = preselect || sel.value;
+  sel.innerHTML = opts.map(o =>
+    `<option value="${esc(o.value)}"${o.value === chosen ? ' selected' : ''}>${esc(o.label)} — ${esc(o.note)}</option>`
+  ).join('');
+}
+
 async function mcbRefreshTargets(preselect) {
   const sel = document.getElementById('mcb-target');
-  let pending = {}, restPending = {}, bridges = [];
-  const [a, b] = await Promise.all([
-    api('GET', '/api/pending-auth').catch(() => null),
-    api('GET', '/api/oauth-callback-status').catch(() => null),
-  ]);
-  if (a) { pending = a.pending || {}; restPending = a.rest_pending || {}; }
-  if (b) bridges = b.providers || [];
-  // Every configured bridge is offered, not just the pending ones: a lapsed
-  // flow has no pending entry, and restarting it is exactly why you're here.
+  sel.innerHTML = '<option value="" disabled selected>loading…</option>';
+
+  // Two sources, rendered in two passes on purpose. The pending flows are what
+  // you almost always came here for and are cheap to fetch; the full bridge list
+  // needs a TCP probe per callback port. Waiting for both left the dropdown
+  // empty for as long as the slower call took.
   const opts = [];
   const seen = new Set();
-  for (const k of Object.keys(pending)) {
-    seen.add(k);
-    opts.push({value: k, label: k.replace(/^.*mcp-remote\S*\s+/, ''),
-               note: (k in restPending) ? 'in-process · waiting' : 'mcp-remote · waiting'});
+
+  const a = await api('GET', '/api/pending-auth').catch(() => null);
+  if (a) {
+    const pending = a.pending || {}, restPending = a.rest_pending || {};
+    for (const k of Object.keys(pending)) {
+      seen.add(k);
+      opts.push({value: k, label: k.replace(/^.*mcp-remote\S*\s+/, ''),
+                 note: (k in restPending) ? 'in-process · waiting' : 'mcp-remote · waiting'});
+    }
   }
-  for (const p of bridges) {
+  if (preselect && !opts.some(o => o.value === preselect)) {
+    opts.unshift({value: preselect, label: preselect.replace(/^.*mcp-remote\S*\s+/, ''), note: 'selected'});
+    seen.add(preselect);
+  }
+  _mcbRenderTargets(opts, preselect);
+
+  // Then fold in every other configured bridge: a lapsed flow has no pending
+  // entry, and restarting it is exactly why you might be here.
+  const b = await api('GET', '/api/oauth-callback-status').catch(() => null);
+  for (const p of (b && b.providers) || []) {
     if (seen.has(p.provider) || p.pending_authorization) continue;
     opts.push({value: p.provider, label: p.provider,
                note: p.authenticated ? 'mcp-remote · authenticated' : 'mcp-remote · not waiting'});
   }
-  if (preselect && !opts.some(o => o.value === preselect)) {
-    opts.unshift({value: preselect, label: preselect.replace(/^.*mcp-remote\S*\s+/, ''), note: 'selected'});
-  }
-  if (!opts.length) {
-    sel.innerHTML = '<option value="">(no remote providers configured)</option>';
-    return;
-  }
-  sel.innerHTML = opts.map(o =>
-    `<option value="${esc(o.value)}"${o.value === preselect ? ' selected' : ''}>${esc(o.label)} — ${esc(o.note)}</option>`
-  ).join('');
+  _mcbRenderTargets(opts, preselect);
 }
 
 // Re-spawn a bridge whose authorization link (and callback listener) expired.
@@ -3346,6 +3402,14 @@ async function mcbSubmit() {
   const target = btn.value || '';
   const callback = (field.value || '').trim();
   if (!callback) { out.className = 'fn-status error'; out.textContent = 'Paste the callback URL first.'; return; }
+  // Submitting before the list finished loading sent an empty target and came
+  // back a bare 400. Only mcpproxy-owned flows can identify themselves from the
+  // pasted state, so anything else needs a provider chosen first.
+  if (!target && btn.options.length && !btn.options[0].value) {
+    out.className = 'fn-status error';
+    out.textContent = 'Choose the provider this callback belongs to.';
+    return;
+  }
   out.className = 'fn-status busy';
   out.textContent = 'Delivering…';
   document.getElementById('mcb-submit').disabled = true;

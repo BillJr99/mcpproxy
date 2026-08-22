@@ -4,6 +4,8 @@ import asyncio.streams
 import json
 from types import SimpleNamespace
 
+from unittest.mock import patch
+
 import pytest
 
 import process_runner
@@ -537,3 +539,94 @@ class TestSendToDeadProcess:
         assert "dynamic client registration" in message
         # No uvloop transport internals leaking through the chain.
         assert exc.value.__cause__ is None
+
+
+class TestIsSpawning:
+    """The re-authorize endpoint must consult this before scheduling: introspect
+    is a coroutine, so its own guard raises only when the task runs, and the
+    failure would otherwise be swallowed and reported as a silent success."""
+
+    def teardown_method(self):
+        process_runner._spawning.clear()
+
+    def test_reports_an_in_flight_spawn(self):
+        cmd = "npx -y mcp-remote https://x/mcp 8887"
+        assert process_runner.is_spawning(cmd) is False
+        process_runner._spawning.add(cmd)
+        assert process_runner.is_spawning(cmd) is True
+
+    def test_is_specific_to_the_command(self):
+        process_runner._spawning.add("command-a")
+        assert process_runner.is_spawning("command-b") is False
+
+
+class TestConcurrentSpawnErrorShape:
+    def test_carries_the_command_without_repeating_it_in_the_message(self):
+        cmd = (
+            "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887 "
+            "--static-oauth-client-info @/app/tools/secrets/asana/client_info.json"
+        )
+        exc = process_runner.ConcurrentSpawnError(cmd, "This bridge is already starting.")
+        assert exc.command == cmd
+        # Commands carry credential-file paths; a log line should not echo them.
+        assert "client_info.json" not in str(exc)
+
+
+# A minimal stdio MCP server: answers any request with an empty result and stays
+# alive, so a full initialize handshake can be exercised without a real bridge.
+_STUB_SERVER = (
+    "import sys, json\n"
+    "for line in sys.stdin:\n"
+    "    msg = json.loads(line)\n"
+    "    if 'id' in msg:\n"
+    "        sys.stdout.write(json.dumps("
+    "{'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': []}}) + '\\n')\n"
+    "        sys.stdout.flush()\n"
+)
+
+
+class TestSuccessfulHandshake:
+    def teardown_method(self):
+        process_runner.bridge_errors.clear()
+        process_runner.authenticated_commands.clear()
+        process_runner.pending_auth_urls.clear()
+
+    async def _start_stub(self, command: str) -> process_runner.ProcessSession:
+        session = process_runner.ProcessSession(command)
+        session._parts = ["python3", "-c", _STUB_SERVER]
+        await session._start()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_marks_the_command_authenticated(self):
+        session = await self._start_stub("stub-a")
+        try:
+            assert "stub-a" in process_runner.authenticated_commands
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_clears_a_previous_bridge_error(self):
+        process_runner.bridge_errors["stub-b"] = "an older failure"
+        session = await self._start_stub("stub-b")
+        try:
+            assert "stub-b" not in process_runner.bridge_errors
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_clears_a_pending_authorization(self):
+        process_runner.pending_auth_urls["stub-c"] = "https://example.com/authorize"
+        session = await self._start_stub("stub-c")
+        try:
+            assert "stub-c" not in process_runner.pending_auth_urls
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_releases_the_concurrency_guard_on_success(self):
+        session = process_runner.ProcessSession("stub-d")
+        session._parts = ["python3", "-c", _STUB_SERVER]
+        with patch.object(process_runner, "ProcessSession", return_value=session):
+            await process_runner.introspect("stub-d")
+        assert "stub-d" not in process_runner._spawning

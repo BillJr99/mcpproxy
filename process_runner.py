@@ -513,7 +513,24 @@ def get_session(
 
 
 class ConcurrentSpawnError(RuntimeError):
-    """A throwaway spawn was refused because one is already in flight."""
+    """A throwaway spawn was refused because one is already in flight.
+
+    An ordinary, expected condition — the startup warm-up holds a spawn open for
+    the whole authorization window, so anything that introspects the same bridge
+    meanwhile lands here.  Callers should report it as a state ("waiting for
+    authorization"), not as a failure, and can use ``command`` to look up the
+    pending authorization URL.
+    """
+
+    def __init__(self, command: str, message: str) -> None:
+        super().__init__(message)
+        self.command = command
+
+
+def is_spawning(command: str) -> bool:
+    """Whether a throwaway spawn of *command* is currently in flight."""
+    with _spawn_lock:
+        return command in _spawning
 
 
 async def introspect(
@@ -538,10 +555,15 @@ async def introspect(
     """
     with _spawn_lock:
         if command in _spawning:
+            # Deliberately does not repeat the command: it carries credential
+            # file paths and is unreadable in a log line, and the caller already
+            # knows which provider it asked about.
             raise ConcurrentSpawnError(
-                f"A bridge for '{command}' is already starting — it may be "
-                "waiting for authorization. Wait for it to finish rather than "
-                "starting a second one."
+                command,
+                "This bridge is already starting and may be waiting for "
+                "authorization. Complete or cancel that attempt rather than "
+                "starting a second one — two bridges would overwrite each "
+                "other's stored PKCE verifier.",
             )
         _spawning.add(command)
     session = ProcessSession(command, cwd=cwd, env_keys=env_keys)

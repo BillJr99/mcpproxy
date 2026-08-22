@@ -251,3 +251,52 @@ class TestProbeLoopbackPort:
 
     def test_false_for_a_closed_port(self):
         assert relay.probe_loopback_port(_free_port()) is False
+
+
+class TestAuthorizeUrlState:
+    """A callback from an earlier attempt still parses, but the bridge has since
+    generated a new PKCE verifier. Comparing state is what stops the single-use
+    code being burned on an opaque code_verifier mismatch."""
+
+    def test_reads_the_state_parameter(self):
+        assert relay.authorize_url_state(
+            "https://app.asana.com/-/oauth_authorize?client_id=1&state=ABC123"
+        ) == "ABC123"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/login/oauth",          # issuer base, no query
+            "https://x/authorize?client_id=1",         # no state
+            "https://x/authorize?state=",              # blank state
+            "",
+            "not a url at all",
+        ],
+    )
+    def test_returns_none_when_there_is_no_state(self, url):
+        assert relay.authorize_url_state(url) is None
+
+    def test_percent_encoded_state_is_decoded(self):
+        assert relay.authorize_url_state("https://x/a?state=a%2Bb") == "a+b"
+
+
+class TestReplayIsAlwaysLoopback:
+    """The replay target must never come from the pasted value."""
+
+    def test_a_pasted_host_cannot_redirect_the_replay(self, listener):
+        # parse_callback_input discards scheme/host/port by design; deliver_to_bridge
+        # takes only a port. There is no code path that accepts a caller host.
+        import inspect
+
+        source = inspect.getsource(relay.deliver_to_bridge)
+        assert '"http://127.0.0.1:{port}{path}"' in source or "127.0.0.1" in source
+        _, params = relay.parse_callback_input(
+            "https://evil.example:9999/oauth/callback?code=abc&state=s"
+        )
+        assert params == {"code": "abc", "state": "s"}
+
+    def test_proxy_environment_is_ignored(self):
+        # An HTTPS_PROXY in the container must never see a URL carrying a code.
+        import inspect
+
+        assert "trust_env=False" in inspect.getsource(relay.deliver_to_bridge)

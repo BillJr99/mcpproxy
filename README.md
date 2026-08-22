@@ -79,6 +79,15 @@ and runs the setup in the background**:
   serves the provider list, status polling and the pending-auth banner.
 - The OAuth callback forwarders bind before any of that, so an authorization callback
   arriving mid-startup still has somewhere to land.
+- `mcp-remote` bridges are warmed **concurrently**. One that needs a browser holds its
+  spawn open for its whole `--auth-timeout` window, so warming them in sequence let a
+  single such provider stop every later one from being warmed at all — those stayed in
+  neither state and the UI reported them as `unknown` for as long as the human took.
+
+While a bridge is mid-authorization, introspecting the same provider (opening it in the
+editor, or the wizard's re-scan) is refused rather than starting a second `mcp-remote`
+process — two would overwrite each other's stored PKCE verifier. That is reported as a
+state, with the authorization link that unblocks it, not as an error.
 - Every tool is advertised right away, so MCP clients see the full tool list at
   once.
 - A call to a tool whose provider is **still installing** returns a structured

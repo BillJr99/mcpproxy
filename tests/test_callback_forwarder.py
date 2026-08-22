@@ -5,8 +5,10 @@ import threading
 
 import pytest
 
+import callback_forwarder
 from callback_forwarder import (
     CallbackForwarder,
+    active_forwarders,
     non_loopback_ipv4_addresses,
     parse_forward_ports,
     start_callback_forwarders,
@@ -79,6 +81,9 @@ class TestCallbackForwarder:
             def start(self):
                 return self
 
+            def stop(self):
+                callback_forwarder._active_forwarders.remove(self)
+
         monkeypatch.setattr("callback_forwarder.CallbackForwarder", FakeForwarder)
         monkeypatch.setattr(
             "callback_forwarder.non_loopback_ipv4_addresses",
@@ -92,4 +97,57 @@ class TestCallbackForwarder:
             ("10.0.0.2", 8887),
             ("10.0.0.2", 9000),
         ]
+        for forwarder in started:
+            forwarder.stop()
         assert len(started) == 4
+
+
+class TestActiveForwarderRegistry:
+    """The UI reports which relays actually bound, so the registry must track
+    exactly what start_callback_forwarders started — no more, no less."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_registry(self):
+        callback_forwarder._active_forwarders.clear()
+        yield
+        callback_forwarder._active_forwarders.clear()
+
+    def _free_port(self) -> int:
+        with socket.socket() as probe:
+            probe.bind(("", 0))
+            return probe.getsockname()[1]
+
+    def test_registers_on_start_and_deregisters_on_stop(self):
+        assert active_forwarders() == []
+        forwarders = start_callback_forwarders([self._free_port()])
+        try:
+            assert len(active_forwarders()) == len(forwarders)
+            assert all(f in active_forwarders() for f in forwarders)
+        finally:
+            for forwarder in forwarders:
+                forwarder.stop()
+        assert active_forwarders() == []
+
+    def test_directly_constructed_forwarders_stay_out_of_the_registry(self):
+        forwarder = CallbackForwarder(
+            non_loopback_ipv4_addresses()[0], self._free_port()
+        ).start()
+        try:
+            assert active_forwarders() == []
+        finally:
+            forwarder.stop()
+
+    def test_a_failed_start_rolls_the_registry_back(self):
+        blocked = self._free_port()
+        blocker = socket.socket()
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind((non_loopback_ipv4_addresses()[0], blocked))
+        blocker.listen(1)
+        try:
+            # The first port binds and registers; the second collides, so the
+            # rollback has to un-register the one that succeeded.
+            with pytest.raises(OSError):
+                start_callback_forwarders([self._free_port(), blocked])
+        finally:
+            blocker.close()
+        assert active_forwarders() == []

@@ -50,6 +50,14 @@ AUTH_INIT_TIMEOUT = float(os.environ.get("MCPPROXY_AUTH_INIT_TIMEOUT", "300"))
 # server) polls this so it can show the link while a spawn is blocked on auth.
 pending_auth_urls: dict[str, str] = {}
 
+# Loopback callback port mcp-remote reported for each spawn command, scraped
+# from stderr.  This is what the manual-callback replay aims at: when the
+# provider YAML omits the port argument mcp-remote picks one at random and only
+# ever announces it here.  Deliberately *not* cleared when a flow completes —
+# the port is a durable fact about the command, and whether anything is
+# actually listening is answered by a TCP probe, not by membership in this dict.
+callback_listener_ports: dict[str, int] = {}
+
 # Commands whose MCP initialize handshake has completed successfully in this
 # process. Provider-status APIs use this to distinguish dependency setup from
 # a live authenticated remote bridge. No tokens or authorization URLs live in
@@ -63,6 +71,11 @@ _AUTH_HINT_RE = re.compile(
     r"authoriz|oauth|visit (?:this|the following)|open (?:this|the following)",
     re.IGNORECASE,
 )
+# "Using specified callback port: 8887" / "Using automatically selected
+# callback port: 3334" — mcp-remote announces the loopback listener it is about
+# to bind.  Matched on its own, without _AUTH_HINT_RE, because the line need not
+# mention authorization at all.
+_CALLBACK_PORT_RE = re.compile(r"callback (?:server )?port[:\s]+(\d{1,5})", re.IGNORECASE)
 
 
 def _extract_auth_url(line: str) -> str | None:
@@ -73,6 +86,26 @@ def _extract_auth_url(line: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _valid_port(value: int | None) -> int | None:
+    return value if value is not None and 1 <= value <= 65535 else None
+
+
+def _extract_callback_port(line: str) -> int | None:
+    """Return the loopback callback port mcp-remote announced on *line*."""
+    m = _CALLBACK_PORT_RE.search(line)
+    if m:
+        return _valid_port(int(m.group(1)))
+    # Fall back to the port of any loopback URL on the line, e.g.
+    # "OAuth callback server listening at http://127.0.0.1:8887".
+    m = _URL_RE.search(line)
+    if not m or not _is_loopback_url(m.group(0)):
+        return None
+    try:
+        return _valid_port(urlparse(m.group(0)).port)
+    except ValueError:
+        return None
+
+
 def _is_loopback_url(url: str) -> bool:
     """Return whether *url* points at a local callback listener."""
     try:
@@ -81,6 +114,24 @@ def _is_loopback_url(url: str) -> bool:
         }
     except ValueError:
         return False
+
+
+def _auth_timeout_from_command(parts: list[str]) -> float | None:
+    """Return mcp-remote's ``--auth-timeout`` (seconds) if the command sets one."""
+    for i, token in enumerate(parts):
+        if token == "--auth-timeout" and i + 1 < len(parts):
+            raw = parts[i + 1]
+        elif token.startswith("--auth-timeout="):
+            raw = token.split("=", 1)[1]
+        else:
+            continue
+        try:
+            seconds = float(raw)
+        except ValueError:
+            return None
+        # An absurd value is a typo, not an instruction to wait a week.
+        return seconds if 0 < seconds <= 86400 else None
+    return None
 
 
 class ProcessSession:
@@ -106,6 +157,14 @@ class ProcessSession:
         self._stderr_task: asyncio.Task | None = None
         # Authorization URL most recently printed by the subprocess, if any.
         self.pending_auth_url: str | None = None
+        # mcp-remote holds the handshake open for its own --auth-timeout.
+        # Abandoning initialize before then kills the OAuth callback listener
+        # out from under a user who is still authorizing — and out from under
+        # the manual-callback paste flow, which replays into that listener.
+        declared = _auth_timeout_from_command(self._parts)
+        self.init_timeout = (
+            max(AUTH_INIT_TIMEOUT, declared + 30) if declared else AUTH_INIT_TIMEOUT
+        )
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -148,6 +207,9 @@ class ProcessSession:
                 self._stderr_tail.append(line)
                 if len(self._stderr_tail) > 50:
                     del self._stderr_tail[:-50]
+                port = _extract_callback_port(line)
+                if port is not None:
+                    callback_listener_ports[self.command] = port
                 url = _extract_auth_url(line)
                 if url:
                     # mcp-remote prints both the provider authorization URL and
@@ -213,8 +275,9 @@ class ProcessSession:
         })
         # A generous timeout: an OAuth bridge (mcp-remote) holds the handshake
         # open until the interactive browser authorization completes.  With a
-        # valid cached token this returns immediately.
-        await self._recv(timeout=AUTH_INIT_TIMEOUT)   # initialize response
+        # valid cached token this returns immediately.  self.init_timeout
+        # honours the command's own --auth-timeout so we never give up first.
+        await self._recv(timeout=self.init_timeout)   # initialize response
         # Handshake completed → any pending authorization is resolved.
         self._clear_pending_auth()
         authenticated_commands.add(self.command)

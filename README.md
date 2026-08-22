@@ -1381,8 +1381,14 @@ package:
 
 ```bash
 # .env — the full header value, not just the token
-GITHUB_MCP_AUTH_HEADER=Bearer ghp_...
+GITHUB_MCP_AUTH_HEADER="Bearer ghp_..."
 ```
+
+The quotes matter here: `run_local.sh` loads the file with `set -a; source`, so an unquoted
+`Bearer ghp_...` would assign only `Bearer` and then try to run the rest as a command. The
+Secrets manager quotes values for you whenever they contain a space or another character the
+shell would act on, and leaves ordinary settings unquoted; one level of quoting is enough,
+and mcpproxy strips it before handing the value to the bridge.
 
 `env_keys` makes the value re-read from `MCP_ENV_FILE` on every spawn, so a secret you add
 through the **🔑 Secrets** manager takes effect on the next spawn rather than only after a

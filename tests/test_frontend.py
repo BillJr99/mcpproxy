@@ -3173,3 +3173,89 @@ class TestBridgeErrorBanner:
     def test_the_banner_escapes_provider_names_and_messages(self, client):
         html = client.get("/").text
         assert "`<b>${esc(name)}</b>: ${esc(st.bridge_error)}`" in html
+
+
+class TestEnvValueQuoting:
+    """run_local.sh does `set -a; source "$ENV_FILE"`, so a value with a space
+    written raw assigns only its first word and then tries to run the rest."""
+
+    def test_a_multi_word_value_is_quoted_on_write(self, tmp_path):
+        from frontend.app import _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"GITHUB_MCP_AUTH_HEADER": "Bearer ghp_abc"})
+        assert 'GITHUB_MCP_AUTH_HEADER="Bearer ghp_abc"' in f.read_text()
+
+    def test_a_shell_sourcing_the_file_sees_the_whole_value(self, tmp_path):
+        import subprocess
+
+        from frontend.app import _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"TOKEN": "Bearer ghp_abc", "OTHER": "x"})
+        out = subprocess.run(
+            ["bash", "-c", f'set -a; source "{f}"; set +a; printf "%s" "$TOKEN"'],
+            capture_output=True,
+            text=True,
+        )
+        assert out.stdout == "Bearer ghp_abc"
+
+    def test_ordinary_values_stay_unquoted(self, tmp_path):
+        from frontend.app import _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"MCP_SERVER_NAME": "mcpproxy"})
+        assert "MCP_SERVER_NAME=mcpproxy\n" in f.read_text()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Bearer ghp_abc",
+            'has"a quote',
+            "has'an apostrophe",
+            "has$dollar and space",
+            "has`backtick`",
+            "trailing space ",
+            "a#b c",
+            "back\\slash here",
+            "",
+        ],
+    )
+    def test_every_awkward_value_round_trips(self, tmp_path, value):
+        from frontend.app import _read_env_file, _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"K": value})
+        assert _read_env_file(f)["K"] == value
+
+    @pytest.mark.parametrize(
+        "value", ["Bearer ghp_abc", 'has"quote', "has$dollar", "a#b c"]
+    )
+    def test_a_shell_agrees_with_the_reader(self, tmp_path, value):
+        import subprocess
+
+        from frontend.app import _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"K": value})
+        out = subprocess.run(
+            ["bash", "-c", f'set -a; source "{f}"; set +a; printf "%s" "$K"'],
+            capture_output=True,
+            text=True,
+        )
+        assert out.stdout == value
+
+    def test_a_hand_written_unquoted_value_still_reads(self, tmp_path):
+        from frontend.app import _read_env_file
+
+        # Files written before this change, or by hand, must keep working.
+        f = tmp_path / ".env"
+        f.write_text("K=Bearer ghp_abc\n")
+        assert _read_env_file(f)["K"] == "Bearer ghp_abc"
+
+    def test_a_hand_written_single_quoted_value_still_reads(self, tmp_path):
+        from frontend.app import _read_env_file
+
+        f = tmp_path / ".env"
+        f.write_text("K='Bearer ghp_abc'\n")
+        assert _read_env_file(f)["K"] == "Bearer ghp_abc"

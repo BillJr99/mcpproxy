@@ -25,6 +25,8 @@ import traceback
 from typing import Any
 from urllib.parse import urlparse
 
+from config import env_unquote
+
 # ---------------------------------------------------------------------------
 # OAuth-bridge (mcp-remote) support
 # ---------------------------------------------------------------------------
@@ -171,9 +173,14 @@ def check_header_credentials(command: str, env: dict[str, str]) -> str | None:
                 "credential. Put the full header value in it."
             )
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            # Quotes in the *file* are correct and often required — a value with
+            # a space has to be quoted or the shell that sources .env truncates
+            # it. Quotes still present here means they survived unquoting, i.e.
+            # the value was quoted twice.
             return (
-                f"{var} is wrapped in quotes, which are sent as part of the "
-                f"{header} header. Store the value without surrounding quotes."
+                f"{var} still has surrounding quotes after parsing, so they "
+                f"would be sent as part of the {header} header — the value is "
+                "quoted twice. One level of quoting in .env is enough."
             )
     return None
 
@@ -569,7 +576,7 @@ class ProcessSession:
                     k, _, v = line.partition("=")
                     k = k.strip()
                     if k in self.env_keys:
-                        env[k] = v.strip().strip('"').strip("'")
+                        env[k] = env_unquote(v)
         except Exception:
             traceback.print_exc()
         return env

@@ -250,8 +250,19 @@ class ProcessSession:
     async def _send(self, msg: dict[str, Any]) -> None:
         assert self._proc and self._proc.stdin
         data = json.dumps(msg, separators=(",", ":")) + "\n"
-        self._proc.stdin.write(data.encode())
-        await self._proc.stdin.drain()
+        try:
+            self._proc.stdin.write(data.encode())
+            await self._proc.stdin.drain()
+        except (RuntimeError, BrokenPipeError, ConnectionResetError) as exc:
+            # The subprocess died before we could write — a bridge that fails
+            # fatally during startup loses its stdin between spawn and the
+            # initialize request.  The transport's own message names an internal
+            # uvloop handle and explains nothing, so report the real cause.
+            stderr_tail = await self._drain_stderr_tail()
+            suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
+            raise EOFError(
+                f"MCP process exited before it could be initialized{suffix}"
+            ) from None
 
     async def _recv(self, timeout: float = 30.0) -> dict[str, Any]:
         assert self._proc and self._proc.stdout

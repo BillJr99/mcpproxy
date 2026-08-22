@@ -55,6 +55,16 @@ is added automatically when the tool is registered.
 | **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
 | **8887** | Loopback-only OAuth callback for containerized `mcp-remote` bridges. Bound by `mcp-remote` itself, not by mcpproxy, and only while a flow is pending — see [Manual OAuth callback](#manual-oauth-callback). |
 
+## Message size
+
+One MCP message is one line on the subprocess's stdout, and asyncio caps a line at 64 KiB by
+default. Servers with large tool lists (Asana's, for one) exceed that on the `initialize` or
+`tools/list` reply, which used to surface as
+`Separator is found, but chunk is longer than limit` and made the server unusable.
+
+mcpproxy reads with a 16 MiB ceiling instead. Raise it with `MCPPROXY_STREAM_LIMIT` (bytes) if
+a server sends something larger; the error message names the variable when it happens.
+
 ## Non-blocking startup
 
 Provider setup — cloning/building repository providers, `pip install`-ing each
@@ -1319,6 +1329,44 @@ on the handshake, so a slow browser flow does not get its callback listener kill
 it. With no such flag the wait is `MCPPROXY_AUTH_INIT_TIMEOUT` (default 300s), which also acts
 as a floor.
 
+#### Passing a token instead of doing OAuth
+
+Not every remote MCP server uses `mcp-remote`'s OAuth flow. Some — the GitHub Copilot
+endpoint among them — authenticate with a token in a header and do **not** support dynamic
+client registration, so letting `mcp-remote` fall back to OAuth ends in
+`Incompatible auth server: does not support dynamic client registration`.
+
+`mcp-remote` substitutes `${VAR}` in a `--header` value **itself, inside the child process**,
+so the variable has to be present in that child's environment. Declare it under
+`package.env_keys` and put the value in `.env`:
+
+```yaml
+package:
+  command: >-
+    npx -y mcp-remote https://api.githubcopilot.com/mcp/
+    --header Authorization:${GITHUB_MCP_AUTH_HEADER}
+    --header X-MCP-Toolsets:all
+  env_keys:
+    - GITHUB_MCP_AUTH_HEADER
+```
+
+```bash
+# .env — the full header value, not just the token
+GITHUB_MCP_AUTH_HEADER=Bearer ghp_...
+```
+
+`env_keys` makes the value re-read from `MCP_ENV_FILE` on every spawn, so a secret you add
+through the **🔑 Secrets** manager takes effect on the next spawn rather than only after a
+container restart. Without it, a variable is picked up only if it was in `.env` when the
+container started (compose loads it via `env_file`; nothing re-reads it afterwards).
+
+If the variable is missing, `mcp-remote` sends an empty header, the server answers 401, and
+the bridge falls into the OAuth path. mcpproxy detects that and shows the provider with a
+**✗ bridge failed** badge naming the variable, rather than a misleading authorization prompt.
+
+> `secrets.env` is a different mechanism and does **not** apply here: on a package provider it
+> injects the value as a *tool-call argument*, not an environment variable.
+
 #### Docker callback forwarding
 
 `mcp-remote@0.1.38` intentionally listens on `127.0.0.1` inside the container. Ordinary
@@ -1462,6 +1510,9 @@ at its root, mcpproxy parses it after the clone step and surfaces every
 1. The wizard's **Secrets** step (so you can fill in values immediately).
 2. The provider's `repository.env_keys` list in YAML (editable in the
    **📂 Repository** editor box).
+
+A plain `package:` provider can declare the same thing as `package.env_keys` — see
+[Passing a token instead of doing OAuth](#passing-a-token-instead-of-doing-oauth).
 
 Values themselves live in `MCP_ENV_FILE` (the proxy's `.env`) — the same
 storage every other secret uses. At spawn time and on every restart, the

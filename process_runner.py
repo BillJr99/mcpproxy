@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shlex
+import threading
 import traceback
 from typing import Any
 from urllib.parse import urlparse
@@ -45,6 +46,12 @@ from urllib.parse import urlparse
 # MCPPROXY_AUTH_INIT_TIMEOUT.
 AUTH_INIT_TIMEOUT = float(os.environ.get("MCPPROXY_AUTH_INIT_TIMEOUT", "300"))
 
+# asyncio caps a StreamReader line at 64 KiB.  One MCP JSON-RPC message is one
+# line, and an initialize reply or a large tools/list routinely exceeds that —
+# readline() then raises ValueError("...chunk is longer than limit") and the
+# server is unusable through the proxy.  Raise the ceiling instead.
+STREAM_LIMIT = int(os.environ.get("MCPPROXY_STREAM_LIMIT", str(16 * 1024 * 1024)))
+
 # Latest pending authorization URL per spawn command, populated from stderr.
 # The UI (same process — the frontend runs as a daemon thread inside the MCP
 # server) polls this so it can show the link while a spawn is blocked on auth.
@@ -64,6 +71,20 @@ callback_listener_ports: dict[str, int] = {}
 # this set.
 authenticated_commands: set[str] = set()
 
+# Why a command's bridge last failed to start, in words a user can act on.
+# A crashed bridge otherwise leaves no trace in the UI at all: setup succeeded
+# (handlers are just closures), so the provider reports "ready" and the real
+# cause reaches only the server's stdout.
+bridge_errors: dict[str, str] = {}
+
+# Commands with a spawn in flight, guarded by a plain threading.Lock because
+# the startup warm-up runs asyncio.run on its own thread while the UI runs a
+# different loop.  Two bridges for one remote server share mcp-remote's on-disk
+# PKCE verifier and overwrite each other, so the callback for the first flow
+# then fails with "code_verifier does not match".
+_spawning: set[str] = set()
+_spawn_lock = threading.Lock()
+
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 # Lines that hint mcp-remote (or a similar bridge) is asking the user to
 # authorize.  Matched case-insensitively against each stderr line.
@@ -76,11 +97,65 @@ _AUTH_HINT_RE = re.compile(
 # to bind.  Matched on its own, without _AUTH_HINT_RE, because the line need not
 # mention authorization at all.
 _CALLBACK_PORT_RE = re.compile(r"callback (?:server )?port[:\s]+(\d{1,5})", re.IGNORECASE)
+# Lines that satisfy _AUTH_HINT_RE but are not an invitation to visit anything:
+# OAuth discovery output ("Discovered authorization server: <issuer>"), warnings,
+# and error dumps carrying an errorUri.  Without this the issuer *base* URL gets
+# published as the pending authorization URL and the UI offers a dead link.
+_AUTH_NOISE_RE = re.compile(
+    r"discover(?:ing|ed)|authorization server|error|warning|fatal", re.IGNORECASE
+)
+
+
+# mcp-remote failures a user can actually do something about.  Each entry maps
+# a stderr pattern to a sentence naming the remedy; anything unrecognised falls
+# back to the last stderr line, so something useful always surfaces.
+_FAILURE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"Environment variable '([^']+)' not found for header '([^']+)'"),
+        "{0} is not set in the bridge's environment, so the {1} header was sent "
+        "empty. Add it to .env and restart, or declare it under the provider's "
+        "package.env_keys so it is picked up on the next spawn.",
+    ),
+    (
+        re.compile(r"does not support dynamic client registration", re.IGNORECASE),
+        "This server does not support dynamic client registration, so mcp-remote "
+        "cannot register itself. Supply a pre-registered client with "
+        "--static-oauth-client-info @<file>, or authenticate with a token using "
+        "--header instead of OAuth.",
+    ),
+    (
+        re.compile(r"code_verifier does not match", re.IGNORECASE),
+        "The callback belonged to a different authorization attempt. Start a "
+        "fresh authorization and use the link it produces.",
+    ),
+    (
+        re.compile(r"invalid_client|InvalidClientError", re.IGNORECASE),
+        "The OAuth client credentials were rejected. Check the client id and "
+        "secret in the file passed to --static-oauth-client-info.",
+    ),
+)
+
+
+def _classify_failure(lines: list[str]) -> str | None:
+    """Return an actionable explanation for a bridge failure, if one is known.
+
+    Patterns are tried in table order, not log order, because the last error a
+    bridge prints is usually downstream of the real cause.  A missing header
+    variable, for instance, makes mcp-remote fall back to OAuth and *then* fail
+    on dynamic client registration — reporting that second error would send the
+    user off to register a client when all they need is to set the variable.
+    """
+    for pattern, template in _FAILURE_PATTERNS:
+        for line in lines:
+            m = pattern.search(line)
+            if m:
+                return template.format(*m.groups())
+    return None
 
 
 def _extract_auth_url(line: str) -> str | None:
     """Return an authorization URL from *line* if it looks like an auth prompt."""
-    if not _AUTH_HINT_RE.search(line):
+    if not _AUTH_HINT_RE.search(line) or _AUTH_NOISE_RE.search(line):
         return None
     m = _URL_RE.search(line)
     return m.group(0) if m else None
@@ -180,7 +255,15 @@ class ProcessSession:
 
     async def _recv(self, timeout: float = 30.0) -> dict[str, Any]:
         assert self._proc and self._proc.stdout
-        line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
+        try:
+            line = await asyncio.wait_for(self._proc.stdout.readline(), timeout=timeout)
+        except ValueError as exc:
+            # readline() raises this when one line exceeds the stream limit.
+            # asyncio's wording ("chunk is longer than limit") names no remedy.
+            raise RuntimeError(
+                f"MCP server sent a message longer than {STREAM_LIMIT} bytes "
+                f"({exc}). Raise MCPPROXY_STREAM_LIMIT."
+            ) from None
         if not line:
             # The subprocess closed stdout — usually means it crashed.  Drain
             # stderr (best-effort, non-blocking) so the caller sees the actual
@@ -247,9 +330,23 @@ class ProcessSession:
         return text[-max_bytes:]
 
     async def _start(self) -> None:
+        try:
+            await self._start_inner()
+        except Exception as exc:
+            # Nothing else records why a bridge died: setup "succeeds" because
+            # handlers are only closures, so without this the provider reports
+            # ready and the cause reaches the server's stdout and nowhere else.
+            bridge_errors[self.command] = (
+                _classify_failure(self._stderr_tail)
+                or (self._stderr_tail[-1] if self._stderr_tail else str(exc))
+            )
+            raise
+
+    async def _start_inner(self) -> None:
         # A new spawn must prove its current credentials before it is reported
         # as authenticated. A later successful handshake adds it back below.
         authenticated_commands.discard(self.command)
+        bridge_errors.pop(self.command, None)
         env = self._build_env()
         self._proc = await asyncio.create_subprocess_exec(
             *self._parts,
@@ -258,6 +355,7 @@ class ProcessSession:
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd,
             env=env,
+            limit=STREAM_LIMIT,
         )
         # Begin scraping stderr immediately so an OAuth authorization URL is
         # captured even though the initialize response below blocks until the
@@ -280,6 +378,7 @@ class ProcessSession:
         await self._recv(timeout=self.init_timeout)   # initialize response
         # Handshake completed → any pending authorization is resolved.
         self._clear_pending_auth()
+        bridge_errors.pop(self.command, None)
         authenticated_commands.add(self.command)
         # notifications/initialized (no response expected)
         await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -402,6 +501,10 @@ def get_session(
     return _sessions[key]
 
 
+class ConcurrentSpawnError(RuntimeError):
+    """A throwaway spawn was refused because one is already in flight."""
+
+
 async def introspect(
     command: str,
     cwd: str | None = None,
@@ -410,7 +513,26 @@ async def introspect(
     """
     Spawn a *fresh* process, fetch its tools/list, then shut it down.
     Used by the frontend wizard — does not affect the persistent session registry.
+
+    Refuses to run while another throwaway spawn of the same command is in
+    flight.  Two mcp-remote processes for one remote server share the PKCE
+    verifier cached under MCP_REMOTE_CONFIG_DIR and overwrite each other, so
+    the callback for the first flow then dies with "code_verifier does not
+    match the stored code challenge".  Startup warm-up, the wizard and the
+    re-authorize button can all reach this at once.
+
+    Persistent tool-call sessions (``get_session``) are deliberately *not*
+    guarded: they are already one per command, and blocking a real tool call
+    behind a warm-up parked on an OAuth prompt would be worse than the race.
     """
+    with _spawn_lock:
+        if command in _spawning:
+            raise ConcurrentSpawnError(
+                f"A bridge for '{command}' is already starting — it may be "
+                "waiting for authorization. Wait for it to finish rather than "
+                "starting a second one."
+            )
+        _spawning.add(command)
     session = ProcessSession(command, cwd=cwd, env_keys=env_keys)
     try:
         await session._start()
@@ -420,3 +542,5 @@ async def introspect(
         raise RuntimeError(f"Failed to introspect '{command}': {exc}") from exc
     finally:
         await session.close()
+        with _spawn_lock:
+            _spawning.discard(command)

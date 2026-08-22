@@ -200,6 +200,22 @@ def parse_callback_input(raw: str) -> tuple[str, dict[str, str]]:
     return path, params
 
 
+def authorize_url_state(url: str) -> str | None:
+    """Return the ``state`` an authorization URL carries, if any.
+
+    Used to check that a pasted callback belongs to the flow that is currently
+    waiting.  A callback from an earlier attempt still has a syntactically valid
+    code, but the bridge has since generated a new PKCE verifier, so delivering
+    it burns the single-use code and fails with an opaque
+    "code_verifier does not match the stored code challenge".
+    """
+    try:
+        params = dict(parse_qsl(urlsplit(url).query, keep_blank_values=False))
+    except ValueError:
+        return None
+    return params.get("state") or None
+
+
 # ---------------------------------------------------------------------------
 # Delivery + liveness
 # ---------------------------------------------------------------------------

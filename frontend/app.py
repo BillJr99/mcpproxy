@@ -130,10 +130,13 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
             if key not in keys:
                 keys.append(key)
     # Repository providers may declare extra env keys (auto-discovered from
-    # the cloned repo's .env.example) that drive the underlying server.
-    for key in (spec.get("repository") or {}).get("env_keys") or []:
-        if key and key not in keys:
-            keys.append(key)
+    # the cloned repo's .env.example) that drive the underlying server, and
+    # package providers may declare them for a command that interpolates a
+    # secret itself (e.g. mcp-remote --header Authorization:${VAR}).
+    for block in ("repository", "package"):
+        for key in (spec.get(block) or {}).get("env_keys") or []:
+            if key and key not in keys:
+                keys.append(key)
     # REST providers reference auth secrets by env-var name (``*_env`` keys) in
     # the auth block, so surface those for the Secrets UI / missing-secrets badge.
     for key in _rest_auth_env_keys(spec):
@@ -1074,6 +1077,20 @@ def create_app(
                 f"No authorization is currently pending for '{target}'. Start the "
                 "flow with the Authorize link first, then paste the callback URL.",
             )
+        # A callback from a previous attempt still parses, but the bridge has
+        # since generated a new PKCE verifier — delivering it would burn the
+        # single-use code and fail with an opaque code_verifier mismatch.
+        from process_runner import pending_auth_urls
+
+        expected = relay.authorize_url_state(pending_auth_urls.get(command, ""))
+        if expected and state and expected != state:
+            raise HTTPException(
+                409,
+                "This callback is from an earlier authorization attempt. Open the "
+                "current authorization link (or use Restart to get a new one) and "
+                "paste the URL that flow produces.",
+            )
+
         port, _source = relay.resolve_callback_port(command)
         if port is None:
             raise HTTPException(
@@ -1731,6 +1748,18 @@ def create_app(
             return ""
         return ((_get_package_spec(spec) or {}).get("command") or "").strip()
 
+    def _spawn_env_keys_for(target: str) -> list[str]:
+        """Env keys to refresh from .env for *target*'s spawn (provider name)."""
+        from server import _spawn_env_keys
+
+        try:
+            spec = yaml.safe_load(
+                (_config_dir / f"{target}.yaml").read_text(encoding="utf-8")
+            ) or {}
+        except (OSError, yaml.YAMLError):
+            return []
+        return _spawn_env_keys(spec)
+
     def _remote_auth_status(command: str) -> str | None:
         """Authentication tri-state for an mcp-remote bridge; None if not one."""
         import process_runner as _pr
@@ -1752,6 +1781,13 @@ def create_app(
         ``"authorization_required"``, ``"authenticated"``, or ``"unknown"``.
         Non-remote providers return ``null`` for ``auth_status``.
 
+        ``bridge_error`` explains why the provider's subprocess last failed to
+        start, when it did.  It is a separate axis from ``status`` on purpose:
+        building a package provider's handlers only creates closures, so setup
+        legitimately reports ready even when every spawn dies.  Flipping
+        ``status`` to failed would also make its tools refuse to run after the
+        user fixes the cause.
+
         Returns ``{"ok": True, "providers": {}}`` when the background-startup
         module is not loaded (e.g. ``MCPPROXY_BACKGROUND_SETUP=0``).
         """
@@ -1764,6 +1800,7 @@ def create_app(
                     "status": state.status,
                     "setup_status": state.status,
                     "auth_status": _remote_auth_status(_provider_command(name)),
+                    "bridge_error": _pr.bridge_errors.get(_provider_command(name)),
                     "error": state.error,
                 }
 
@@ -1821,7 +1858,9 @@ def create_app(
 
         task = _reauth_tasks.get(command)
         if task is None or task.done():
-            task = asyncio.ensure_future(introspect(command))
+            task = asyncio.ensure_future(
+                introspect(command, env_keys=_spawn_env_keys_for(target))
+            )
             task.add_done_callback(_swallow_reauth_result)
             _reauth_tasks[command] = task
 
@@ -1915,6 +1954,7 @@ def create_app(
                 "port_source": source,
                 "pending_authorization": command in pending,
                 "authenticated": command in _pr.authenticated_commands,
+                "bridge_error": _pr.bridge_errors.get(command),
             })
 
         # Probe each distinct port once — per-provider ports and every configured
@@ -3215,11 +3255,13 @@ async function pollProviderStatus() {
   } catch { return; }
   // Remove ⏳ badges the moment a provider flips to READY, however long it took.
   updateStatusBadges();
-  // Stop polling once every provider has settled (ready or failed — no pending).
-  // Providers never go back to pending without a server restart, so no future
-  // ticks would change anything.
-  const hasPending = Object.values(_providerStatus).some(s => s.status === 'pending');
-  if (!hasPending && _statusPollTimer !== null) {
+  // Stop polling once every provider has settled. Setup state never returns to
+  // pending without a restart, but bridge health does move on its own — a spawn
+  // can recover or fail after setup settles — so keep ticking while any bridge
+  // is unhealthy or waiting on authorization.
+  const unsettled = Object.values(_providerStatus).some(s =>
+    s.status === 'pending' || s.bridge_error || s.auth_status === 'authorization_required');
+  if (!unsettled && _statusPollTimer !== null) {
     clearInterval(_statusPollTimer);
     _statusPollTimer = null;
   }
@@ -3230,8 +3272,17 @@ function updateStatusBadges() {
     const name = el.dataset.name;
     const st = _providerStatus[name];
     let badge = el.querySelector('.status-init-badge');
-    // Provider is READY (or not tracked): remove any existing status badge.
-    if (!st || st.status === 'ready') {
+    // Setup state and bridge health are separate axes: building a package
+    // provider's handlers only makes closures, so setup reports ready even when
+    // every spawn of its subprocess dies. Show the bridge problem in that case
+    // rather than a clean row.
+    const bridge = st && (st.bridge_error
+      ? {cls: 'badge-status-failed', text: '✗ bridge failed', title: st.bridge_error}
+      : st.auth_status === 'authorization_required'
+        ? {cls: 'badge-warn', text: '🔐 authorize', title: 'This remote bridge is waiting for you to authorize'}
+        : null);
+    // Provider is READY (or not tracked) and its bridge is fine: no badge.
+    if (!st || (st.status === 'ready' && !bridge)) {
       if (badge) badge.remove();
       return;
     }
@@ -3254,6 +3305,10 @@ function updateStatusBadges() {
       badge.className = 'status-init-badge badge-status-failed';
       badge.title = st.error || 'Setup failed';
       badge.textContent = '✗ setup failed';
+    } else if (bridge) {
+      badge.className = 'status-init-badge ' + bridge.cls;
+      badge.title = bridge.title;
+      badge.textContent = bridge.text;
     }
   });
 }

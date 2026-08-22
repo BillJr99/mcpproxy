@@ -292,6 +292,24 @@ def register_tool(
         raise
 
 
+def _spawn_env_keys(spec: dict[str, Any]) -> list[str]:
+    """Env var names to refresh from MCP_ENV_FILE before spawning this provider.
+
+    ``repository.env_keys`` has always done this.  ``package.env_keys`` extends
+    it to plain package providers, which otherwise have no way to declare one:
+    a value added through the UI Secrets manager reaches them only after a full
+    container restart, because nothing re-reads .env into os.environ.  Commands
+    that interpolate a secret themselves — ``mcp-remote --header Auth:${VAR}``,
+    where mcp-remote does the substitution inside the child — need exactly this.
+    """
+    keys: list[str] = []
+    for block in ("repository", "package"):
+        for key in (spec.get(block) or {}).get("env_keys") or []:
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
 def _get_package_command(spec: dict[str, Any]) -> str | None:
     """Return the spawn command for package providers, or None for code providers."""
     sub = spec.get("package")
@@ -452,7 +470,7 @@ def build_tool_handlers(
     # difference is that their subprocess is spawned with cwd=<workdir>
     # and env enriched with the repository.env_keys declared in YAML.
     cwd = repository_workdir(provider_name, spec)
-    env_keys = list((spec.get("repository") or {}).get("env_keys") or [])
+    env_keys = _spawn_env_keys(spec)
 
     handlers: dict[str, tuple[dict[str, Any], Callable[..., Any]]] = {}
 
@@ -859,19 +877,22 @@ else:
 # Remote OAuth-bridge warm-up
 # ---------------------------------------------------------------------------
 
-def _remote_bridge_commands() -> list[str]:
-    """Return every package command that bridges a remote server via mcp-remote.
+def _remote_bridge_commands() -> list[tuple[str, str, list[str]]]:
+    """Return ``(provider_name, command, env_keys)`` for every mcp-remote bridge.
 
     These are the providers whose OAuth token cache benefits from being warmed
     on startup so the access token refreshes silently (and any needed
-    re-authorization is surfaced) before the first tool call.
+    re-authorization is surfaced) before the first tool call.  The name lets a
+    warm-up failure be attributed to a provider, and env_keys lets the spawn see
+    secrets that reached .env after this process started.
     """
-    commands: list[str] = []
+    bridges: list[tuple[str, str, list[str]]] = []
     for spec in load_provider_specs(CONFIG_DIR):
         command = _get_package_command(spec)
         if command and "mcp-remote" in command:
-            commands.append(command)
-    return commands
+            name = Path(spec.get("_config_path", "")).stem or "remote"
+            bridges.append((name, command, _spawn_env_keys(spec)))
+    return bridges
 
 
 def _warm_remote_providers() -> None:
@@ -885,21 +906,27 @@ def _warm_remote_providers() -> None:
     the user discovering it only on the first failed tool call.  Disable with
     MCPPROXY_WARM_REMOTE=0.
     """
-    commands = _remote_bridge_commands()
-    if not commands:
+    bridges = _remote_bridge_commands()
+    if not bridges:
         return
     import asyncio
 
-    from process_runner import introspect
+    from process_runner import bridge_errors, introspect
 
     async def _warm_all() -> None:
-        for command in commands:
+        for name, command, env_keys in bridges:
             print(f"[mcpproxy] warming mcp-remote bridge: {command}")
             try:
-                await introspect(command)
+                await introspect(command, env_keys=env_keys)
                 print(f"[mcpproxy] token cache ready for: {command}")
             except Exception as exc:  # noqa: BLE001 — best-effort warm-up
-                print(f"[mcpproxy] warm-up for '{command}' did not complete: {exc}")
+                # process_runner has already recorded an actionable reason in
+                # bridge_errors for the UI; repeat it here so the log says what
+                # to do rather than only that something closed stdout.
+                reason = bridge_errors.get(command)
+                print(f"[mcpproxy] warm-up for provider '{name}' did not complete: {exc}")
+                if reason:
+                    print(f"[mcpproxy] provider '{name}': {reason}")
 
     try:
         asyncio.run(_warm_all())

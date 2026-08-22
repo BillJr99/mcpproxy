@@ -1769,8 +1769,50 @@ def create_app(
 
     @app.get("/api/config")
     async def client_config() -> dict:
-        """Expose UI feature flags so the front end can hide disabled features."""
-        return {"ok": True, "web_terminal": _web_terminal_enabled()}
+        """Expose UI feature flags and server identity to the front end.
+
+        ``server_name`` is what MCP clients currently see (read at import, so it
+        is the value this process started with); ``pending_server_name`` is what
+        MCP_ENV_FILE now says, when the two differ — an edit is only picked up on
+        restart, and showing both is the difference between "saved" and "live".
+        """
+        from config import SERVER_NAME
+
+        stored = (_read_env_file(_env_file).get("MCP_SERVER_NAME") or "").strip()
+        return {
+            "ok": True,
+            "web_terminal": _web_terminal_enabled(),
+            "server_name": SERVER_NAME,
+            "pending_server_name": stored if stored and stored != SERVER_NAME else None,
+        }
+
+    @app.post("/api/server-name")
+    async def set_server_name(request: Request) -> dict:
+        """Persist MCP_SERVER_NAME to MCP_ENV_FILE.
+
+        This is the display name reported to MCP clients in the initialize
+        handshake.  It affects nothing else — tool names are namespaced from each
+        provider's YAML filename, not from this — so changing it cannot break a
+        provider, and it takes effect on the next restart.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "name is required")
+        if len(name) > 128:
+            raise HTTPException(400, "name must be 128 characters or fewer")
+        # Keep it to what an MCP client can display and a shell can round-trip
+        # through a .env file unquoted.
+        if not re.fullmatch(r"[A-Za-z0-9._\- ]+", name):
+            raise HTTPException(
+                400,
+                "name may contain only letters, digits, spaces, dots, dashes and "
+                "underscores",
+            )
+        _write_env_file(_env_file, {"MCP_SERVER_NAME": name})
+        from config import SERVER_NAME
+
+        return {"ok": True, "name": name, "restart_required": name != SERVER_NAME}
 
     def _provider_command(name: str) -> str:
         """Return a provider's package spawn command, or "" if it has none."""
@@ -2230,7 +2272,9 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
     <button class="btn btn-sm btn-outline-light" onclick="openToolTester()"
       title="Invoke any registered tool with custom arguments">🧪 Test Tools</button>
   </div>
-  <span class="ms-auto text-muted" style="font-size:.75em">MCP :8888 &nbsp;|&nbsp; UI :8889</span>
+  <button class="btn btn-sm btn-outline-light ms-auto" onclick="openSettings()"
+    title="Server identity reported to MCP clients">⚙ Settings</button>
+  <span class="text-muted ms-2" style="font-size:.75em">MCP :8888 &nbsp;|&nbsp; UI :8889</span>
 </nav>
 
 <!-- Pending OAuth authorization banner (surfaced by the startup warm-up) -->
@@ -2323,6 +2367,10 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
             <button class="btn btn-sm btn-outline-secondary py-0" id="reauth-manual-btn" style="display:none"
               onclick="openManualCallback(currentName)"
               title="Approved on another machine? Paste the callback URL instead of waiting for the redirect">📋 Paste callback URL</button>
+          </div>
+          <div id="package-token-note" class="text-muted mb-2" style="display:none;font-size:.8em">
+            🔑 This bridge authenticates with a token in a header, not OAuth — there is nothing to
+            re-authorize. Set or replace the value under <b>🔑 Secrets</b>.
           </div>
           <input id="f-command" class="form-control font-monospace"
             placeholder="npx @playwright/mcp@latest --isolated  ·  uvx mcp-server-fetch  ·  python -m mcp_server_github  ·  mcp-server-github"
@@ -2955,6 +3003,34 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
   </div>
 </div>
 
+<!-- Server settings -->
+<div class="modal fade" id="settings-modal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title">⚙ Settings</h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <label class="form-label" style="font-size:.85em">Server name</label>
+        <input id="settings-server-name" class="form-control form-control-sm font-monospace"
+          placeholder="mcpproxy" maxlength="128">
+        <div class="text-muted mt-1" style="font-size:.8em">
+          The name this proxy reports to MCP clients in the initialize handshake — what they show
+          in their server list. It affects nothing else: tool names are namespaced from each
+          provider's YAML filename, so changing this cannot break a provider. Stored as
+          <code>MCP_SERVER_NAME</code>; applied on the next restart.
+        </div>
+        <div id="settings-pending" class="fn-status mt-2" style="display:none"></div>
+        <div class="mt-3 d-flex align-items-center gap-2">
+          <button class="btn btn-sm btn-primary" onclick="saveSettings()">Save</button>
+          <div id="settings-result" class="fn-status"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Manual OAuth callback: complete a flow when the browser that approved it
      could not reach this host's callback listener (authorizing from a laptop
      while mcpproxy runs on a server). -->
@@ -3138,6 +3214,47 @@ function mcbLink(target, label, opts) {
     : '';
   const extra = (opts && opts.restart) ? `${arg ? '' : "''"},{restart:true}` : '';
   return `<a href="#" onclick="openManualCallback(${arg}${extra});return false">${esc(label || 'enter the callback URL manually')}</a>`;
+}
+
+let settingsModal = null;
+
+async function openSettings() {
+  settingsModal = settingsModal || new bootstrap.Modal(document.getElementById('settings-modal'));
+  const out = document.getElementById('settings-result');
+  const pending = document.getElementById('settings-pending');
+  out.textContent = '';
+  out.className = 'fn-status';
+  pending.style.display = 'none';
+  try {
+    const c = await api('GET', '/api/config');
+    document.getElementById('settings-server-name').value = c.pending_server_name || c.server_name || '';
+    if (c.pending_server_name) {
+      // Saved but not yet live: say so, rather than letting the field imply it took effect.
+      pending.className = 'fn-status busy';
+      pending.textContent = `Saved as "${c.pending_server_name}" — clients still see "${c.server_name}" until the server restarts.`;
+      pending.style.display = '';
+    }
+  } catch {}
+  settingsModal.show();
+}
+
+async function saveSettings() {
+  const name = (document.getElementById('settings-server-name').value || '').trim();
+  const out = document.getElementById('settings-result');
+  if (!name) { out.className = 'fn-status error'; out.textContent = 'Enter a server name.'; return; }
+  out.className = 'fn-status busy';
+  out.textContent = 'Saving…';
+  try {
+    const r = await api('POST', '/api/server-name', {name});
+    out.className = 'fn-status ok';
+    out.innerHTML = r.restart_required
+      ? 'Saved. <a href="#" onclick="restartServer();return false">Restart the server</a> to apply it.'
+      : 'Saved.';
+    toast('Server name saved');
+  } catch(e) {
+    out.className = 'fn-status error';
+    out.textContent = e.message || 'could not save';
+  }
 }
 
 function openManualCallback(target, opts) {
@@ -3639,8 +3756,14 @@ function renderProvider(p) {
     document.getElementById('f-command').value = p.command || '';
     renderPkgEnvKeys(p.pkg_env_keys || []);
     const isRemote = /\bmcp-remote\b/.test(p.command || '');
+    // A bridge that sends its own Authorization header does not use OAuth, so
+    // re-running the OAuth flow only ends in "does not support dynamic client
+    // registration". Point at the credential instead of offering a dead end.
+    const usesTokenHeader = /--header\s+Authorization:/i.test(p.command || '');
     document.getElementById('reauth-btn').style.display =
-      (isRemote && webTerminalEnabled) ? '' : 'none';
+      (isRemote && webTerminalEnabled && !usesTokenHeader) ? '' : 'none';
+    const tokenNote = document.getElementById('package-token-note');
+    tokenNote.style.display = (isRemote && usesTokenHeader) ? '' : 'none';
     // Pasting a callback URL needs no PTY, so this stays available even when
     // the web terminal is disabled.
     document.getElementById('reauth-manual-btn').style.display = isRemote ? '' : 'none';
@@ -4533,13 +4656,17 @@ async function openSecretsModal() {
   document.getElementById('secrets-provider-name').textContent = currentName;
   const env = await api('GET', '/api/env').catch(() => ({vars:{}, env_file:'.env'}));
   document.getElementById('secrets-env-path').textContent = env.env_file || '.env';
-  const keys = [];
+  const meta = providersMeta[currentName] || {};
+  // secret_keys is the server's own union (per-tool secrets, package.env_keys,
+  // repository.env_keys and REST auth *_env). It drives the "N secrets missing"
+  // badge, so reading it here keeps the badge and this dialog from disagreeing —
+  // they used to, and a package provider's declared variable never appeared.
+  const keys = [...(meta.secret_keys || [])];
   for (const t of currentProvider.tools) {
     for (const s of (t.secrets || [])) {
       if (s.env && !keys.includes(s.env)) keys.push(s.env);
     }
   }
-  const meta = providersMeta[currentName] || {};
   const info = meta.auth_info || null;
   // REST auth credentials (token_env, value_env, client_id_env, client_secret_env)
   // are declared in the auth block, not on a tool — surface them here too.

@@ -163,7 +163,12 @@ Open **`http://localhost:8889`** in your browser after starting the server.
   focus; the **↻ Re-scan** button forces a refresh. Failure is silent — the
   dropdown just falls back to "Other…" so you can always free-type.
 - **Save** — write the file; restart MCP server to reload
-- **🔑 Secrets** — manage `.env` values for secrets declared in this provider
+- **🔑 Secrets** — manage `.env` values for every variable the provider declares:
+  per-tool `secrets.env`, `package.env_keys`, `repository.env_keys`, and REST auth `*_env`
+- **⚙ Settings** (navbar) — the server name reported to MCP clients (`MCP_SERVER_NAME`).
+  It is only a display name: tool names are namespaced from each provider's YAML filename,
+  so changing it cannot break a provider. Applied on the next restart, and the dialog says
+  so while a saved value is not yet live.
 - **Delete** — remove the provider YAML
 
 ### New Provider wizard
@@ -1371,6 +1376,10 @@ the bridge falls into the OAuth path. mcpproxy detects that and shows the provid
 
 > `secrets.env` is a different mechanism and does **not** apply here: on a package provider it
 > injects the value as a *tool-call argument*, not an environment variable.
+
+A bridge configured this way does not use OAuth, so the editor hides **🔐 Re-authorize** for it —
+re-running that flow against a server without dynamic client registration only fails. Manage the
+credential under **🔑 Secrets** instead.
 
 #### Docker callback forwarding
 

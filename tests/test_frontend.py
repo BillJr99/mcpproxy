@@ -2842,3 +2842,80 @@ class TestUIStaysResponsiveDuringSlowWork:
         )
         assert r.status_code == 200
         assert threads and loop_thread not in threads
+
+
+class TestServerNameSetting:
+    """MCP_SERVER_NAME is the display name reported to MCP clients. It affects
+    nothing else — tool names come from each provider's YAML filename — so it is
+    safe to edit, but it only takes effect on restart."""
+
+    def test_config_reports_the_running_name(self, client):
+        body = client.get("/api/config").json()
+        assert body["server_name"]
+        assert body["pending_server_name"] is None
+
+    def test_saving_writes_the_env_file(self, client, env_path):
+        r = client.post("/api/server-name", json={"name": "mcpproxy"})
+        assert r.json()["ok"] is True
+        assert "MCP_SERVER_NAME=mcpproxy" in Path(env_path).read_text()
+
+    def test_a_saved_but_unapplied_name_is_reported_separately(self, client):
+        # Saying "saved" without saying "not yet live" would be misleading:
+        # clients keep seeing the old name until the process restarts.
+        client.post("/api/server-name", json={"name": "something-else"})
+        body = client.get("/api/config").json()
+        assert body["pending_server_name"] == "something-else"
+        assert body["server_name"] != "something-else"
+
+    @pytest.mark.parametrize(
+        "name", ["", "   ", "a; rm -rf /", "name\nwith-newline", "x" * 129]
+    )
+    def test_rejects_unusable_names(self, client, name):
+        assert client.post("/api/server-name", json={"name": name}).status_code == 400
+
+    @pytest.mark.parametrize("name", ["mcpproxy", "My Proxy", "mcp-proxy_2.0"])
+    def test_accepts_ordinary_names(self, client, name):
+        assert client.post("/api/server-name", json={"name": name}).status_code == 200
+
+    def test_ui_exposes_the_setting(self, client):
+        html = client.get("/").text
+        for needle in ("settings-modal", "openSettings()", "saveSettings", "/api/server-name"):
+            assert needle in html, needle
+
+
+class TestSecretsDialogShowsDeclaredKeys:
+    """The provider list badge and this dialog used to disagree: the badge counts
+    the server's union of secret keys, while the dialog only read per-tool
+    secrets — so a package provider's declared variable never appeared."""
+
+    def test_package_env_keys_reach_the_api(self, client, tools_dir):
+        (tools_dir / "ghcopilot.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "package": {
+                        "command": (
+                            "npx -y mcp-remote https://api.githubcopilot.com/mcp/ "
+                            "--header Authorization:${GITHUB_MCP_AUTH_HEADER}"
+                        ),
+                        "env_keys": ["GITHUB_MCP_AUTH_HEADER"],
+                    },
+                    "tools": [],
+                }
+            )
+        )
+        entry = next(
+            p for p in client.get("/api/tools").json() if p["name"] == "ghcopilot"
+        )
+        assert entry["secret_keys"] == ["GITHUB_MCP_AUTH_HEADER"]
+        assert entry["missing_secrets"] == ["GITHUB_MCP_AUTH_HEADER"]
+
+    def test_dialog_seeds_from_the_same_list_the_badge_uses(self, client):
+        html = client.get("/").text
+        # openSecretsModal must start from meta.secret_keys, not only per-tool
+        # secrets, or the two disagree again.
+        assert "const keys = [...(meta.secret_keys || [])];" in html
+
+    def test_token_header_bridges_are_not_offered_oauth_reauth(self, client):
+        html = client.get("/").text
+        assert "package-token-note" in html
+        assert "usesTokenHeader" in html

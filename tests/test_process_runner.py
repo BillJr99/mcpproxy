@@ -501,3 +501,39 @@ class TestConcurrentSpawnGuard:
         process_runner._spawning.add("npx -y mcp-remote https://a/mcp")
         with pytest.raises(RuntimeError, match="Failed to introspect"):
             await process_runner.introspect("definitely-not-a-real-binary-xyz")
+
+
+class TestSendToDeadProcess:
+    """A bridge that fails fatally during startup loses its stdin between spawn
+    and the initialize request. The transport's own error names an internal
+    uvloop handle and explains nothing."""
+
+    @pytest.mark.asyncio
+    async def test_reports_the_real_cause_with_the_stderr_tail(self):
+        session = process_runner.ProcessSession("irrelevant")
+        session._parts = [
+            "python3",
+            "-c",
+            "import sys; sys.stderr.write('Fatal error: Incompatible auth server: "
+            "does not support dynamic client registration\\n'); sys.exit(1)",
+        ]
+        session._proc = await asyncio.create_subprocess_exec(
+            *session._parts,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=process_runner.STREAM_LIMIT,
+        )
+        session._start_stderr_reader()
+        await session._proc.wait()
+        await asyncio.sleep(0.2)
+        session._proc.stdin.close()
+        await asyncio.sleep(0.1)
+
+        with pytest.raises(EOFError) as exc:
+            await session._send({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        message = str(exc.value)
+        assert "exited before it could be initialized" in message
+        assert "dynamic client registration" in message
+        # No uvloop transport internals leaking through the chain.
+        assert exc.value.__cause__ is None

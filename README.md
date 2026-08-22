@@ -55,6 +55,16 @@ is added automatically when the tool is registered.
 | **8889** | Web UI & OpenAI-compatible tools endpoint — `http://localhost:8889` |
 | **8887** | Loopback-only OAuth callback for containerized `mcp-remote` bridges. Bound by `mcp-remote` itself, not by mcpproxy, and only while a flow is pending — see [Manual OAuth callback](#manual-oauth-callback). |
 
+## Message correlation
+
+One MCP message is one line, but a line is not necessarily the reply to the request just
+sent: servers emit notifications (logging, progress, cancellation) whenever they like, and a
+reply that arrives after its caller timed out is still queued behind it. mcpproxy matches
+replies to requests by JSON-RPC id, so a notification is never mistaken for a response, a
+late reply is discarded rather than becoming the next call's answer, and a non-JSON line on
+stdout (a wrapper script's banner, say) is recorded for diagnostics instead of failing the
+call in flight.
+
 ## Message size
 
 One MCP message is one line on the subprocess's stdout, and asyncio caps a line at 64 KiB by
@@ -1379,9 +1389,16 @@ through the **🔑 Secrets** manager takes effect on the next spawn rather than 
 container restart. Without it, a variable is picked up only if it was in `.env` when the
 container started (compose loads it via `env_file`; nothing re-reads it afterwards).
 
-If the variable is missing, `mcp-remote` sends an empty header, the server answers 401, and
-the bridge falls into the OAuth path. mcpproxy detects that and shows the provider with a
-**✗ bridge failed** badge naming the variable, rather than a misleading authorization prompt.
+mcpproxy checks the value before spawning and refuses with a specific complaint when it is
+missing, set-but-empty, or wrapped in quotes — all of which reach the server as a broken
+header and come back as a 401 that `mcp-remote` then reports as an unrelated OAuth failure.
+If the credential is well-formed but the server rejects it anyway, the resulting
+"does not support dynamic client registration" error is reported as *the credential was
+rejected*, naming the variable, rather than advising you to register an OAuth client you do
+not need.
+
+Failures appear both as a **✗ bridge failed** badge on the provider and in a banner across
+the top, since a badge on an unselected row is easy to miss.
 
 > `secrets.env` is a different mechanism and does **not** apply here: on a package provider it
 > injects the value as a *tool-call argument*, not an environment variable.

@@ -3160,3 +3160,16 @@ class TestReauthorizeRaceSafety:
         finally:
             process_runner.pending_auth_urls.pop(command, None)
         assert "client_info.json" not in capsys.readouterr().out
+
+
+class TestBridgeErrorBanner:
+    def test_index_renders_a_bridge_failure_banner(self, client):
+        html = client.get("/").text
+        # A badge on an unselected provider row is easy to miss; a credential
+        # that is silently wrong should be visible on arrival.
+        for needle in ("bridge-banner", "updateBridgeBanner", "could not start"):
+            assert needle in html, needle
+
+    def test_the_banner_escapes_provider_names_and_messages(self, client):
+        html = client.get("/").text
+        assert "`<b>${esc(name)}</b>: ${esc(st.bridge_error)}`" in html

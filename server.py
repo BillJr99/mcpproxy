@@ -910,7 +910,7 @@ def _declared_callback_ports() -> list[int]:
     return ports
 
 
-def _warm_remote_providers() -> None:
+def _warm_remote_providers(wait_for: "threading.Thread | None" = None) -> None:
     """Introspect each mcp-remote bridge once at startup.
 
     A throwaway introspect spawns the bridge, which — with a valid cache —
@@ -928,20 +928,42 @@ def _warm_remote_providers() -> None:
 
     from process_runner import bridge_errors, introspect
 
+    if wait_for is not None:
+        # A bridge can depend on its provider's setup_commands having run — the
+        # file passed to --static-oauth-client-info, or a repository build that
+        # produces the binary.  Warming before that finishes fails for a reason
+        # that has nothing to do with the bridge, records a bridge_error the UI
+        # then displays, and is not retried until the refresh interval (an hour
+        # by default).  Waiting costs nothing: this already runs off the
+        # serving path, on its own thread.
+        print("[mcpproxy] waiting for provider setup before warming remote bridges")
+        wait_for.join()
+
+    async def _warm_one(name: str, command: str, env_keys: list[str]) -> None:
+        print(f"[mcpproxy] warming mcp-remote bridge: {name}")
+        try:
+            await introspect(command, env_keys=env_keys)
+            print(f"[mcpproxy] token cache ready for: {name}")
+        except Exception as exc:  # noqa: BLE001 — best-effort warm-up
+            # process_runner has already recorded an actionable reason in
+            # bridge_errors for the UI; repeat it here so the log says what
+            # to do rather than only that something closed stdout.
+            reason = bridge_errors.get(command)
+            print(f"[mcpproxy] warm-up for provider '{name}' did not complete: {exc}")
+            if reason:
+                print(f"[mcpproxy] provider '{name}': {reason}")
+
     async def _warm_all() -> None:
-        for name, command, env_keys in bridges:
-            print(f"[mcpproxy] warming mcp-remote bridge: {command}")
-            try:
-                await introspect(command, env_keys=env_keys)
-                print(f"[mcpproxy] token cache ready for: {command}")
-            except Exception as exc:  # noqa: BLE001 — best-effort warm-up
-                # process_runner has already recorded an actionable reason in
-                # bridge_errors for the UI; repeat it here so the log says what
-                # to do rather than only that something closed stdout.
-                reason = bridge_errors.get(command)
-                print(f"[mcpproxy] warm-up for provider '{name}' did not complete: {exc}")
-                if reason:
-                    print(f"[mcpproxy] provider '{name}': {reason}")
+        # Concurrently, not one after another.  A bridge that needs a browser
+        # holds its spawn open for the whole --auth-timeout window, and warming
+        # sequentially meant one such provider stopped every later one from
+        # being warmed at all — they stayed in neither pending_auth_urls nor
+        # authenticated_commands, so the UI reported them as "unknown" for as
+        # long as the human took.  Each spawn is a separate process and the
+        # concurrency guard is per command, so there is nothing to serialise.
+        await asyncio.gather(
+            *(_warm_one(name, command, env_keys) for name, command, env_keys in bridges)
+        )
 
     try:
         asyncio.run(_warm_all())
@@ -955,6 +977,34 @@ def _warm_remote_providers() -> None:
 # refresh token lapse and require a browser round-trip that a periodic touch
 # would have avoided.  0 disables the loop.
 REFRESH_INTERVAL_SECONDS = float(os.environ.get("MCPPROXY_REFRESH_INTERVAL", "3600"))
+
+
+async def refresh_remote_providers_once() -> None:
+    """Re-warm every mcp-remote bridge that is not already mid-flow.
+
+    Concurrently, for the same reason as the startup warm-up: one bridge that
+    needs a browser must not stall renewal of all the others.
+    """
+    import asyncio
+
+    from process_runner import ConcurrentSpawnError, introspect, pending_auth_urls
+
+    async def _refresh_one(name: str, command: str, env_keys: list[str]) -> None:
+        if command in pending_auth_urls:
+            return  # a human is mid-flow; leave their link valid
+        try:
+            await introspect(command, env_keys=env_keys)
+        except ConcurrentSpawnError:
+            pass  # another spawn is already doing this work
+        except Exception as exc:  # noqa: BLE001 — best-effort renewal
+            print(f"[mcpproxy] refresh for provider '{name}' did not complete: {exc}")
+
+    await asyncio.gather(
+        *(
+            _refresh_one(name, command, env_keys)
+            for name, command, env_keys in _remote_bridge_commands()
+        )
+    )
 
 
 def _refresh_remote_providers_forever() -> None:
@@ -973,27 +1023,10 @@ def _refresh_remote_providers_forever() -> None:
     import asyncio
     import time
 
-    from process_runner import (
-        ConcurrentSpawnError,
-        introspect,
-        pending_auth_urls,
-    )
-
-    async def _refresh_all() -> None:
-        for name, command, env_keys in _remote_bridge_commands():
-            if command in pending_auth_urls:
-                continue  # a human is mid-flow; leave their link valid
-            try:
-                await introspect(command, env_keys=env_keys)
-            except ConcurrentSpawnError:
-                pass  # another spawn is already doing this work
-            except Exception as exc:  # noqa: BLE001 — best-effort renewal
-                print(f"[mcpproxy] refresh for provider '{name}' did not complete: {exc}")
-
     while True:
         time.sleep(REFRESH_INTERVAL_SECONDS)
         try:
-            asyncio.run(_refresh_all())
+            asyncio.run(refresh_remote_providers_once())
         except Exception as exc:  # noqa: BLE001
             print(f"_refresh_remote_providers_forever error: {exc}")
 
@@ -1147,7 +1180,10 @@ if __name__ == "__main__":
             )
         if _warm_remote_enabled():
             warm_thread = threading.Thread(
-                target=_warm_remote_providers, daemon=True, name="remote-warmup"
+                target=_warm_remote_providers,
+                args=(bootstrap_thread if _PENDING_SPECS else None,),
+                daemon=True,
+                name="remote-warmup",
             )
             warm_thread.start()
             if _refresh_remote_enabled():

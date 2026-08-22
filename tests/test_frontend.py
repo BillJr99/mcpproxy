@@ -2919,3 +2919,244 @@ class TestSecretsDialogShowsDeclaredKeys:
         html = client.get("/").text
         assert "package-token-note" in html
         assert "usesTokenHeader" in html
+
+
+class TestConcurrentSpawnIsAState:
+    """The startup warm-up holds a bridge's spawn open for the whole
+    authorization window, so every editor open and command-field blur meanwhile
+    hits the concurrency guard. That is expected, not a crash."""
+
+    def test_introspect_reports_it_without_a_traceback(self, client, capsys):
+        import process_runner
+
+        command = "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887"
+        process_runner._spawning.add(command)
+        process_runner.pending_auth_urls[command] = "https://app.asana.com/-/oauth"
+        try:
+            body = client.post("/api/introspect", json={"command": command}).json()
+        finally:
+            process_runner._spawning.discard(command)
+            process_runner.pending_auth_urls.pop(command, None)
+
+        assert body["ok"] is False
+        assert body["pending_auth"] is True
+        # The link that actually unblocks it comes back with the refusal.
+        assert body["auth_url"] == "https://app.asana.com/-/oauth"
+        assert "Traceback" not in capsys.readouterr().err
+
+    def test_the_message_does_not_repeat_the_command(self, client):
+        import process_runner
+
+        command = (
+            "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887 "
+            "--static-oauth-client-info @/app/tools/secrets/asana/client_info.json"
+        )
+        process_runner._spawning.add(command)
+        try:
+            body = client.post("/api/introspect", json={"command": command}).json()
+        finally:
+            process_runner._spawning.discard(command)
+        # Commands carry credential-file paths and are unreadable in a log line.
+        assert "client_info.json" not in body["error"]
+
+    def test_reauthorize_reports_it_rather_than_racing(self, client, tools_dir):
+        import process_runner
+
+        command = "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887"
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+        process_runner._spawning.add(command)
+        try:
+            body = client.post("/api/oauth-reauthorize", json={"target": "asana"}).json()
+        finally:
+            process_runner._spawning.discard(command)
+        assert body["ok"] is False
+        assert "already starting" in body["error"]
+
+
+class TestManualCallbackTargetRequired:
+    def test_missing_target_explains_what_to_do(self, client):
+        r = client.post(
+            "/api/oauth-manual-callback", json={"callback": "?code=abc&state=xyz"}
+        )
+        assert r.status_code == 400
+        assert "Choose which provider" in r.json()["detail"]
+
+    def test_dropdown_placeholders_are_not_selectable(self, client):
+        # An empty target used to be POSTed while the list was still loading,
+        # which came back as a bare 400.
+        html = client.get("/").text
+        assert '<option value="" disabled selected>loading…</option>' in html
+        assert "Choose the provider this callback belongs to." in html
+
+
+class TestRemoteCommandSummary:
+    """The diagnostics table shows this. Commands carry credential-file paths."""
+
+    def test_keeps_the_bridge_url_and_port_but_drops_the_flags(self):
+        from frontend.app import _summarize_remote_command
+
+        out = _summarize_remote_command(
+            "npx -y mcp-remote@0.1.38 https://mcp.asana.com/v2/mcp 8887 "
+            "--static-oauth-client-info @/app/tools/secrets/asana/client_info.json "
+            "--resource https://mcp.asana.com/v2 --auth-timeout 600"
+        )
+        assert out == "mcp-remote@0.1.38 https://mcp.asana.com/v2/mcp 8887"
+        assert "client_info.json" not in out
+
+    def test_handles_a_command_with_no_flags(self):
+        from frontend.app import _summarize_remote_command
+
+        assert _summarize_remote_command("npx -y mcp-remote https://x/mcp") == (
+            "mcp-remote https://x/mcp"
+        )
+
+    def test_does_not_crash_on_an_unexpected_command(self):
+        from frontend.app import _summarize_remote_command
+
+        assert isinstance(_summarize_remote_command(""), str)
+
+
+class TestSecretEnvKeyUnion:
+    """The provider list badge and the Secrets dialog both read this."""
+
+    def test_unions_every_declaration_site_without_duplicates(self):
+        from frontend.app import _extract_secret_env_keys
+
+        spec = {
+            "package": {"command": "node x", "env_keys": ["PKG", "SHARED"]},
+            "repository": {"url": "https://x/y", "env_keys": ["REPO", "SHARED"]},
+            "tools": [{"name": "t", "secrets": {"env": {"arg": "TOOL"}}}],
+        }
+        keys = _extract_secret_env_keys(spec)
+        assert set(keys) == {"PKG", "SHARED", "REPO", "TOOL"}
+        assert len(keys) == len(set(keys))
+
+    def test_repository_env_keys_alone_are_surfaced(self):
+        from frontend.app import _extract_secret_env_keys
+
+        spec = {"repository": {"url": "https://x/y", "env_keys": ["REPO_TOKEN"]}, "tools": []}
+        assert _extract_secret_env_keys(spec) == ["REPO_TOKEN"]
+
+
+class TestEnvFileWriting:
+    """Every reader of a .env file — this module, ProcessSession._build_env,
+    docker-compose, dotenv — takes the *last* occurrence of a key."""
+
+    def test_rewrites_the_last_duplicate_and_drops_the_rest(self, tmp_path):
+        from frontend.app import _read_env_file, _write_env_file
+
+        f = tmp_path / ".env"
+        f.write_text("A=1\nB=2\nA=3\n")
+        _write_env_file(f, {"A": "9"})
+        # Rewriting the first left the stale later line winning, so the UI said
+        # "saved" and the value never took effect.
+        assert _read_env_file(f)["A"] == "9"
+        assert f.read_text().count("A=") == 1
+
+    @pytest.mark.parametrize("value", ["x\nMCP_SERVER_NAME=pwned", "x\rY=2"])
+    def test_rejects_values_containing_line_breaks(self, tmp_path, value):
+        from frontend.app import _write_env_file
+
+        # A pasted credential with a newline would define arbitrary variables
+        # that _build_env then injects into every spawned subprocess.
+        f = tmp_path / ".env"
+        with pytest.raises(ValueError, match="line break"):
+            _write_env_file(f, {"C": value})
+        assert "pwned" not in (f.read_text() if f.exists() else "")
+
+    def test_rejects_a_non_string_value(self, tmp_path):
+        from frontend.app import _write_env_file
+
+        with pytest.raises(ValueError, match="must be text"):
+            _write_env_file(tmp_path / ".env", {"C": {"nested": "dict"}})
+
+    def test_preserves_comments_and_unrelated_keys(self, tmp_path):
+        from frontend.app import _read_env_file, _write_env_file
+
+        f = tmp_path / ".env"
+        f.write_text("# a comment\nKEEP=yes\nTARGET=old\n")
+        _write_env_file(f, {"TARGET": "new"})
+        text = f.read_text()
+        assert "# a comment" in text
+        assert _read_env_file(f) == {"KEEP": "yes", "TARGET": "new"}
+
+
+class TestOutputEscaping:
+    """Tool names are auto-filled from the remote MCP server being introspected,
+    and provider names come from filenames in a mounted volume."""
+
+    def test_esc_covers_single_quotes(self, client):
+        html = client.get("/").text
+        # esc() is interpolated into single-quoted attributes such as
+        # onclick="openProvider('...')".
+        assert ".replace(/'/g,'&#39;')" in html
+
+    def test_provider_list_escapes_name_and_tool_names(self, client):
+        html = client.get("/").text
+        assert """onclick="openProvider('${esc(p.name)}')\"""" in html
+        assert '<div class="fw-semibold">${esc(p.name)}</div>' in html
+        assert "${esc((p.tool_names || []).join(', ')) || 'no tools'}" in html
+
+    def test_secret_keys_are_escaped_in_both_dialogs(self, client):
+        html = client.get("/").text
+        assert 'id="secret-${k}"' not in html
+        assert html.count('id="secret-${esc(k)}"') >= 2
+
+    def test_server_supplied_error_text_is_escaped(self, client):
+        html = client.get("/").text
+        assert 'style="font-size:.85em">${e.message}</div>' not in html
+
+
+class TestReauthorizeRaceSafety:
+    def test_a_pending_url_popped_mid_request_does_not_500(self, client, tools_dir):
+        """pending_auth_urls is written and popped from other threads' event
+        loops; testing membership then subscripting could raise KeyError."""
+        import process_runner
+        from frontend.app import _summarize_remote_command  # noqa: F401
+
+        command = "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887"
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": command}, "tools": []})
+        )
+
+        class VanishingDict(dict):
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                super().pop(key, None)          # popped by another thread
+                return value
+
+        original = process_runner.pending_auth_urls
+        process_runner.pending_auth_urls = VanishingDict(
+            {command: "https://app.asana.com/-/oauth"}
+        )
+        try:
+            r = client.post("/api/oauth-reauthorize", json={"target": "asana"})
+        finally:
+            process_runner.pending_auth_urls = original
+        assert r.status_code == 200
+        assert r.json()["auth_url"] == "https://app.asana.com/-/oauth"
+
+    def test_delivery_log_does_not_echo_the_spawn_command(self, client, capsys):
+        """When the caller picks a pending flow the target *is* the command,
+        which carries header credentials and client-secret file paths."""
+        import process_runner
+
+        command = (
+            "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887 "
+            "--static-oauth-client-info @/app/tools/secrets/asana/client_info.json"
+        )
+        process_runner.pending_auth_urls[command] = "https://app.asana.com/-/oauth"
+        try:
+            with patch(
+                "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+            ) as deliver:
+                deliver.return_value = 200
+                client.post(
+                    "/api/oauth-manual-callback",
+                    json={"target": command, "callback": "?code=abc"},
+                )
+        finally:
+            process_runner.pending_auth_urls.pop(command, None)
+        assert "client_info.json" not in capsys.readouterr().out

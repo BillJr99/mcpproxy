@@ -85,7 +85,9 @@ bridge_errors: dict[str, str] = {}
 _spawning: set[str] = set()
 _spawn_lock = threading.Lock()
 
-_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+# Trailing sentence punctuation is not part of the URL — "visit https://x/auth."
+# used to yield a link with the full stop attached, which simply does not resolve.
+_URL_RE = re.compile(r"https?://[^\s'\"<>]*[^\s'\"<>.,;:!?)\]}]")
 # Lines that hint mcp-remote (or a similar bridge) is asking the user to
 # authorize.  Matched case-insensitively against each stderr line.
 _AUTH_HINT_RE = re.compile(
@@ -96,7 +98,9 @@ _AUTH_HINT_RE = re.compile(
 # callback port: 3334" — mcp-remote announces the loopback listener it is about
 # to bind.  Matched on its own, without _AUTH_HINT_RE, because the line need not
 # mention authorization at all.
-_CALLBACK_PORT_RE = re.compile(r"callback (?:server )?port[:\s]+(\d{1,5})", re.IGNORECASE)
+_CALLBACK_PORT_RE = re.compile(
+    r"callback (?:server )?port[:\s]+(\d{1,5})(?!\d)", re.IGNORECASE
+)
 # Lines that satisfy _AUTH_HINT_RE but are not an invitation to visit anything:
 # OAuth discovery output ("Discovered authorization server: <issuer>"), warnings,
 # and error dumps carrying an errorUri.  Without this the issuer *base* URL gets
@@ -253,16 +257,18 @@ class ProcessSession:
         try:
             self._proc.stdin.write(data.encode())
             await self._proc.stdin.drain()
-        except (RuntimeError, BrokenPipeError, ConnectionResetError) as exc:
-            # The subprocess died before we could write — a bridge that fails
-            # fatally during startup loses its stdin between spawn and the
-            # initialize request.  The transport's own message names an internal
-            # uvloop handle and explains nothing, so report the real cause.
+        except (RuntimeError, BrokenPipeError, ConnectionResetError):
+            # The subprocess died before we could write.  The transport's own
+            # message names an internal uvloop handle and explains nothing, so
+            # report the real cause with whatever the process said on the way out.
+            stage = (
+                "before it could be initialized"
+                if self.command not in authenticated_commands
+                else "mid-session"
+            )
             stderr_tail = await self._drain_stderr_tail()
             suffix = f"\nsubprocess stderr (tail): {stderr_tail}" if stderr_tail else ""
-            raise EOFError(
-                f"MCP process exited before it could be initialized{suffix}"
-            ) from None
+            raise EOFError(f"MCP process exited {stage}{suffix}") from None
 
     async def _recv(self, timeout: float = 30.0) -> dict[str, Any]:
         assert self._proc and self._proc.stdout
@@ -347,16 +353,27 @@ class ProcessSession:
             # Nothing else records why a bridge died: setup "succeeds" because
             # handlers are only closures, so without this the provider reports
             # ready and the cause reaches the server's stdout and nowhere else.
+            authenticated_commands.discard(self.command)
             bridge_errors[self.command] = (
                 _classify_failure(self._stderr_tail)
                 or (self._stderr_tail[-1] if self._stderr_tail else str(exc))
             )
+            # A process that outlived a failed handshake is not usable: _alive()
+            # would be true, so the next tool call would skip _start entirely and
+            # write to a subprocess that never completed initialize.
+            if self._proc is not None and self._proc.returncode is None:
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
             raise
 
     async def _start_inner(self) -> None:
-        # A new spawn must prove its current credentials before it is reported
-        # as authenticated. A later successful handshake adds it back below.
-        authenticated_commands.discard(self.command)
+        # Deliberately does *not* pre-emptively clear authenticated_commands:
+        # the periodic refresh spawns a throwaway session under the same command
+        # key as a live, healthy one, and blanking the status up front made the
+        # UI report "unknown" for the duration of every renewal.  A spawn that
+        # fails clears it in _start's handler instead.
         bridge_errors.pop(self.command, None)
         env = self._build_env()
         self._proc = await asyncio.create_subprocess_exec(
@@ -513,7 +530,24 @@ def get_session(
 
 
 class ConcurrentSpawnError(RuntimeError):
-    """A throwaway spawn was refused because one is already in flight."""
+    """A throwaway spawn was refused because one is already in flight.
+
+    An ordinary, expected condition — the startup warm-up holds a spawn open for
+    the whole authorization window, so anything that introspects the same bridge
+    meanwhile lands here.  Callers should report it as a state ("waiting for
+    authorization"), not as a failure, and can use ``command`` to look up the
+    pending authorization URL.
+    """
+
+    def __init__(self, command: str, message: str) -> None:
+        super().__init__(message)
+        self.command = command
+
+
+def is_spawning(command: str) -> bool:
+    """Whether a throwaway spawn of *command* is currently in flight."""
+    with _spawn_lock:
+        return command in _spawning
 
 
 async def introspect(
@@ -538,20 +572,32 @@ async def introspect(
     """
     with _spawn_lock:
         if command in _spawning:
+            # Deliberately does not repeat the command: it carries credential
+            # file paths and is unreadable in a log line, and the caller already
+            # knows which provider it asked about.
             raise ConcurrentSpawnError(
-                f"A bridge for '{command}' is already starting — it may be "
-                "waiting for authorization. Wait for it to finish rather than "
-                "starting a second one."
+                command,
+                "This bridge is already starting and may be waiting for "
+                "authorization. Complete or cancel that attempt rather than "
+                "starting a second one — two bridges would overwrite each "
+                "other's stored PKCE verifier.",
             )
         _spawning.add(command)
-    session = ProcessSession(command, cwd=cwd, env_keys=env_keys)
+    session: ProcessSession | None = None
     try:
+        # Constructed inside the try: shlex.split raises on an unbalanced quote,
+        # and leaving that outside stranded the command in _spawning forever —
+        # every later introspect then reported a bridge that was "already
+        # starting" until the process restarted.
+        session = ProcessSession(command, cwd=cwd, env_keys=env_keys)
         await session._start()
         return await session.list_tools()
     except Exception as exc:
         traceback.print_exc()
         raise RuntimeError(f"Failed to introspect '{command}': {exc}") from exc
     finally:
-        await session.close()
+        # Release the guard first: a failure inside close() must not strand it.
         with _spawn_lock:
             _spawning.discard(command)
+        if session is not None:
+            await session.close()

@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 import yaml
 
+import server
+
 # server.py has module-level side effects (load_provider_specs + register_provider +
 # run_provider_setup).  conftest.py has already set MCP_TOOL_CONFIG_DIR to an empty
 # temp dir, so the import is safe and results in zero tools being registered.
@@ -1420,3 +1422,219 @@ class TestOauthWarmup:
             assert "gmailish" not in rest_provider.pending_rest_auth
         finally:
             rest_provider.pending_rest_auth.clear()
+
+
+# ---------------------------------------------------------------------------
+# Remote bridge warm-up and refresh
+# ---------------------------------------------------------------------------
+
+REMOTE_ASANA = "npx -y mcp-remote https://mcp.asana.com/v2/mcp 8887"
+REMOTE_GITHUB = (
+    "npx -y mcp-remote https://api.githubcopilot.com/mcp/ "
+    "--header Authorization:${GITHUB_MCP_AUTH_HEADER}"
+)
+
+
+def _write_two_bridges(tmp_path: Path) -> None:
+    (tmp_path / "asana.yaml").write_text(
+        yaml.safe_dump({"package": {"command": REMOTE_ASANA}}), encoding="utf-8"
+    )
+    (tmp_path / "ghcopilot.yaml").write_text(
+        yaml.safe_dump(
+            {"package": {"command": REMOTE_GITHUB, "env_keys": ["GITHUB_MCP_AUTH_HEADER"]}}
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestWarmUpConcurrency:
+    """A bridge that needs a browser holds its spawn open for the whole
+    --auth-timeout window. Warming sequentially meant one such provider stopped
+    every later one from being warmed at all — they stayed in neither
+    pending_auth_urls nor authenticated_commands, so the UI called them
+    "unknown" for as long as the human took."""
+
+    def test_a_parked_bridge_does_not_starve_the_others(self, tmp_path, monkeypatch):
+        import asyncio
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+
+        state = {"asana_running": False, "github_saw_asana_running": None}
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            if "asana" in command:
+                state["asana_running"] = True
+                await asyncio.sleep(0.3)          # parked on a browser prompt
+                state["asana_running"] = False
+            else:
+                await asyncio.sleep(0.05)
+                state["github_saw_asana_running"] = state["asana_running"]
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers()
+
+        # Sequential warm-up would only reach GitHub after Asana finished.
+        assert state["github_saw_asana_running"] is True
+
+    def test_every_bridge_is_warmed_even_when_one_fails(self, tmp_path, monkeypatch):
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        seen = []
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            seen.append(command)
+            if "asana" in command:
+                raise RuntimeError("boom")
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers()
+        assert sorted(seen) == sorted([REMOTE_ASANA, REMOTE_GITHUB])
+
+    def test_declared_env_keys_reach_the_warm_up_spawn(self, tmp_path, monkeypatch):
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        calls = {}
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            calls[command] = env_keys
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers()
+        assert calls[REMOTE_GITHUB] == ["GITHUB_MCP_AUTH_HEADER"]
+        assert calls[REMOTE_ASANA] == []
+
+
+class TestRefreshSweep:
+    def test_skips_a_bridge_that_is_mid_authorization(self, tmp_path, monkeypatch):
+        """Re-spawning a bridge mid-flow would invalidate the link the user is
+        part-way through and strand the callback they are about to deliver."""
+        import asyncio
+
+        import process_runner
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        seen = []
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            seen.append(command)
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        process_runner.pending_auth_urls[REMOTE_ASANA] = "https://app.asana.com/-/oauth"
+        try:
+            asyncio.run(server.refresh_remote_providers_once())
+        finally:
+            process_runner.pending_auth_urls.pop(REMOTE_ASANA, None)
+        assert REMOTE_ASANA not in seen
+        assert REMOTE_GITHUB in seen
+
+    def test_a_concurrent_spawn_is_not_an_error(self, tmp_path, monkeypatch):
+        import asyncio
+
+        import process_runner
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            raise process_runner.ConcurrentSpawnError(command, "already starting")
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        asyncio.run(server.refresh_remote_providers_once())  # must not raise
+
+    def test_one_failing_bridge_does_not_stop_the_others(self, tmp_path, monkeypatch):
+        import asyncio
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        seen = []
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            seen.append(command)
+            if "asana" in command:
+                raise RuntimeError("boom")
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        asyncio.run(server.refresh_remote_providers_once())
+        assert sorted(seen) == sorted([REMOTE_ASANA, REMOTE_GITHUB])
+
+
+class TestSpawnEnvKeys:
+    def test_unions_package_and_repository_keys_without_duplicates(self):
+        spec = {
+            "package": {"command": "node x", "env_keys": ["SHARED", "PKG"]},
+            "repository": {"url": "https://x/y", "env_keys": ["SHARED", "REPO"]},
+        }
+        assert server._spawn_env_keys(spec) == ["SHARED", "REPO", "PKG"]
+
+    def test_empty_when_neither_declares_any(self):
+        assert server._spawn_env_keys({"package": {"command": "node x"}}) == []
+
+    def test_ignores_blank_entries(self):
+        spec = {"package": {"command": "node x", "env_keys": ["A", "", None]}}
+        assert server._spawn_env_keys(spec) == ["A"]
+
+
+class TestDeclaredCallbackPorts:
+    def test_reads_ports_from_configured_bridges(self, tmp_path, monkeypatch):
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        # Only the Asana command declares one; GitHub lets mcp-remote choose.
+        assert server._declared_callback_ports() == [8887]
+
+    def test_never_raises_on_a_broken_config(self, tmp_path, monkeypatch):
+        (tmp_path / "bad.yaml").write_text("{[not yaml", encoding="utf-8")
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        assert server._declared_callback_ports() == []
+
+
+class TestWarmUpWaitsForProviderSetup:
+    """A bridge can depend on its provider's setup_commands having run — the
+    file passed to --static-oauth-client-info, or a repo build that produces the
+    binary. Warming first fails for an unrelated reason, records a bridge_error
+    the UI displays, and is not retried until the refresh interval."""
+
+    def test_joins_the_bootstrap_thread_before_spawning(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        order = []
+
+        def slow_setup():
+            time.sleep(0.3)
+            order.append("setup-done")
+
+        bootstrap = threading.Thread(target=slow_setup)
+        bootstrap.start()
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            order.append("warmed")
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers(bootstrap)
+        bootstrap.join()
+
+        assert order[0] == "setup-done"
+        assert "warmed" in order
+
+    def test_still_warms_when_there_is_nothing_to_wait_for(self, tmp_path, monkeypatch):
+        _write_two_bridges(tmp_path)
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        seen = []
+
+        async def fake_introspect(command, cwd=None, env_keys=None):
+            seen.append(command)
+            return []
+
+        monkeypatch.setattr("process_runner.introspect", fake_introspect)
+        server._warm_remote_providers(None)
+        assert len(seen) == 2

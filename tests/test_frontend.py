@@ -2721,3 +2721,124 @@ class TestBridgeBadgeUI:
         html = client.get("/").text
         for needle in ("bridge_error", "auth_status", "✗ bridge failed", "🔐 authorize"):
             assert needle in html, needle
+
+
+class TestPackageEnvKeysRoundTrip:
+    """env_keys names variables re-read from .env before each spawn. Dropping it
+    on a save would silently break the provider the next time it starts."""
+
+    SPEC = {
+        "package": {
+            "command": (
+                "npx -y mcp-remote https://api.githubcopilot.com/mcp/ "
+                "--header Authorization:${GITHUB_MCP_AUTH_HEADER}"
+            ),
+            "env_keys": ["GITHUB_MCP_AUTH_HEADER"],
+        },
+        "tools": [
+            {
+                "name": "get_me",
+                "description": "Return the authorized user.",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+
+    def test_survives_an_editor_round_trip(self):
+        from frontend.app import _provider_to_structured, _structured_to_yaml
+
+        structured = _provider_to_structured("ghcopilot", self.SPEC)
+        assert structured["pkg_env_keys"] == ["GITHUB_MCP_AUTH_HEADER"]
+        written = yaml.safe_load(_structured_to_yaml(structured))
+        assert written["package"]["env_keys"] == ["GITHUB_MCP_AUTH_HEADER"]
+
+    def test_survives_a_save_through_the_api(self, client, tools_dir):
+        from frontend.app import _provider_to_structured
+
+        structured = _provider_to_structured("ghcopilot", self.SPEC)
+        r = client.post(
+            "/api/tools", json={"name": "ghcopilot", "provider": structured}
+        )
+        assert r.status_code == 200, r.text
+        written = yaml.safe_load((tools_dir / "ghcopilot.yaml").read_text())
+        assert written["package"]["env_keys"] == ["GITHUB_MCP_AUTH_HEADER"]
+
+    def test_absent_env_keys_are_not_invented(self):
+        from frontend.app import _provider_to_structured, _structured_to_yaml
+
+        spec = {"package": {"command": "npx @playwright/mcp"}, "tools": []}
+        out = yaml.safe_load(_structured_to_yaml(_provider_to_structured("pw", spec)))
+        assert "env_keys" not in out["package"]
+
+    def test_repository_providers_keep_both_lists(self):
+        from frontend.app import _provider_to_structured, _structured_to_yaml
+
+        spec = {
+            "package": {"command": "node dist/index.js", "env_keys": ["PKG_TOKEN"]},
+            "repository": {"url": "https://github.com/x/y", "env_keys": ["REPO_TOKEN"]},
+            "tools": [],
+        }
+        out = yaml.safe_load(_structured_to_yaml(_provider_to_structured("repo", spec)))
+        assert out["package"]["env_keys"] == ["PKG_TOKEN"]
+        assert out["repository"]["env_keys"] == ["REPO_TOKEN"]
+
+    def test_editor_exposes_the_field(self, client):
+        html = client.get("/").text
+        for needle in ("pkg-env-keys-container", "addPkgEnvKey()", "renderPkgEnvKeys"):
+            assert needle in html, needle
+
+
+class TestUIStaysResponsiveDuringSlowWork:
+    """The provider list, status polling and the pending-auth banner all come
+    from the same event loop as introspection and cloning. A blocking
+    subprocess.run in one of those routes froze the entire page."""
+
+    def test_introspect_does_not_block_the_event_loop(self, client, monkeypatch):
+        import threading
+
+        loop_thread = threading.get_ident()
+        ran_on: dict[str, int] = {}
+
+        def slow_run(*args, **kwargs):
+            ran_on["thread"] = threading.get_ident()
+            return None
+
+        monkeypatch.setattr("frontend.app.subprocess.run", slow_run)
+        with patch("process_runner.introspect", new_callable=AsyncMock) as spawn:
+            spawn.return_value = []
+            r = client.post(
+                "/api/introspect",
+                json={
+                    "command": "npx some-server",
+                    "setup_commands": ["echo hi"],
+                },
+            )
+        assert r.json()["ok"] is True
+        # TestClient drives the loop from the calling thread; the blocking work
+        # must have been handed to a worker.
+        assert ran_on["thread"] != loop_thread
+
+    def test_clone_and_build_does_not_block_the_event_loop(
+        self, client, tmp_path, monkeypatch
+    ):
+        import threading
+
+        loop_thread = threading.get_ident()
+        threads: set[int] = set()
+
+        def slow_run(*args, **kwargs):
+            threads.add(threading.get_ident())
+            return None
+
+        monkeypatch.setattr("frontend.app.subprocess.run", slow_run)
+        r = client.post(
+            "/api/clone-and-build",
+            json={
+                "name": "demo",
+                "repo_url": "https://example.com/x.git",
+                "workdir": str(tmp_path / "wd"),
+                "build_commands": ["echo build"],
+            },
+        )
+        assert r.status_code == 200
+        assert threads and loop_thread not in threads

@@ -2596,3 +2596,128 @@ class TestManualCallbackUI:
         assert 'id="reauth-manual-btn"' in html
         assert "function mcbLink(" in html
         assert html.count("mcbLink(") >= 5
+
+
+class TestBridgeErrorReporting:
+    """A package provider's setup "succeeds" because building handlers only makes
+    closures — so a bridge whose every spawn dies used to show as a clean, ready
+    provider with the real cause only on the server's stdout."""
+
+    @pytest.fixture()
+    def broken_bridge(self, tools_dir):
+        import process_runner
+        import provider_status
+
+        (tools_dir / "ghcopilot.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        provider_status.clear()
+        provider_status.set_state(
+            provider_status.ProviderState(name="ghcopilot", status=provider_status.READY)
+        )
+        process_runner.bridge_errors[ASANA_CMD] = "GITHUB_MCP_AUTH_HEADER is not set."
+        try:
+            yield
+        finally:
+            process_runner.bridge_errors.pop(ASANA_CMD, None)
+            provider_status.clear()
+
+    def test_provider_status_reports_the_bridge_error(self, client, broken_bridge):
+        entry = client.get("/api/provider-status").json()["providers"]["ghcopilot"]
+        # Setup and bridge health are separate axes on purpose.
+        assert entry["setup_status"] == "ready"
+        assert entry["error"] is None
+        assert entry["bridge_error"] == "GITHUB_MCP_AUTH_HEADER is not set."
+
+    def test_callback_status_reports_the_bridge_error(
+        self, client, broken_bridge, monkeypatch
+    ):
+        monkeypatch.setattr("oauth_callback_relay.probe_loopback_port", lambda p, **k: False)
+        body = client.get("/api/oauth-callback-status").json()
+        entry = next(p for p in body["providers"] if p["provider"] == "ghcopilot")
+        assert entry["bridge_error"] == "GITHUB_MCP_AUTH_HEADER is not set."
+
+    def test_healthy_provider_reports_no_bridge_error(self, client, pending_remote):
+        entry = client.get("/api/provider-status").json()["providers"]
+        assert all(e["bridge_error"] is None for e in entry.values())
+
+
+class TestStaleCallbackRejected:
+    """A callback from an earlier attempt still parses, but the bridge has since
+    generated a new PKCE verifier — delivering it burns the single-use code and
+    fails with an opaque code_verifier mismatch."""
+
+    @pytest.fixture()
+    def bridge_with_state(self, tools_dir):
+        import process_runner
+
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        process_runner.pending_auth_urls[ASANA_CMD] = (
+            "https://app.asana.com/-/oauth_authorize?client_id=1&state=CURRENT"
+        )
+        try:
+            yield
+        finally:
+            process_runner.pending_auth_urls.pop(ASANA_CMD, None)
+
+    def test_mismatched_state_is_refused_without_delivering(
+        self, client, bridge_with_state
+    ):
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": "?code=abc&state=STALE"},
+            )
+        assert r.status_code == 409
+        assert "earlier authorization attempt" in r.json()["detail"]
+        deliver.assert_not_awaited()
+
+    def test_matching_state_is_delivered(self, client, bridge_with_state):
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": "?code=abc&state=CURRENT"},
+            )
+        assert r.json()["ok"] is True
+        deliver.assert_awaited_once()
+
+    def test_no_state_on_either_side_still_delivers(self, client, pending_remote):
+        # The pending URL here carries no state, so there is nothing to compare
+        # against — refusing would block a legitimate paste.
+        with patch(
+            "oauth_callback_relay.deliver_to_bridge", new_callable=AsyncMock
+        ) as deliver:
+            deliver.return_value = 200
+            r = client.post(
+                "/api/oauth-manual-callback",
+                json={"target": "asana", "callback": "?code=abc"},
+            )
+        assert r.json()["ok"] is True
+
+
+class TestPackageEnvKeys:
+    def test_package_env_keys_reach_the_secrets_ui(self):
+        from frontend.app import _extract_secret_env_keys
+
+        spec = {
+            "package": {
+                "command": "npx -y mcp-remote https://x/mcp --header Auth:${TOKEN}",
+                "env_keys": ["TOKEN"],
+            },
+            "tools": [],
+        }
+        assert "TOKEN" in _extract_secret_env_keys(spec)
+
+
+class TestBridgeBadgeUI:
+    def test_index_renders_bridge_and_auth_badges(self, client):
+        html = client.get("/").text
+        for needle in ("bridge_error", "auth_status", "✗ bridge failed", "🔐 authorize"):
+            assert needle in html, needle

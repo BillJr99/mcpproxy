@@ -55,9 +55,30 @@ class TestServerWarmup:
             encoding="utf-8",
         )
         monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        # (provider_name, command, env_keys) — the name lets a warm-up failure be
+        # attributed to a provider, and env_keys lets the spawn see secrets that
+        # reached .env after this process started.
         assert server._remote_bridge_commands() == [
-            "npx -y mcp-remote https://mcp.asana.com/v2/mcp"
+            ("asana", "npx -y mcp-remote https://mcp.asana.com/v2/mcp", [])
         ]
+
+    def test_remote_bridge_commands_carries_declared_env_keys(self, tmp_path, monkeypatch):
+        (tmp_path / "ghcopilot.yaml").write_text(
+            yaml.safe_dump({
+                "package": {
+                    "command": (
+                        "npx -y mcp-remote https://api.githubcopilot.com/mcp/ "
+                        "--header Authorization:${GITHUB_MCP_AUTH_HEADER}"
+                    ),
+                    "env_keys": ["GITHUB_MCP_AUTH_HEADER"],
+                }
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+        (name, _command, env_keys), = server._remote_bridge_commands()
+        assert name == "ghcopilot"
+        assert env_keys == ["GITHUB_MCP_AUTH_HEADER"]
 
     def test_warm_enabled_default(self, monkeypatch):
         monkeypatch.delenv("MCPPROXY_WARM_REMOTE", raising=False)

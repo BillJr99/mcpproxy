@@ -60,7 +60,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
-from config import CONFIG_DIR, ENV_FILE, FILES_DIR, REPOS_DIR
+from config import CONFIG_DIR, ENV_FILE, FILES_DIR, REPOS_DIR, REST_AUTH_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +145,68 @@ def _rest_auth_env_keys(spec: dict[str, Any]) -> list[str]:
     auth = (spec.get("rest") or {}).get("auth") or {}
     candidates = ("token_env", "value_env", "client_id_env", "client_secret_env")
     return [auth[k] for k in candidates if auth.get(k)]
+
+
+# REST auth types whose token can be refreshed without user interaction.
+_REFRESHABLE_REST_TYPES = ("client_credentials", "authorization_code")
+
+
+def _rest_bearer_token_file(spec: dict[str, Any]) -> str:
+    """Return the ``token_file`` path of a bearer REST provider, or ``""``.
+
+    Only bearer auth stores a *raw* secret in a file, so only that path may be
+    written from the Secrets dialog.  A top-level ``oauth:`` block also has a
+    ``token_file``, but it holds a structured credentials record the OAuth flow
+    owns — pasting a raw string into it would corrupt it.
+    """
+    auth = (spec.get("rest") or {}).get("auth") or {}
+    if (auth.get("type") or "").strip() != "bearer":
+        return ""
+    return (auth.get("token_file") or "").strip()
+
+
+def _provider_auth_info(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Describe a provider's auth for the UI, or ``None`` when it declares none.
+
+    Drives the Secrets dialog's credential list and the visibility of the
+    "Refresh auth" button.  ``env_keys`` are credentials that live in ``.env``;
+    ``token_file`` is a raw-secret file the dialog may write.
+    """
+    oauth_cfg = spec.get("oauth") or {}
+    if oauth_cfg.get("type"):
+        return {
+            "kind": "oauth",
+            "type": oauth_cfg.get("type"),
+            "env_keys": [],
+            "token_file": "",          # structured record — not raw-writable
+            "token_file_set": False,
+            "refreshable": True,
+        }
+
+    rest = spec.get("rest")
+    if not isinstance(rest, dict):
+        return None
+    atype = ((rest.get("auth") or {}).get("type") or "none").strip()
+    if atype == "none":
+        return None
+    token_file = _rest_bearer_token_file(spec)
+    token_file_set = False
+    if token_file:
+        try:
+            token_file_set = bool(Path(token_file).read_text(encoding="utf-8").strip())
+        except OSError:
+            token_file_set = False
+    return {
+        "kind": "rest",
+        "type": atype,
+        "env_keys": _rest_auth_env_keys(spec),
+        "token_file": token_file,
+        "token_file_set": token_file_set,
+        # Static credentials cannot be "refreshed", but the button still
+        # verifies that the env var / file actually resolves.
+        "refreshable": True,
+        "renewable": atype in _REFRESHABLE_REST_TYPES,
+    }
 
 
 _ENV_EXAMPLE_CANDIDATES = (".env.example", ".env.sample", ".env.template")
@@ -343,7 +405,13 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         headers = {k: v for k, v in (rest_in.get("headers") or {}).items() if k}
         if headers:
             rest_block["headers"] = headers
-        auth = dict(rest_in.get("auth") or {"type": "none"})
+        # Cleared inputs in the editor arrive as "" — dropping them keeps the
+        # YAML honest (e.g. no `token_env: ""` sitting beside a real token_file).
+        auth = {
+            k: v
+            for k, v in (rest_in.get("auth") or {}).items()
+            if not (isinstance(v, str) and not v.strip())
+        }
         auth.setdefault("type", "none")
         rest_block["auth"] = auth
         openapi = (rest_in.get("openapi") or "").strip()
@@ -453,8 +521,18 @@ def _validate_rest(provider: dict[str, Any]) -> list[str]:
     atype = (auth.get("type") or "none").strip()
     if atype not in _REST_AUTH_TYPES:
         errors.append(f"auth.type must be one of {sorted(_REST_AUTH_TYPES)}")
-    if atype == "bearer" and not (auth.get("token_env") or "").strip():
-        errors.append("auth.token_env is required for bearer auth")
+    if atype == "bearer":
+        token_env = (auth.get("token_env") or "").strip()
+        token_file = (auth.get("token_file") or "").strip()
+        if bool(token_env) == bool(token_file):
+            errors.append(
+                "bearer auth requires exactly one of auth.token_env or auth.token_file"
+            )
+        elif token_file and not Path(token_file).is_file():
+            errors.append(
+                f"auth.token_file not found: {token_file} — set its value via the "
+                "Secrets dialog, or upload it with the Files manager (e.g. tools/secrets/)"
+            )
     if atype == "api_key" and not (auth.get("value_env") or "").strip():
         errors.append("auth.value_env is required for api_key auth")
     if atype == "client_credentials":
@@ -644,6 +722,30 @@ def _resolve_in_root(roots: dict[str, Path], root: str, rel: str) -> Path:
     return target
 
 
+def _guard_secret_file(declared: str, roots: dict[str, Path]) -> Path:
+    """Resolve a YAML-declared secret path, rejecting anything outside the
+    mounted roots (tools / files / repos) or the REST auth dir.
+
+    The path always comes from provider YAML rather than from a request body,
+    but a provider could still name ``/etc/passwd`` — this keeps a write from
+    the Secrets dialog inside the directories the proxy already owns.
+    """
+    target = Path(declared).resolve()
+    allowed = [Path(r).resolve() for r in roots.values()]
+    allowed.append(Path(REST_AUTH_DIR).resolve())
+    for base in allowed:
+        try:
+            target.relative_to(base)
+            return target
+        except ValueError:
+            continue
+    raise HTTPException(
+        400,
+        f"Refusing to write {declared!r}: token_file must live under one of "
+        + ", ".join(sorted(str(b) for b in allowed)),
+    )
+
+
 def create_app(
     config_dir: Path | None = None,
     env_file: Path | None = None,
@@ -698,6 +800,7 @@ def create_app(
                     "validation_errors": validation["errors"],
                     "documentation": spec.get("documentation") or "",
                     "oauth": oauth_out,
+                    "auth_info": _provider_auth_info(spec),
                 })
             except Exception as exc:
                 out.append({"name": path.stem, "file": path.name, "error": str(exc)})
@@ -900,6 +1003,94 @@ def create_app(
             store = AuthCodeTokenStore(name, auth)
             auth_url = store.begin_authorization()
             return {"ok": True, "auth_url": auth_url, "redirect_uri": oauth_redirect_uri()}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/secret-file")
+    async def write_secret_file(request: Request) -> dict:
+        """Write a raw credential into the file a provider's auth block declares.
+
+        Body: ``{ name, value }``.  The destination comes from the provider's
+        YAML (``rest.auth.token_file``), never from the request, and is written
+        mode 0600 — so the secret reaches disk without passing through YAML,
+        the container environment, or shell history.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        _guard_name(name)
+        value = body.get("value")
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(400, "A non-empty value is required")
+        path = _config_dir / f"{name}.yaml"
+        if not path.exists():
+            raise HTTPException(404, f"Provider '{name}' not found")
+        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        declared = _rest_bearer_token_file(spec)
+        if not declared:
+            raise HTTPException(
+                400, f"Provider '{name}' declares no bearer auth.token_file to write"
+            )
+        target = _guard_secret_file(declared, _file_roots)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(value.strip() + "\n")
+        os.chmod(target, 0o600)   # tighten an already-existing file too
+        return {"ok": True, "path": str(target)}
+
+    @app.post("/api/auth-refresh")
+    async def auth_refresh(request: Request) -> dict:
+        """Force a token refresh (or credential re-check) for one provider.
+
+        Body: ``{ name }``.  OAuth-backed providers fetch a fresh token; static
+        credentials (bearer / api_key) are re-resolved so the UI can confirm the
+        env var or token file is actually readable.  Never raises — an
+        authorization_code provider whose refresh token is dead comes back with
+        ``needs_authorization`` and the URL to visit.
+        """
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        _guard_name(name)
+        path = _config_dir / f"{name}.yaml"
+        if not path.exists():
+            raise HTTPException(404, f"Provider '{name}' not found")
+        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        info = _provider_auth_info(spec)
+        if not info:
+            return {"ok": False, "error": f"Provider '{name}' declares no authentication."}
+
+        try:
+            if info["kind"] == "oauth":
+                import oauth_bootstrap
+                result = await oauth_bootstrap.refresh_provider(name, spec.get("oauth") or {})
+                return {
+                    "ok": True,
+                    "refreshed": True,
+                    "message": f"Token refreshed — expires {result.get('expiry')}.",
+                }
+
+            from rest_provider import NeedsAuthorization, resolve_rest_auth
+            resolver = resolve_rest_auth(name, spec.get("rest") or {})
+            try:
+                probe: dict[str, str] = {}
+                await resolver.apply(probe, force_refresh=True)
+                resolver.apply_query({})    # api_key with `in: query` resolves here
+            except NeedsAuthorization as exc:
+                return {
+                    "ok": False,
+                    "needs_authorization": True,
+                    "auth_url": exc.auth_url,
+                    "message": "Re-authorization required — open the authorize link.",
+                }
+            if info.get("renewable"):
+                return {"ok": True, "refreshed": True, "message": "Token refreshed."}
+            source = f"token file {info['token_file']}" if info.get("token_file") else "the environment"
+            return {
+                "ok": True,
+                "refreshed": False,
+                "message": f"Credential verified — read from {source} and sent with each request.",
+            }
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc)}
@@ -1671,6 +1862,8 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <h6 id="editor-title" class="mb-0 fw-semibold" style="color:#cdd6f4"></h6>
           <div class="d-flex gap-2">
             <button class="btn btn-sm btn-outline-info" onclick="openSecretsModal()">🔑 Secrets</button>
+            <button class="btn btn-sm btn-outline-success" id="auth-refresh-btn" style="display:none"
+              onclick="refreshProviderAuth()" title="Fetch a fresh token, or verify the stored credential">⟳ Refresh auth</button>
             <button class="btn btn-sm btn-primary" onclick="saveProvider()">Save</button>
             <button class="btn btn-sm btn-outline-danger" onclick="deleteProvider()">Delete</button>
           </div>
@@ -1877,10 +2070,28 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
       <div class="modal-body">
         <p class="text-muted" style="font-size:.85em">Values are written to <code id="secrets-env-path">.env</code>. The file is never committed to git.</p>
         <div id="secrets-fields"></div>
+        <div id="secrets-file-section" style="display:none">
+          <hr style="border-color:#45475a">
+          <p class="text-muted" style="font-size:.85em">
+            This provider reads its bearer token from a <b>file</b> rather than the environment.
+            The value below is written to <code id="secrets-file-path"></code> with mode <code>0600</code>;
+            it never enters the provider YAML or the container environment.
+          </p>
+          <div class="section-box mb-2" id="secrets-file-box">
+            <div class="d-flex align-items-center gap-2 mb-1">
+              <span class="fw-semibold font-monospace" style="font-size:.9em">auth.token_file</span>
+              <span id="secrets-file-state" style="font-size:.8em"></span>
+            </div>
+            <input class="form-control form-control-sm" type="password" id="secret-token-file"
+              placeholder="paste the token…">
+          </div>
+        </div>
       </div>
       <div class="modal-footer">
+        <button class="btn btn-outline-success me-auto" id="secrets-refresh-btn" style="display:none"
+          onclick="refreshProviderAuth()">⟳ Refresh auth</button>
         <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-        <button class="btn btn-primary" onclick="saveSecrets()">Save to .env</button>
+        <button class="btn btn-primary" onclick="saveSecrets()">Save</button>
       </div>
     </div>
   </div>
@@ -2063,8 +2274,13 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div class="mb-3" id="wz-rest-auth-fields" style="display:none">
             <!-- bearer -->
             <div class="wz-rest-auth wz-rest-auth-bearer" style="display:none">
-              <label class="form-label">Token env var *</label>
+              <label class="form-label">Token env var</label>
               <input class="form-control font-monospace" id="wz-rest-token-env" placeholder="EXAMPLE_TOKEN">
+              <label class="form-label mt-2">…or token file</label>
+              <input class="form-control font-monospace" id="wz-rest-token-file"
+                placeholder="/app/tools/secrets/&lt;provider&gt;/access_token">
+              <div class="text-muted" style="font-size:.8em">Set exactly one. A token file keeps the
+                secret out of both the YAML and the container environment.</div>
             </div>
             <!-- api_key -->
             <div class="wz-rest-auth wz-rest-auth-api_key" style="display:none">
@@ -2505,6 +2721,8 @@ async function loadList() {
       providersMeta[p.name] = {
         missing_secrets: p.missing_secrets || [],
         validation_errors: p.validation_errors || [],
+        secret_keys: p.secret_keys || [],
+        auth_info: p.auth_info || null,
         oauth: p.oauth || null,
       };
     });
@@ -2686,6 +2904,34 @@ function _refreshEditorBars(name) {
   } else {
     vBar.style.display = 'none';
   }
+
+  // "Refresh auth" only makes sense for providers that actually authenticate.
+  const authBtn = document.getElementById('auth-refresh-btn');
+  if (authBtn) authBtn.style.display = (meta.auth_info && meta.auth_info.refreshable) ? '' : 'none';
+}
+
+// Force a token refresh (OAuth) or re-resolve a static credential.
+async function refreshProviderAuth() {
+  if (!currentName) return;
+  const btns = document.querySelectorAll('#auth-refresh-btn, #secrets-refresh-btn');
+  btns.forEach(b => { b.disabled = true; });
+  try {
+    const r = await api('POST', '/api/auth-refresh', {name: currentName});
+    if (r.ok) {
+      toast(r.message || 'Auth refreshed ✓');
+    } else if (r.needs_authorization && r.auth_url) {
+      toast('Re-authorization required — opening the authorize page.', false);
+      window.open(r.auth_url, '_blank', 'noopener');
+    } else {
+      toast(r.error || r.message || 'Refresh failed', false);
+    }
+    await loadList();
+    _refreshEditorBars(currentName);
+  } catch (e) {
+    toast(e.message, false);
+  } finally {
+    btns.forEach(b => { b.disabled = false; });
+  }
 }
 
 function renderProvider(p) {
@@ -2865,7 +3111,12 @@ function renderRestAuthFields(auth) {
   const t = auth.type || 'none';
   let html = '';
   if (t === 'bearer') {
-    html = _restAuthRow('Token env var', 'token_env', auth.token_env, 'EXAMPLE_TOKEN');
+    html  = _restAuthRow('Token env var', 'token_env', auth.token_env, 'EXAMPLE_TOKEN');
+    html += _restAuthRow('…or token file', 'token_file', auth.token_file,
+                         '/app/tools/secrets/<provider>/access_token');
+    html += `<div class="text-muted" style="font-size:.8em">Set exactly one. A token file is read
+      at request time, so the secret never enters the YAML or the container environment — fill its
+      value with the 🔑 Secrets button.</div>`;
   } else if (t === 'api_key') {
     const loc = auth.in === 'query' ? 'query' : 'header';
     html = `<div class="mb-2"><label class="form-label">Send key in</label>
@@ -3566,10 +3817,40 @@ async function openSecretsModal() {
       if (s.env && !keys.includes(s.env)) keys.push(s.env);
     }
   }
+  const meta = providersMeta[currentName] || {};
+  const info = meta.auth_info || null;
+  // REST auth credentials (token_env, value_env, client_id_env, client_secret_env)
+  // are declared in the auth block, not on a tool — surface them here too.
+  for (const k of (info && info.env_keys) || []) {
+    if (k && !keys.includes(k)) keys.push(k);
+  }
+
+  // File-backed bearer token: written to the path the YAML declares.
+  const fileSection = document.getElementById('secrets-file-section');
+  if (info && info.token_file) {
+    document.getElementById('secrets-file-path').textContent = info.token_file;
+    document.getElementById('secrets-file-state').innerHTML = info.token_file_set
+      ? '<span style="color:var(--green)">✓ set</span>'
+      : '<span style="color:var(--yellow)">not set</span>';
+    const input = document.getElementById('secret-token-file');
+    input.value = '';
+    input.placeholder = info.token_file_set ? 'leave blank to keep existing' : 'paste the token…';
+    document.getElementById('secrets-file-box').className =
+      'section-box mb-2 ' + (info.token_file_set ? 'secret-set' : 'secret-unset');
+    fileSection.style.display = '';
+  } else {
+    fileSection.style.display = 'none';
+  }
+
+  const refreshBtn = document.getElementById('secrets-refresh-btn');
+  refreshBtn.style.display = (info && info.refreshable) ? '' : 'none';
+
   const existing = env.vars || {};
   const el = document.getElementById('secrets-fields');
   if (!keys.length) {
-    el.innerHTML = '<div class="text-muted">No secrets declared in this provider.</div>';
+    el.innerHTML = (info && info.token_file)
+      ? '<div class="text-muted">This provider has no environment-backed secrets.</div>'
+      : '<div class="text-muted">No secrets declared in this provider.</div>';
   } else {
     el.innerHTML = keys.map(k => {
       const isSet = !!existing[k];
@@ -3593,10 +3874,22 @@ async function saveSecrets() {
     const key = el.id.replace('secret-', '');
     if (el.value.trim()) vars[key] = el.value.trim();
   });
-  if (!Object.keys(vars).length) { secretsModal.hide(); return; }
+  const fileInput = document.getElementById('secret-token-file');
+  const fileValue = (document.getElementById('secrets-file-section').style.display !== 'none'
+    && fileInput) ? fileInput.value.trim() : '';
+  if (!Object.keys(vars).length && !fileValue) { secretsModal.hide(); return; }
   try {
-    await api('POST', '/api/env', {vars});
-    toast(`Saved ${Object.keys(vars).length} secret(s) ✓`);
+    const saved = [];
+    if (Object.keys(vars).length) {
+      await api('POST', '/api/env', {vars});
+      saved.push(`${Object.keys(vars).length} secret(s) → .env`);
+    }
+    if (fileValue) {
+      const r = await api('POST', '/api/secret-file', {name: currentName, value: fileValue});
+      saved.push(`token file ${r.path}`);
+      fileInput.value = '';
+    }
+    toast(`Saved ${saved.join(' · ')} ✓`);
     secretsModal.hide();
     await loadList();
     if (currentName) _refreshEditorBars(currentName);
@@ -3652,7 +3945,7 @@ function openWizard() {
 function wzRestReset() {
   wzRestEndpoints = [];
   wzRestEndpointTools = {};
-  ['wz-rest-name','wz-rest-base-url','wz-rest-token-env','wz-rest-header','wz-rest-value-env',
+  ['wz-rest-name','wz-rest-base-url','wz-rest-token-env','wz-rest-token-file','wz-rest-header','wz-rest-value-env',
    'wz-rest-authorize-url','wz-rest-token-url','wz-rest-client-id-env','wz-rest-client-secret-env',
    'wz-rest-scopes','wz-rest-openapi'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   const at = document.getElementById('wz-rest-auth-type'); if (at) at.value = 'none';
@@ -3820,7 +4113,10 @@ function wzRestCollectAuth() {
   const type = document.getElementById('wz-rest-auth-type').value;
   const auth = { type };
   const g = id => (document.getElementById(id).value || '').trim();
-  if (type === 'bearer') auth.token_env = g('wz-rest-token-env');
+  if (type === 'bearer') {
+    const tEnv = g('wz-rest-token-env'); if (tEnv) auth.token_env = tEnv;
+    const tFile = g('wz-rest-token-file'); if (tFile) auth.token_file = tFile;
+  }
   else if (type === 'api_key') { auth.header = g('wz-rest-header') || 'X-Api-Key'; auth.value_env = g('wz-rest-value-env'); }
   else if (type === 'client_credentials' || type === 'authorization_code') {
     auth.token_url = g('wz-rest-token-url');
@@ -3833,7 +4129,8 @@ function wzRestCollectAuth() {
 }
 
 function wzRestValidateAuth(auth) {
-  if (auth.type === 'bearer' && !auth.token_env) return 'Bearer auth needs a token env var.';
+  if (auth.type === 'bearer' && Boolean(auth.token_env) === Boolean(auth.token_file))
+    return 'Bearer auth needs exactly one of a token env var or a token file.';
   if (auth.type === 'api_key' && !auth.value_env) return 'API-key auth needs a value env var.';
   if (auth.type === 'client_credentials') {
     if (!auth.token_url || !auth.client_id_env || !auth.client_secret_env)

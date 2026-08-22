@@ -223,22 +223,52 @@ async def _complete_google(flow: dict[str, Any], code: str) -> str:
             "at https://myaccount.google.com/permissions and authorize again."
         )
 
+    _write_google_token(
+        token_file=token_file,
+        provider=flow["provider"],
+        payload=payload,
+        access=access,
+        refresh=refresh,
+        token_uri=flow["token_uri"],
+        client_id=flow["client_id"],
+        client_secret=flow.get("client_secret") or "",
+        fallback_scopes=list(flow.get("scopes") or []),
+    )
+    pending_rest_auth.pop(flow["provider"], None)
+    return access
+
+
+def _write_google_token(
+    *,
+    token_file: Path,
+    provider: str,
+    payload: dict[str, Any],
+    access: str,
+    refresh: str,
+    token_uri: str,
+    client_id: str,
+    client_secret: str,
+    fallback_scopes: list[str],
+) -> dict[str, Any]:
+    """Persist a token response in the exact shape Credentials.to_json() emits.
+
+    Shared by the initial code exchange and by ``refresh_provider`` so the two
+    paths cannot drift into writing different record formats.
+    """
     # Granted scopes (space-separated in the response) may differ from requested.
     scope_str = (payload.get("scope") or "").strip()
-    scopes = scope_str.split() if scope_str else list(flow.get("scopes") or [])
+    scopes = scope_str.split() if scope_str else list(fallback_scopes)
     expires_in = float(payload.get("expires_in", 3600))
     expiry = datetime.datetime.fromtimestamp(
         time.time() + expires_in, tz=datetime.timezone.utc
     ).replace(tzinfo=None)  # naive UTC — the format Credentials.to_json() uses
 
-    # Exactly the shape google.oauth2.credentials.Credentials.to_json() emits,
-    # so from_authorized_user_file() loads it and refreshes transparently.
     record = {
         "token": access,
         "refresh_token": refresh,
-        "token_uri": flow["token_uri"],
-        "client_id": flow["client_id"],
-        "client_secret": flow.get("client_secret") or "",
+        "token_uri": token_uri,
+        "client_id": client_id,
+        "client_secret": client_secret,
         "scopes": scopes,
         "universe_domain": "googleapis.com",
         "account": "",
@@ -246,10 +276,70 @@ async def _complete_google(flow: dict[str, Any], code: str) -> str:
     }
     token_file.parent.mkdir(parents=True, exist_ok=True)
     token_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    print(f"[mcpproxy] OAuth token written for provider '{flow['provider']}': {token_file}")
+    print(f"[mcpproxy] OAuth token written for provider '{provider}': {token_file}")
+    return record
 
-    pending_rest_auth.pop(flow["provider"], None)
-    return access
+
+async def refresh_provider(provider: str, oauth_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Force a refresh of an ``oauth:`` block's cached token.
+
+    Exchanges the stored refresh_token for a new access token and rewrites
+    ``token_file`` in place.  Raises with an actionable message when there is
+    nothing to refresh, so the caller can fall back to the Authorize flow.
+    """
+    otype = (oauth_cfg.get("type") or "").strip()
+    if otype not in SUPPORTED_TYPES:
+        raise ValueError(
+            f"Unsupported oauth.type {otype!r} (supported: {sorted(SUPPORTED_TYPES)})"
+        )
+    token_file = Path((oauth_cfg.get("token_file") or "").strip())
+    try:
+        stored = json.loads(token_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"No token file to refresh at {token_file} — click Authorize first."
+        ) from exc
+    refresh = (stored.get("refresh_token") or "").strip()
+    if not refresh:
+        raise RuntimeError(
+            "The stored token has no refresh_token — click Authorize to grant "
+            "consent again (Google only issues one on a full consent screen)."
+        )
+
+    client = load_client_secret(oauth_cfg.get("client_secret_file") or "")
+    token_uri = stored.get("token_uri") or client["token_uri"]
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": stored.get("client_id") or client["client_id"],
+    }
+    secret = stored.get("client_secret") or client.get("client_secret") or ""
+    if secret:
+        data["client_secret"] = secret
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as http:
+        resp = await http.post(token_uri, data=data)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    access = payload.get("access_token")
+    if not access:
+        raise RuntimeError(f"Token endpoint {token_uri} returned no access_token")
+
+    record = _write_google_token(
+        token_file=token_file,
+        provider=provider,
+        payload=payload,
+        access=access,
+        # A refresh response usually omits refresh_token — carry the old one.
+        refresh=(payload.get("refresh_token") or refresh),
+        token_uri=token_uri,
+        client_id=data["client_id"],
+        client_secret=secret,
+        fallback_scopes=list(stored.get("scopes") or oauth_cfg.get("scopes") or []),
+    )
+    pending_rest_auth.pop(provider, None)
+    return {"expiry": record["expiry"], "scopes": record["scopes"]}
 
 
 _BEGINNERS = {"google": _begin_google}

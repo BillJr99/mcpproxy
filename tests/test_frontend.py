@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from frontend.app import (
     _detect_package_manager,
+    _provider_auth_info,
     _extract_functions,
     _extract_secret_env_keys,
     _parse_env_example,
@@ -1305,12 +1306,234 @@ class TestValidateRest:
         assert any("auth.type" in e for e in errors)
 
 
+def _bearer_provider(auth):
+    """A minimal, otherwise-valid REST provider using bearer auth."""
+    return {
+        "type": "rest",
+        "rest": {
+            "base_url": "https://x",
+            "auth": {"type": "bearer", **auth},
+            "endpoints": [{"name": "t", "method": "GET", "path": "/"}],
+        },
+        "tools": [{"name": "t", "description": "d"}],
+    }
+
+
+class TestValidateBearerCredentialSource:
+    """bearer auth takes exactly one of token_env / token_file (mirrors
+    rest_provider._require_bearer_token, which has accepted both since the
+    file-backed token commit)."""
+
+    def test_token_env_alone_ok(self):
+        assert _validate_rest(_bearer_provider({"token_env": "TOK"})) == []
+
+    def test_token_file_alone_ok(self, tmp_path):
+        token = tmp_path / "access_token"
+        token.write_text("secret\n", encoding="utf-8")
+        assert _validate_rest(_bearer_provider({"token_file": str(token)})) == []
+
+    def test_neither_fails(self):
+        errors = _validate_rest(_bearer_provider({}))
+        assert any("exactly one" in e for e in errors)
+
+    def test_both_fails(self, tmp_path):
+        token = tmp_path / "access_token"
+        token.write_text("secret\n", encoding="utf-8")
+        errors = _validate_rest(
+            _bearer_provider({"token_env": "TOK", "token_file": str(token)})
+        )
+        assert any("exactly one" in e for e in errors)
+
+    def test_missing_token_file_reports_path(self, tmp_path):
+        missing = tmp_path / "nope" / "access_token"
+        errors = _validate_rest(_bearer_provider({"token_file": str(missing)}))
+        assert any(str(missing) in e for e in errors)
+
+    def test_empty_string_credentials_are_not_credentials(self):
+        errors = _validate_rest(_bearer_provider({"token_env": "", "token_file": ""}))
+        assert any("exactly one" in e for e in errors)
+
+
+class TestBearerTokenFileRoundTrip:
+    def test_token_file_survives_yaml_round_trip(self, tmp_path):
+        token = tmp_path / "access_token"
+        token.write_text("secret\n", encoding="utf-8")
+        provider = {
+            **REST_PROVIDER,
+            "rest": {**REST_PROVIDER["rest"],
+                     "auth": {"type": "bearer", "token_file": str(token)}},
+        }
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+        assert spec["rest"]["auth"]["token_file"] == str(token)
+        assert "token_env" not in spec["rest"]["auth"]
+
+    def test_blank_token_env_is_not_written(self, tmp_path):
+        """The editor writes '' into cleared inputs — that must not reach YAML."""
+        token = tmp_path / "access_token"
+        token.write_text("secret\n", encoding="utf-8")
+        provider = {
+            **REST_PROVIDER,
+            "rest": {**REST_PROVIDER["rest"],
+                     "auth": {"type": "bearer", "token_env": "",
+                              "token_file": str(token)}},
+        }
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+        assert "token_env" not in spec["rest"]["auth"]
+        assert _validate_rest({"type": "rest", **spec, "tools": [{"name": "t"}]}) == []
+
+
 class TestExtractSecretEnvKeysRest:
     def test_rest_auth_env_keys_extracted(self):
         spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
         keys = _extract_secret_env_keys(spec)
         assert "WEATHER_CLIENT_ID" in keys
         assert "WEATHER_CLIENT_SECRET" in keys
+
+
+def _write_bearer_provider(tools_dir, token_path, name="asana-rest"):
+    """Write a bearer/token_file provider YAML into the tools dir."""
+    provider = {
+        **REST_PROVIDER,
+        "name": name,
+        "rest": {**REST_PROVIDER["rest"],
+                 "auth": {"type": "bearer", "token_file": str(token_path)}},
+    }
+    (tools_dir / f"{name}.yaml").write_text(_structured_to_yaml(provider))
+    return provider
+
+
+class TestProviderAuthInfo:
+    def test_none_for_code_provider(self):
+        spec = yaml.safe_load(_structured_to_yaml(CODE_PROVIDER))
+        assert _provider_auth_info(spec) is None
+
+    def test_none_for_rest_without_auth(self):
+        provider = {**REST_PROVIDER,
+                    "rest": {**REST_PROVIDER["rest"], "auth": {"type": "none"}}}
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+        assert _provider_auth_info(spec) is None
+
+    def test_reports_env_keys_for_oauth_rest(self):
+        spec = yaml.safe_load(_structured_to_yaml(REST_PROVIDER))
+        info = _provider_auth_info(spec)
+        assert info["kind"] == "rest"
+        assert info["renewable"] is True
+        assert "WEATHER_CLIENT_ID" in info["env_keys"]
+
+    def test_reports_unset_then_set_token_file(self, tmp_path, tools_dir):
+        token = tmp_path / "secrets" / "access_token"
+        provider = _write_bearer_provider(tools_dir, token)
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+
+        info = _provider_auth_info(spec)
+        assert info["token_file"] == str(token)
+        assert info["token_file_set"] is False
+        assert info["renewable"] is False      # nothing to refresh, but re-checkable
+        assert info["refreshable"] is True
+
+        token.parent.mkdir(parents=True)
+        token.write_text("secret\n", encoding="utf-8")
+        assert _provider_auth_info(spec)["token_file_set"] is True
+
+    def test_whitespace_only_token_file_counts_as_unset(self, tmp_path, tools_dir):
+        token = tmp_path / "access_token"
+        token.write_text("\n", encoding="utf-8")
+        provider = _write_bearer_provider(tools_dir, token)
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+        assert _provider_auth_info(spec)["token_file_set"] is False
+
+    def test_exposed_by_list_tools(self, app, tools_dir, tmp_path):
+        _write_bearer_provider(tools_dir, tmp_path / "access_token")
+        data = TestClient(app).get("/api/tools").json()
+        assert data[0]["auth_info"]["type"] == "bearer"
+
+
+class TestSecretFileEndpoint:
+    def test_writes_declared_path_mode_600(self, app, tools_dir):
+        token = tools_dir / "secrets" / "asana-rest" / "access_token"
+        _write_bearer_provider(tools_dir, token)
+        r = TestClient(app).post("/api/secret-file",
+                                 json={"name": "asana-rest", "value": "  tok-123  "})
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert token.read_text(encoding="utf-8") == "tok-123\n"
+        assert oct(token.stat().st_mode & 0o777) == "0o600"
+
+    def test_overwrites_and_tightens_existing_file(self, app, tools_dir):
+        token = tools_dir / "secrets" / "access_token"
+        token.parent.mkdir(parents=True)
+        token.write_text("old\n", encoding="utf-8")
+        token.chmod(0o644)
+        _write_bearer_provider(tools_dir, token)
+        TestClient(app).post("/api/secret-file",
+                             json={"name": "asana-rest", "value": "new"})
+        assert token.read_text(encoding="utf-8") == "new\n"
+        assert oct(token.stat().st_mode & 0o777) == "0o600"
+
+    def test_rejects_empty_value(self, app, tools_dir):
+        _write_bearer_provider(tools_dir, tools_dir / "secrets" / "access_token")
+        r = TestClient(app).post("/api/secret-file",
+                                 json={"name": "asana-rest", "value": "   "})
+        assert r.status_code == 400
+
+    def test_rejects_path_outside_the_mounted_roots(self, app, tools_dir, tmp_path):
+        outside = tmp_path / "elsewhere" / "passwd"
+        _write_bearer_provider(tools_dir, outside)
+        r = TestClient(app).post("/api/secret-file",
+                                 json={"name": "asana-rest", "value": "tok"})
+        assert r.status_code == 400
+        assert not outside.exists()
+
+    def test_rejects_provider_without_token_file(self, app, tools_dir):
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        r = TestClient(app).post("/api/secret-file",
+                                 json={"name": "weather", "value": "tok"})
+        assert r.status_code == 400
+
+    def test_unknown_provider_is_404(self, app):
+        r = TestClient(app).post("/api/secret-file",
+                                 json={"name": "nope", "value": "tok"})
+        assert r.status_code == 404
+
+
+class TestAuthRefreshEndpoint:
+    def test_verifies_a_readable_token_file(self, app, tools_dir):
+        token = tools_dir / "secrets" / "access_token"
+        token.parent.mkdir(parents=True)
+        token.write_text("tok\n", encoding="utf-8")
+        _write_bearer_provider(tools_dir, token)
+        body = TestClient(app).post("/api/auth-refresh", json={"name": "asana-rest"}).json()
+        assert body["ok"] is True
+        assert body["refreshed"] is False
+        assert str(token) in body["message"]
+
+    def test_reports_an_unreadable_token_file(self, app, tools_dir):
+        _write_bearer_provider(tools_dir, tools_dir / "secrets" / "missing")
+        body = TestClient(app).post("/api/auth-refresh", json={"name": "asana-rest"}).json()
+        assert body["ok"] is False
+        assert "error" in body
+
+    def test_forces_a_refresh_for_oauth_rest(self, app, tools_dir):
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        with patch("rest_provider._AuthResolver.apply", new=AsyncMock()) as applied:
+            body = TestClient(app).post("/api/auth-refresh", json={"name": "weather"}).json()
+        assert body["ok"] is True and body["refreshed"] is True
+        assert applied.await_args.kwargs["force_refresh"] is True
+
+    def test_surfaces_the_authorize_url_when_consent_is_needed(self, app, tools_dir):
+        from rest_provider import NeedsAuthorization
+        (tools_dir / "weather.yaml").write_text(_structured_to_yaml(REST_PROVIDER))
+        boom = AsyncMock(side_effect=NeedsAuthorization("weather", "https://auth/x"))
+        with patch("rest_provider._AuthResolver.apply", new=boom):
+            body = TestClient(app).post("/api/auth-refresh", json={"name": "weather"}).json()
+        assert body["ok"] is False
+        assert body["needs_authorization"] is True
+        assert body["auth_url"] == "https://auth/x"
+
+    def test_provider_without_auth_says_so(self, app, tools_dir):
+        (tools_dir / "myprovider.yaml").write_text(_structured_to_yaml(CODE_PROVIDER))
+        body = TestClient(app).post("/api/auth-refresh", json={"name": "myprovider"}).json()
+        assert body["ok"] is False
+        assert "no authentication" in body["error"]
 
 
 class TestListToolsRest:

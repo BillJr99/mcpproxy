@@ -885,11 +885,29 @@ class TestHeaderCredentialChecks:
         assert "set but empty" in msg
 
     @pytest.mark.parametrize("value", ['"Bearer ghp_x"', "'Bearer ghp_x'"])
-    def test_quoted_values_are_reported(self, value):
+    def test_doubly_quoted_values_are_reported(self, value):
+        # Quotes in the *file* are correct and often required — a value with a
+        # space must be quoted or the shell that sources .env truncates it.
+        # Quotes surviving into the resolved value mean it was quoted twice.
         msg = process_runner.check_header_credentials(
             GH_COMMAND, {"GITHUB_MCP_AUTH_HEADER": value}
         )
-        assert "wrapped in quotes" in msg
+        assert "quoted twice" in msg
+
+    def test_a_correctly_quoted_file_value_is_accepted(self, tmp_path, monkeypatch):
+        # End to end: the file holds "Bearer ghp_x" with quotes, and what the
+        # bridge receives has none.
+        from config import env_quote
+
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"GITHUB_MCP_AUTH_HEADER={env_quote('Bearer ghp_x')}\n")
+        monkeypatch.setenv("MCP_ENV_FILE", str(env_file))
+        session = process_runner.ProcessSession(
+            GH_COMMAND, env_keys=["GITHUB_MCP_AUTH_HEADER"]
+        )
+        env = session._build_env()
+        assert env["GITHUB_MCP_AUTH_HEADER"] == "Bearer ghp_x"
+        assert process_runner.check_header_credentials(GH_COMMAND, env) is None
 
     def test_a_usable_value_passes(self):
         assert process_runner.check_header_credentials(

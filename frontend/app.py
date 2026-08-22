@@ -62,7 +62,15 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
-from config import CONFIG_DIR, ENV_FILE, FILES_DIR, REPOS_DIR, REST_AUTH_DIR
+from config import (
+    CONFIG_DIR,
+    ENV_FILE,
+    FILES_DIR,
+    REPOS_DIR,
+    REST_AUTH_DIR,
+    env_quote,
+    env_unquote,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +103,7 @@ def _read_env_file(path: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        result[key.strip()] = val.strip().strip('"').strip("'")
+        result[key.strip()] = env_unquote(val)
     return result
 
 
@@ -124,7 +132,9 @@ def _write_env_file(path: Path, updates: dict[str, str]) -> None:
 
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     for key, value in updates.items():
-        replacement = f"{key}={value}"
+        # Quoted where the shell would otherwise mis-parse it: run_local.sh
+        # sources this file, so `TOKEN=Bearer ghp_x` would assign only "Bearer".
+        replacement = f"{key}={env_quote(value)}"
         # Walk backwards: the last assignment is the one that wins at read time.
         target = None
         for i in range(len(lines) - 1, -1, -1):

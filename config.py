@@ -1,5 +1,6 @@
 """Shared configuration — imported by both server.py and frontend/app.py."""
 import os
+import re
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("MCP_TOOL_CONFIG_DIR", "/app/tools"))
@@ -38,3 +39,60 @@ UI_PORT = int(os.environ.get("MCP_UI_PORT", "8889"))
 
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8888"))
+
+
+# ---------------------------------------------------------------------------
+# .env value quoting
+# ---------------------------------------------------------------------------
+#
+# The env file is consumed three ways: parsed by this project, handed to
+# docker-compose as env_file, and *sourced by a shell* (run_local.sh does
+# `set -a; source "$ENV_FILE"`).  That last one is why a value needs quoting:
+# `TOKEN=Bearer ghp_x` assigns only "Bearer" and then tries to run `ghp_x`.
+# Writing values raw therefore silently truncated anything with a space.
+
+_NEEDS_QUOTING = re.compile(r"""[\s"'#$`\\]""")
+
+# Inside double quotes the shell still acts on these, so they are backslashed.
+_SHELL_SPECIAL = '\\"$`'
+
+
+def env_quote(value: str) -> str:
+    """Render *value* for the right-hand side of a .env line.
+
+    Quoted only when it would otherwise be misread, so ordinary settings stay
+    readable — matching how .env.example is written.
+    """
+    if value == "":
+        return '""'
+    if not _NEEDS_QUOTING.search(value):
+        return value
+    escaped = value
+    for char in _SHELL_SPECIAL:
+        escaped = escaped.replace(char, "\\" + char)
+    return f'"{escaped}"'
+
+
+def env_unquote(raw: str) -> str:
+    """Inverse of :func:`env_quote`, tolerant of hand-written files.
+
+    Single quotes are literal to the shell, so their body is taken as-is;
+    double quotes undo the escaping ``env_quote`` applies.
+    """
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        body = text[1:-1]
+        if text[0] == "'":
+            return body
+        out: list[str] = []
+        i = 0
+        while i < len(body):
+            char = body[i]
+            if char == "\\" and i + 1 < len(body) and body[i + 1] in _SHELL_SPECIAL:
+                out.append(body[i + 1])
+                i += 2
+            else:
+                out.append(char)
+                i += 1
+        return "".join(out)
+    return text

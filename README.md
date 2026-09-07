@@ -188,7 +188,10 @@ Open **`http://localhost:8889`** in your browser after starting the server.
   dropdown just falls back to "Other…" so you can always free-type.
 - **Save** — write the file; restart MCP server to reload
 - **🔑 Secrets** — manage `.env` values for every variable the provider declares:
-  per-tool `secrets.env`, `package.env_keys`, `repository.env_keys`, and REST auth `*_env`
+  per-tool `secrets.env`, `package.env_keys`, `repository.env_keys`, and REST auth `*_env`.
+  Saving takes effect on the next tool call; no restart is needed for a secret.
+  **⟳ Reload secrets** (in the same dialog) re-reads `.env` on demand and reports which
+  variable *names* changed, for when the file was edited outside the UI
 - **⚙ Settings** (navbar) — the server name reported to MCP clients (`MCP_SERVER_NAME`).
   It is only a display name: tool names are namespaced from each provider's YAML filename,
   so changing it cannot break a provider. Applied on the next restart, and the dialog says
@@ -394,6 +397,12 @@ call, so the browser binary is always ready when needed.
 
 > **After editing and saving** a provider's command or setup steps, click **Restart MCP Server**
 > (the yellow bar that appears after saving) to apply the changes.
+>
+> This does **not** apply to secrets. A value saved under **🔑 Secrets** is picked up on the
+> next tool call, so a rotated credential needs no restart. What still needs one is anything
+> read at import time: the server name, ports, `MCPPROXY_FILES_DIR` / `REPOS_DIR` /
+> `REST_AUTH_DIR`, and the tuning knobs listed under
+> [Non-blocking startup](#non-blocking-startup).
 
 ## REST / OAuth providers
 
@@ -434,6 +443,37 @@ never written directly into provider YAML.
 For `authorization_code`, register the redirect URI **`<MCPPROXY_OAUTH_REDIRECT_BASE>/oauth/callback`**
 (default `http://localhost:8889/oauth/callback`) with your OAuth provider. Tokens are cached
 under `MCPPROXY_REST_AUTH_DIR` (default `/app/.rest-auth`, gitignored).
+
+#### When a credential is rejected
+
+The two OAuth types self-heal: an expiry check runs before every request, and a `401` triggers
+one forced token refresh and a retry. `bearer` and `api_key` cannot, because a static key has
+nothing to refresh. So that a rejected credential is not merely an opaque upstream string, a
+`401` or `403` returns a directive naming what to fix:
+
+```json
+{
+  "ok": false,
+  "tool": "list_issues",
+  "status": 401,
+  "error": "HTTP 401: {\"detail\":\"token expired\"}",
+  "auth_error": "rejected",
+  "credential": "environment variable GITHUB_TOKEN",
+  "retryable": false,
+  "message": "Provider 'github' rejected the credential for 'list_issues' (HTTP 401). It is set, so it has most likely expired, been revoked, or been rotated elsewhere. Ask the user to update environment variable GITHUB_TOKEN in the mcpproxy Secrets UI; the new value takes effect on the next call, with no restart needed. Do not retry this tool until they confirm they have updated it."
+}
+```
+
+| `auth_error` | When | What it tells the model |
+|---|---|---|
+| `rejected` | `401` on `bearer` / `api_key` | The key is set but was not accepted, so it has expired, been revoked, or been rotated. Names the variable or token file to update. |
+| `forbidden` | `403` on `bearer` / `api_key` | The key works but the operation is not permitted, so this is a missing scope rather than expiry. Retrying will not help. |
+| `reauthorization_required` | `401`/`403` on an OAuth type | A token refresh was already attempted and also rejected, so the stored grant is revoked or re-scoped. Re-authorize the provider. |
+
+`credential` names the **source** (`environment variable NAME`, or `token file PATH`), never a
+value. `status` remains the HTTP integer, and `error` keeps the truncated upstream body, so
+anything already reading those is unaffected. A `403` deliberately does **not** trigger a token
+refresh: an ordinary permission denial would otherwise cause a pointless token round-trip.
 
 Both bearer credential sources are editable in the UI — the provider editor and the **New
 Provider** wizard each offer a *Token env var* and a *…or token file* field, and exactly one
@@ -573,6 +613,27 @@ tools:
 
 The server injects the value of `MY_SERVICE_API_KEY` from the environment at call time.
 The LLM never sees the value — it is not in the tool schema.
+
+### Rotating a secret
+
+`.env` is the source of truth, and the proxy re-reads it whenever the file changes. A key
+rotated through the Secrets UI (or edited on disk) therefore takes effect on the **next tool
+call**, with no restart. The re-read costs one `stat()` per call and only re-parses when the
+file has actually changed.
+
+Three consequences worth knowing:
+
+- Values are pushed into the proxy's own environment, and every subprocess it spawns inherits
+  that environment. A secret added after startup will now reach package providers that do not
+  declare it under `package.env_keys`, which previously could not see it.
+- A key **deleted** from `.env` is removed from the process environment too, so the file stays
+  authoritative. A value that something else has since overwritten is left alone.
+- An already-running provider subprocess keeps the environment it was spawned with; it picks up
+  the new value when it is next spawned. For an `mcp-remote` bridge, **🔐 Re-authorize** forces
+  that respawn without restarting the proxy.
+
+Only variable *names* are ever reported back: `GET /api/env` masks values to `***`, and both
+`POST /api/env` and `POST /api/env/reload` return names alone.
 
 **Ways to set secret values:**
 
@@ -873,6 +934,10 @@ re-downloaded, re-built, or re-authorized on every fresh container.
 | `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens are neither readable by `mcpproxy__getfile` nor removable by `mcpproxy__deletefile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
 | `/app/.rest-auth` | `mcpproxy-rest-auth` | OAuth token cache for REST `authorization_code` providers. | Re-authorize REST OAuth providers on every fresh container. |
 
+`docker-compose.yml` sets `restart: unless-stopped`. **Restart MCP Server** in the UI works by
+sending `SIGTERM` to the proxy's own process, so without a restart policy the container would
+stop and never return. Set it to `no` if you would rather a stopped container stay stopped.
+
 The image pins `PIP_CACHE_DIR=/root/.cache/pip` and `UV_CACHE_DIR=/root/.cache/uv`
 so the pip and uv wheel caches always land inside the persisted `mcpproxy-cache`
 volume, even if `HOME`/XDG defaults change.
@@ -1159,6 +1224,12 @@ It is a test-only dependency; the proxy itself does not import it.
   any read or delete happens. `tests/test_builtin_tools.py::TestContainment` runs a
   battery of traversal payloads against every tool and asserts nothing outside the base
   is ever read or removed.
+- Secrets in `.env` are re-read into the proxy's environment when the file changes, and every
+  subprocess it spawns inherits that environment. A secret added after startup therefore reaches
+  package providers that do not declare it under `package.env_keys`, which previously could not
+  see it. Keep unrelated credentials out of a `.env` shared with providers you do not trust.
+- Deleting a key from `.env` removes it from the running process environment, so the file stays
+  authoritative. A value something else has overwritten in the meantime is left untouched.
 - The built-in `mcpproxy__deletefile` tool permanently deletes files under
   `MCPPROXY_FILES_DIR`, and both the MCP endpoint and the web UI that can invoke it
   are unauthenticated. Set `MCPPROXY_ENABLE_DELETEFILE=0` on any deployment whose

@@ -97,6 +97,17 @@ def _background_setup_enabled() -> bool:
     )
 
 
+# The built-in file tools are read-only except mcpproxy__deletefile, which removes
+# a file (or an already-empty directory) for good.  It is registered by default;
+# set MCPPROXY_ENABLE_DELETEFILE=0 to keep the built-in file surface read-only.
+# Built-ins bypass the per-tool `enabled: false` switch that YAML providers have,
+# so this env var is the only way to withhold the tool.
+def _delete_file_enabled() -> bool:
+    return os.environ.get("MCPPROXY_ENABLE_DELETEFILE", "1").strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
 # Seconds advertised in the retry directive returned for a not-yet-ready tool.
 INIT_RETRY_SECONDS = int(os.environ.get("MCPPROXY_INIT_RETRY_SECONDS", "15"))
 
@@ -589,16 +600,19 @@ def run_provider_setup(spec: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def register_builtin_tools() -> None:
-    """Register the mcpproxy__listfiles and mcpproxy__getfile utility tools.
+    """Register the mcpproxy__listfiles / getfile / deletefile utility tools.
 
-    These tools expose read-only access to the files directory (default:
-    ``/app/files``, override with ``MCPPROXY_FILES_DIR``).  They are
-    always registered regardless of what YAML providers are loaded, giving
-    LLMs a way to retrieve screenshots, JSON snapshots, and other files
-    produced by package providers such as the Playwright MCP server.
+    These tools expose the files directory (default: ``/app/files``, override
+    with ``MCPPROXY_FILES_DIR``) to LLMs, giving them a way to retrieve the
+    screenshots, JSON snapshots, and other files produced by package providers
+    such as the Playwright MCP server, and to clean those artefacts up
+    afterwards.  They are always registered regardless of what YAML providers
+    are loaded, with one exception: ``mcpproxy__deletefile`` is the only
+    built-in that mutates the filesystem, and it is skipped when
+    ``MCPPROXY_ENABLE_DELETEFILE`` is set to ``0``.
     """
     try:
-        from builtin_tools import get_file, list_files
+        from builtin_tools import delete_file, get_file, list_files
 
         register_tool(
             {
@@ -611,7 +625,8 @@ def register_builtin_tools() -> None:
                     "Pass a subdirectory path to drill down. "
                     "Each returned entry has a 'path' field (relative to the base "
                     "files directory) — pass that value directly to mcpproxy__getfile "
-                    "to read the file. Do NOT use just the 'name' (basename) for "
+                    "to read the file, or to mcpproxy__deletefile to remove it. "
+                    "Do NOT use just the 'name' (basename) for "
                     "nested entries, or the file will not be found."
                 ),
                 "input_schema": {
@@ -684,7 +699,44 @@ def register_builtin_tools() -> None:
             get_file,
         )
 
-        print("Registered built-in tools: mcpproxy__listfiles, mcpproxy__getfile")
+        registered = ["mcpproxy__listfiles", "mcpproxy__getfile"]
+
+        if _delete_file_enabled():
+            register_tool(
+                {
+                    "name": "mcpproxy__deletefile",
+                    "description": (
+                        "Permanently delete a single file from the mcpproxy files "
+                        "directory (default: /app/files). "
+                        "There is no undo and no trash — the file is gone. "
+                        "An empty directory can also be removed; a directory that "
+                        "still has contents is refused, so delete its files one at "
+                        "a time first. "
+                        "Deleting a symlink removes the link only and leaves what it "
+                        "points at untouched. "
+                        "Use mcpproxy__listfiles to discover paths and pass an "
+                        "entry's 'path' value verbatim; do not guess a path or use "
+                        "just the 'name' (basename) of a nested entry."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": (
+                                    "Path to the file, empty directory, or symlink "
+                                    "to delete, relative to the base files directory."
+                                ),
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+                delete_file,
+            )
+            registered.append("mcpproxy__deletefile")
+
+        print(f"Registered built-in tools: {', '.join(registered)}")
     except Exception as exc:
         print(f"register_builtin_tools error: {exc}")
         traceback.print_exc()

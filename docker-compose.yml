@@ -10,7 +10,8 @@
 # ───────
 # mcpproxy-tools    /app/tools                — provider YAML configs (required)
 # mcpproxy-files    /app/files                — provider output artefacts surfaced via
-#                                               mcpproxy__listfiles / mcpproxy__getfile
+#                                               mcpproxy__listfiles / mcpproxy__getfile,
+#                                               and removable via mcpproxy__deletefile
 #                                               (e.g. Playwright screenshots under
 #                                               /app/files/playwright)
 # mcpproxy-repos    /app/repos                — git workdirs + build artefacts for
@@ -24,7 +25,8 @@
 #                                               PERSIST THIS: it holds the refresh
 #                                               token, so you only authorize once.
 #                                               Kept out of /app/files so tokens are
-#                                               never exposed via mcpproxy__getfile.
+#                                               neither readable by mcpproxy__getfile
+#                                               nor removable by mcpproxy__deletefile.
 #
 # Every cache/artefact volume is optional in spirit — remove the entry and the
 # container falls back to ephemeral storage on its writable layer (re-clones,
@@ -47,6 +49,10 @@ services:
       MCP_TOOL_CONFIG_DIR: "/app/tools"
       MCP_ENV_FILE: "/app/.env"
       MCPPROXY_FILES_DIR: "/app/files"
+      # The built-in mcpproxy__deletefile tool permanently removes files under
+      # MCPPROXY_FILES_DIR. Set to "0" to leave it unregistered and keep the
+      # built-in file tools read-only.
+      MCPPROXY_ENABLE_DELETEFILE: "1"
       MCPPROXY_REPOS_DIR: "/app/repos"
       # Where mcp-remote caches OAuth tokens (access + refresh). Persisted via
       # the mcpproxy-mcp-auth volume so you authorize once and refresh silently.

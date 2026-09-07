@@ -29,10 +29,13 @@ requests immediately while each provider's dependencies install. A tool whose pr
 is still installing returns a structured **retry directive** instead of blocking — see
 [Non-blocking startup](#non-blocking-startup) below.
 
-Two **built-in tools** (`mcpproxy__listfiles` and `mcpproxy__getfile`) are always registered
-without any YAML config.  They give LLMs read-only access to a configurable directory
-(default: `/app/files`, mountable as a Docker volume) — useful for retrieving screenshots
-and snapshots produced by package providers such as Playwright MCP.
+Three **built-in tools** (`mcpproxy__listfiles`, `mcpproxy__getfile` and
+`mcpproxy__deletefile`) are always registered without any YAML config.  They give LLMs
+access to a configurable directory (default: `/app/files`, mountable as a Docker volume)
+— useful for retrieving screenshots and snapshots produced by package providers such as
+Playwright MCP, and for cleaning those artefacts up afterwards.  The first two are
+read-only; `mcpproxy__deletefile` removes one file, empty directory, or symlink
+permanently and can be withheld entirely with `MCPPROXY_ENABLE_DELETEFILE=0`.
 
 ## Tool names advertised to the LLM
 
@@ -43,9 +46,9 @@ joined to the tool's own `name` by a double underscore. For example, a YAML file
 as `playwright__browser_navigate`. This guarantees that tools from different
 providers cannot collide, even if they happen to share a name.
 
-The two built-in tools follow the same convention: `mcpproxy__listfiles` and
-`mcpproxy__getfile`. The `name:` field in your YAML stays unprefixed — the prefix
-is added automatically when the tool is registered.
+The three built-in tools follow the same convention: `mcpproxy__listfiles`,
+`mcpproxy__getfile` and `mcpproxy__deletefile`. The `name:` field in your YAML stays
+unprefixed — the prefix is added automatically when the tool is registered.
 
 ## Ports
 
@@ -113,8 +116,9 @@ state, with the authorization link that unblocks it, not as an error.
   }
   ```
 
-  The calling LLM reads the message and retries shortly. The two built-in tools
-  (`mcpproxy__listfiles` / `mcpproxy__getfile`) are always ready immediately.
+  The calling LLM reads the message and retries shortly. The built-in tools
+  (`mcpproxy__listfiles` / `mcpproxy__getfile` / `mcpproxy__deletefile`) are always
+  ready immediately.
 
 - If a provider's setup **fails**, its tools return `"status": "failed"` with the
   error at call time (the rest of the server stays up).
@@ -125,6 +129,7 @@ Knobs:
 |---|---|---|
 | `MCPPROXY_BACKGROUND_SETUP` | `1` | Set to `0` to run setup synchronously before the server starts (the old blocking behaviour). |
 | `MCPPROXY_INIT_RETRY_SECONDS` | `15` | Seconds advertised in the `retry_after_seconds` field of the directive. |
+| `MCPPROXY_ENABLE_DELETEFILE` | `1` | Set to `0` to leave `mcpproxy__deletefile` unregistered, keeping the built-in file surface read-only. See [Built-in file tool environment variables](#built-in-file-tool-environment-variables). |
 
 Startup stays fast across restarts because pip/uv/npm caches and cloned repos are
 persisted via Docker volumes — see [Volumes & caching](#volumes--caching).
@@ -142,7 +147,7 @@ persisted via Docker volumes — see [Volumes & caching](#volumes--caching).
 ├── server.py
 ├── config.py                       ← shared env-var config (imported by all modules)
 ├── process_runner.py               ← spawns & proxies any stdio MCP subprocess
-├── builtin_tools.py                ← built-in mcpproxy__listfiles / mcpproxy__getfile tools
+├── builtin_tools.py                ← built-in mcpproxy__listfiles / getfile / deletefile tools
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -860,12 +865,12 @@ re-downloaded, re-built, or re-authorized on every fresh container.
 | Container path | Volume | Holds | Without it (cold start) |
 |---|---|---|---|
 | `/app/tools` | `mcpproxy-tools` | Provider YAML configs | **Required** — the proxy has nothing to serve. |
-| `/app/files` | `mcpproxy-files` | Provider output artefacts (Playwright screenshots, snapshots, …) surfaced via `mcpproxy__listfiles` / `mcpproxy__getfile` | Files vanish on container removal. |
+| `/app/files` | `mcpproxy-files` | Provider output artefacts (Playwright screenshots, snapshots, …) surfaced via `mcpproxy__listfiles` / `mcpproxy__getfile`, and removable via `mcpproxy__deletefile` | Files vanish on container removal. |
 | `/app/repos` | `mcpproxy-repos` | Cloned git workdirs + their build artefacts (`node_modules`, `dist`, …) for repository-mode providers | Re-clones and re-runs every `build_commands` on each start (seconds to several minutes per repo). |
 | `/root/.cache` | `mcpproxy-cache` | XDG caches: pip wheels, uv wheels, Playwright browser binaries (`ms-playwright`) | pip/uvx re-download wheels; `npx playwright install chrome` re-fetches ~150 MB. |
 | `/root/.npm` | `mcpproxy-npm` | npm/npx package cache | npx re-downloads packages from the npm registry on first call. |
 | `/root/.local/share/uv` | `mcpproxy-uv-tools` | uvx per-tool venvs | uvx re-creates per-tool venvs from cached wheels. |
-| `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens aren't exposed via `mcpproxy__getfile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
+| `/app/.mcp-auth` | `mcpproxy-mcp-auth` | OAuth token cache (access + refresh tokens) for `mcp-remote` bridge providers, e.g. the official Asana MCP (`MCP_REMOTE_CONFIG_DIR`). Kept out of `/app/files` so tokens are neither readable by `mcpproxy__getfile` nor removable by `mcpproxy__deletefile`. | Re-authorize through the browser on every fresh container. Only relevant if you run an OAuth-bridge provider. |
 | `/app/.rest-auth` | `mcpproxy-rest-auth` | OAuth token cache for REST `authorization_code` providers. | Re-authorize REST OAuth providers on every fresh container. |
 
 The image pins `PIP_CACHE_DIR=/root/.cache/pip` and `UV_CACHE_DIR=/root/.cache/uv`
@@ -1133,7 +1138,7 @@ pytest tests/ -v
 ```
 
 Tests cover `server.py` (pure helpers), `frontend/app.py` (all API endpoints), and
-`builtin_tools.py` (file listing and retrieval).
+`builtin_tools.py` (file listing, retrieval, and deletion).
 CI runs on every push via `.github/workflows/tests.yml`.
 
 ---
@@ -1143,6 +1148,16 @@ CI runs on every push via `.github/workflows/tests.yml`.
 - Do not commit `.env`.
 - Do not enable `debug: true` outside of local testing.
 - The web UI has no authentication — run it on a trusted network only.
+- All three built-in file tools are confined to `MCPPROXY_FILES_DIR` and cannot reach
+  any other directory. Injected traversal is refused: `../` sequences, absolute paths,
+  and symlinked parent directories that point outside the base are all rejected before
+  any read or delete happens. `tests/test_builtin_tools.py::TestContainment` runs a
+  battery of traversal payloads against every tool and asserts nothing outside the base
+  is ever read or removed.
+- The built-in `mcpproxy__deletefile` tool permanently deletes files under
+  `MCPPROXY_FILES_DIR`, and both the MCP endpoint and the web UI that can invoke it
+  are unauthenticated. Set `MCPPROXY_ENABLE_DELETEFILE=0` on any deployment whose
+  files volume holds data you cannot regenerate.
 
 ---
 
@@ -1714,15 +1729,16 @@ Write state to a well-known file path and read it on the next call.
 
 Package providers (e.g. Playwright MCP) often write files to disk — screenshots (PNG),
 accessibility snapshots (JSON), downloaded pages (HTML) — that the LLM would otherwise
-have no way to retrieve.
+have no way to retrieve, and that nothing would ever clean up.
 
-mcpproxy ships two **built-in utility tools** that are always registered, with no YAML
+mcpproxy ships three **built-in utility tools** that are always registered, with no YAML
 config file required:
 
 | Tool | Description |
 |---|---|
 | `mcpproxy__listfiles` | List files and subdirectories inside the files base directory |
 | `mcpproxy__getfile` | Read a file from the files base directory (UTF-8 text or base64) |
+| `mcpproxy__deletefile` | Permanently delete one file, one already-empty directory, or one symlink from the files base directory |
 
 **Default base directory:** `/app/files` inside Docker (mounted as the
 `mcpproxy-files` named volume, or `./files` in dev — see
@@ -1742,7 +1758,35 @@ land at `/app/files/playwright/screenshot.png`.
 > `MCPPROXY_FILES_DIR=/app/.playwright-mcp` to keep the old layout.
 
 Only files **inside** the base directory are accessible — path-traversal attempts
-(`../`) are rejected.
+(`../`) are rejected. `mcpproxy__listfiles` and `mcpproxy__getfile` are read-only.
+`mcpproxy__deletefile` is the one built-in that mutates the filesystem: it unlinks a
+single file, or removes a directory only when that directory is already empty, and it
+refuses both non-empty directories and the base directory itself. There is no recursive
+delete, so no single call can destroy a subtree, and there is no trash or undo.
+
+A **symlink** is deleted as a link: the link inside the base directory disappears and
+whatever it pointed at is left untouched, even when the target sits outside the base or
+no longer exists. Only the final path component is treated this way — a symlinked
+*parent* directory is still resolved, so a link cannot be used to reach outside the base.
+`mcpproxy__getfile` differs here: it reads *through* a link, and therefore refuses one
+whose target lies outside the base.
+
+#### Built-in file tool environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCPPROXY_FILES_DIR` | `/app/files` | Base directory the three built-in file tools operate on. Nothing outside it is reachable. `run_local.sh` sets it to `./files` under the repo root when running outside Docker. |
+| `MCPPROXY_ENABLE_DELETEFILE` | `1` | Set to `0` (also accepts `false`, `no`, `off`, or an empty value) to leave `mcpproxy__deletefile` unregistered, keeping the built-in file surface read-only. Read once at startup, so changing it requires a server restart. |
+
+Built-in tools bypass the per-tool `enabled: false` switch that YAML providers have, so
+`MCPPROXY_ENABLE_DELETEFILE` is the only way to withhold the delete tool. Set it in
+`docker-compose.yml` under the service's `environment:` block, or pass `-e` at run time:
+
+```yaml
+environment:
+  MCPPROXY_FILES_DIR: "/app/files"
+  MCPPROXY_ENABLE_DELETEFILE: "0"   # keep the built-in file tools read-only
+```
 
 #### Example workflow with Playwright
 
@@ -1752,6 +1796,11 @@ Only files **inside** the base directory are accessible — path-traversal attem
 3. Ask the LLM to call `mcpproxy__listfiles` with `path="playwright"` — it returns the file list.
 4. Ask the LLM to call `mcpproxy__getfile` with `path="playwright/screenshot.png"` — it returns
    the PNG as a base64 string that the LLM can describe or pass to a vision model.
+5. Once the artefact is no longer needed, ask the LLM to call `mcpproxy__deletefile` with
+   the same `path="playwright/screenshot.png"` — the files volume does not clean itself up.
+
+The `path` value from step 3 is passed verbatim to both step 4 and step 5; all three tools
+interpret it identically, relative to the base directory.
 
 #### `mcpproxy__listfiles` parameters
 
@@ -1769,6 +1818,18 @@ Returns an object with `ok`, `base_dir`, `path`, and `entries` (list of `{name, 
 | `encoding` | string | No | `"auto"` | `"auto"` tries UTF-8, falls back to base64. `"text"` forces UTF-8. `"base64"` always base64. |
 
 Returns an object with `ok`, `path`, `size`, `content`, and `encoding`.
+
+#### `mcpproxy__deletefile` parameters
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | **Yes** | — | Path to the file, relative to the base dir. A directory is accepted only when it is already empty. A symlink removes the link, not its target. |
+
+Returns an object with `ok`, `path` (echoed as passed), `type` (`"file"`, `"directory"`
+or `"symlink"`), `size` (bytes the entry occupied before removal, `0` for a directory),
+and `deleted`. Returns `ok: false` with an `error` for a missing path, a non-empty
+directory, a path outside the base directory, or the base directory itself. Registered
+only when `MCPPROXY_ENABLE_DELETEFILE` is not disabled.
 
 #### Changing the base directory
 

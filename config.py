@@ -7,12 +7,17 @@ CONFIG_DIR = Path(os.environ.get("MCP_TOOL_CONFIG_DIR", "/app/tools"))
 ENV_FILE = Path(os.environ.get("MCP_ENV_FILE", ".env"))
 SERVER_NAME = os.environ.get("MCP_SERVER_NAME", "local-config-driven-mcp")
 
-# Base directory exposed by the built-in mcpproxy__listfiles / mcpproxy__getfile tools.
+# Base directory exposed by the built-in mcpproxy__listfiles / mcpproxy__getfile /
+# mcpproxy__deletefile tools.
 # Defaults to /app/files inside Docker so the directory can be mounted as a volume to
 # persist screenshots, snapshots, and other artefacts produced by package providers
 # (e.g. Playwright MCP writing under /app/files/playwright when launched with
 # `--output-dir /app/files/playwright`).  Override with MCPPROXY_FILES_DIR (run_local.sh
 # sets it to ./files for local non-Docker runs).
+#
+# mcpproxy__deletefile is the only built-in that mutates this directory.  It is
+# registered by default; set MCPPROXY_ENABLE_DELETEFILE=0 to withhold it and keep the
+# built-in file surface read-only (see server._delete_file_enabled).
 FILES_DIR = Path(os.environ.get("MCPPROXY_FILES_DIR", "/app/files"))
 
 # Base directory where repository providers clone their git repos.  Each

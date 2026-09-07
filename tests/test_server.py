@@ -467,12 +467,32 @@ class TestRegisterBuiltinTools:
 
     def test_builtin_tool_handlers_importable(self):
         """builtin_tools module exports the required handler functions."""
-        from builtin_tools import get_file, list_files
+        from builtin_tools import delete_file, get_file, list_files
         assert callable(list_files)
         assert callable(get_file)
+        assert callable(delete_file)
 
-    def test_register_builtin_tools_calls_mcp_tool_twice(self):
-        """register_builtin_tools registers exactly two tools via mcp.tool."""
+    def test_register_builtin_tools_registers_three_tools(self, monkeypatch):
+        """By default register_builtin_tools registers all three tools."""
+        monkeypatch.delenv("MCPPROXY_ENABLE_DELETEFILE", raising=False)
+        tool_calls = []
+
+        def fake_decorator(**kwargs):
+            tool_calls.append(kwargs.get("name"))
+            return lambda fn: fn
+
+        with patch("server.mcp") as mock_mcp:
+            mock_mcp.tool.side_effect = fake_decorator
+            register_builtin_tools()
+
+        assert len(tool_calls) == 3
+        assert "mcpproxy__listfiles" in tool_calls
+        assert "mcpproxy__getfile" in tool_calls
+        assert "mcpproxy__deletefile" in tool_calls
+
+    def test_deletefile_not_registered_when_disabled(self, monkeypatch):
+        """MCPPROXY_ENABLE_DELETEFILE=0 keeps the built-in surface read-only."""
+        monkeypatch.setenv("MCPPROXY_ENABLE_DELETEFILE", "0")
         tool_calls = []
 
         def fake_decorator(**kwargs):
@@ -484,8 +504,24 @@ class TestRegisterBuiltinTools:
             register_builtin_tools()
 
         assert len(tool_calls) == 2
-        assert "mcpproxy__listfiles" in tool_calls
-        assert "mcpproxy__getfile" in tool_calls
+        assert "mcpproxy__deletefile" not in tool_calls
+
+    @pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", "", "  "])
+    def test_delete_file_disabled_values(self, value, monkeypatch):
+        from server import _delete_file_enabled
+        monkeypatch.setenv("MCPPROXY_ENABLE_DELETEFILE", value)
+        assert _delete_file_enabled() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+    def test_delete_file_enabled_values(self, value, monkeypatch):
+        from server import _delete_file_enabled
+        monkeypatch.setenv("MCPPROXY_ENABLE_DELETEFILE", value)
+        assert _delete_file_enabled() is True
+
+    def test_delete_file_enabled_by_default(self, monkeypatch):
+        from server import _delete_file_enabled
+        monkeypatch.delenv("MCPPROXY_ENABLE_DELETEFILE", raising=False)
+        assert _delete_file_enabled() is True
 
     def test_listfiles_tool_spec_has_no_required_fields(self):
         """mcpproxy__listfiles 'path' parameter should be optional."""
@@ -508,6 +544,14 @@ class TestRegisterBuiltinTools:
         from builtin_tools import get_file
         import inspect
         sig = inspect.signature(get_file)
+        # path has no default → required
+        assert sig.parameters["path"].default is inspect.Parameter.empty
+
+    def test_deletefile_tool_spec_requires_path(self):
+        """mcpproxy__deletefile should declare 'path' as a required parameter."""
+        from builtin_tools import delete_file
+        import inspect
+        sig = inspect.signature(delete_file)
         # path has no default → required
         assert sig.parameters["path"].default is inspect.Parameter.empty
 

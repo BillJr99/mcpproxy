@@ -806,7 +806,7 @@ fi
 
 python3 - "${_FILES_MODE}" "${_FILES_MCP_URL}" "${_FILES_SESSION}" \
           "${_FILES_RPC_START}" "${FILES_DATA}" "${_FILES_UI_URL}" <<'PY'
-import json, sys, urllib.request, urllib.error
+import json, os, sys, urllib.request, urllib.error
 from pathlib import Path
 
 mode       = sys.argv[1]          # 'mcp' or 'openai'
@@ -922,12 +922,51 @@ for entry in entries:
         'error':    file_result.get('error', ''),
     })
 
+# 3. Optional mcpproxy__deletefile round-trip.
+#
+#    Off by default: this script runs against a live server whose files volume
+#    holds real artefacts, so it must never delete anything it merely happens to
+#    find.  Set MCPPROXY_TEST_DELETE=1 AND drop a file named exactly
+#    'mcpproxy-delete-smoke-test.txt' in the files directory to exercise the
+#    tool.  Anything else in the listing is left strictly alone.
+SENTINEL = 'mcpproxy-delete-smoke-test.txt'
+delete_check = None
+
+if os.environ.get('MCPPROXY_TEST_DELETE', '').strip() in ('1', 'true', 'yes'):
+    sentinel_entry = next(
+        (e for e in entries
+         if e.get('type') == 'file'
+         and (e.get('path') or e.get('name', '')).rsplit('/', 1)[-1] == SENTINEL),
+        None,
+    )
+    if sentinel_entry is None:
+        delete_check = {
+            'ran': False,
+            'reason': f'sentinel {SENTINEL!r} not present in {base_dir}',
+        }
+    else:
+        spath  = sentinel_entry.get('path') or sentinel_entry['name']
+        result = _extract(_call_tool('mcpproxy__deletefile', {'path': spath}))
+        after  = _extract(_call_tool('mcpproxy__listfiles', {}))
+        still_there = any(
+            (e.get('path') or e.get('name')) == spath
+            for e in after.get('entries', [])
+        )
+        delete_check = {
+            'ran':     True,
+            'path':    spath,
+            'result':  result,
+            'gone':    not still_there,
+            'ok':      bool(result.get('ok')) and not still_there,
+        }
+
 out_path.write_text(
     json.dumps({
-        'ok':       listing.get('ok', True),
-        'base_dir': base_dir,
-        'entries':  entries,
-        'files':    files_fetched,
+        'ok':           listing.get('ok', True),
+        'base_dir':     base_dir,
+        'entries':      entries,
+        'files':        files_fetched,
+        'delete_check': delete_check,
     }, indent=2, ensure_ascii=False),
     encoding='utf-8',
 )
@@ -963,6 +1002,17 @@ try:
                 preview = f.get('content','')[:80].replace('\n',' ')
                 ellipsis = '…' if len(f.get('content','')) > 80 else ''
                 print(f\"  ✓  {f['name']}  →  {preview}{ellipsis}\")
+
+    dc = d.get('delete_check')
+    if dc is not None:
+        print()
+        if not dc.get('ran'):
+            print(f\"  ⊘  mcpproxy__deletefile skipped — {dc.get('reason','')}\")
+        elif dc.get('ok'):
+            print(f\"  ✓  mcpproxy__deletefile removed {dc['path']} (verified gone)\")
+        else:
+            err = dc.get('result', {}).get('error', 'still listed after delete')
+            print(f\"  ✗  mcpproxy__deletefile failed on {dc['path']} — {err}\")
 except Exception as e:
     print(f'  (could not display file data: {e})', file=sys.stderr)
 "

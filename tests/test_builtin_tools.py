@@ -549,8 +549,8 @@ class TestDeleteFile:
         assert "not found" in second["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_symlink_escape_rejected(self, tmp_path: Path, monkeypatch):
-        """A symlink pointing outside the base resolves out and is refused."""
+    async def test_symlink_removes_link_not_target(self, tmp_path: Path, monkeypatch):
+        """A symlink is unlinked as a link; the file it points at survives."""
         base = tmp_path / "files"
         base.mkdir()
         outside = tmp_path / "outside.txt"
@@ -562,9 +562,90 @@ class TestDeleteFile:
         _set_base(monkeypatch, base)
         from builtin_tools import delete_file
         result = await delete_file(_ctx(), path="link.txt")
+        assert result["ok"] is True
+        assert result["type"] == "symlink"
+        assert not (base / "link.txt").is_symlink()
+        # The link is gone; what it pointed at is untouched.
+        assert outside.read_text(encoding="utf-8") == "outside"
+
+    @pytest.mark.asyncio
+    async def test_symlink_to_inside_file_keeps_target(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Same rule when the target is inside the base: only the link goes."""
+        base = tmp_path / "files"
+        base.mkdir()
+        real = base / "real.txt"
+        real.write_text("real", encoding="utf-8")
+        try:
+            (base / "alias.txt").symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="alias.txt")
+        assert result["ok"] is True
+        assert result["type"] == "symlink"
+        assert not (base / "alias.txt").is_symlink()
+        assert real.read_text(encoding="utf-8") == "real"
+
+    @pytest.mark.asyncio
+    async def test_broken_symlink_is_removed(self, tmp_path: Path, monkeypatch):
+        """A dangling link is removed rather than reported as 'not found'."""
+        base = tmp_path / "files"
+        base.mkdir()
+        try:
+            (base / "dangling.txt").symlink_to(tmp_path / "never_existed.txt")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="dangling.txt")
+        assert result["ok"] is True
+        assert result["type"] == "symlink"
+        assert not (base / "dangling.txt").is_symlink()
+
+    @pytest.mark.asyncio
+    async def test_symlinked_directory_removes_link_only(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A link to a directory is unlinked; the directory and contents remain."""
+        base = tmp_path / "files"
+        (base / "realdir").mkdir(parents=True)
+        (base / "realdir" / "keep.txt").write_text("keep", encoding="utf-8")
+        try:
+            (base / "dirlink").symlink_to(base / "realdir", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="dirlink")
+        assert result["ok"] is True
+        assert result["type"] == "symlink"
+        assert not (base / "dirlink").is_symlink()
+        assert (base / "realdir" / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.asyncio
+    async def test_symlinked_parent_cannot_escape_base(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Only the FINAL component skips resolution — parents are still confined."""
+        base = tmp_path / "files"
+        base.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        victim = outside_dir / "victim.txt"
+        victim.write_text("victim", encoding="utf-8")
+        try:
+            (base / "escape").symlink_to(outside_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="escape/victim.txt")
         assert result["ok"] is False
         assert "outside" in result["error"].lower()
-        assert outside.exists()
+        assert victim.read_text(encoding="utf-8") == "victim"
 
     @pytest.mark.asyncio
     async def test_list_get_delete_roundtrip(self, tmp_path: Path, monkeypatch):
@@ -622,6 +703,186 @@ class TestSafeResolve:
             _safe_resolve("../secret")
 
 
+class TestSafeResolveNoFollow:
+    """The final component is kept unresolved; parents are not."""
+
+    def test_final_symlink_not_followed(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "base"
+        base.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x", encoding="utf-8")
+        try:
+            (base / "link.txt").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import _safe_resolve, _safe_resolve_nofollow
+        # _safe_resolve follows the link out of the base and rejects it...
+        with pytest.raises(ValueError, match="outside"):
+            _safe_resolve("link.txt")
+        # ...while _safe_resolve_nofollow names the link itself, inside the base.
+        assert _safe_resolve_nofollow("link.txt") == base / "link.txt"
+
+    def test_traversal_raises(self, tmp_path: Path, monkeypatch):
+        _set_base(monkeypatch, tmp_path / "base")
+        from builtin_tools import _safe_resolve_nofollow
+        with pytest.raises(ValueError, match="outside"):
+            _safe_resolve_nofollow("../secret")
+
+    @pytest.mark.parametrize("rel", ["", ".", None])
+    def test_base_spellings_resolve_to_base(self, rel, tmp_path: Path, monkeypatch):
+        _set_base(monkeypatch, tmp_path / "base")
+        from builtin_tools import _base_dir, _safe_resolve_nofollow
+        assert _safe_resolve_nofollow(rel) == _base_dir()
+
+    def test_dotdot_final_component_normalised(self, tmp_path: Path, monkeypatch):
+        """'a/..' has no final component to preserve — it normalises to the base."""
+        _set_base(monkeypatch, tmp_path / "base")
+        from builtin_tools import _base_dir, _safe_resolve_nofollow
+        assert _safe_resolve_nofollow("a/..") == _base_dir()
+
+    def test_nested_path_parent_resolved(self, tmp_path: Path, monkeypatch):
+        _set_base(monkeypatch, tmp_path / "base")
+        from builtin_tools import _base_dir, _safe_resolve_nofollow
+        assert _safe_resolve_nofollow("a/b/c.txt") == _base_dir() / "a" / "b" / "c.txt"
+
+
+# ---------------------------------------------------------------------------
+# Containment: no tool may reach outside MCPPROXY_FILES_DIR
+# ---------------------------------------------------------------------------
+
+# Injected traversal payloads. Some are real escapes (../, absolute paths);
+# others only *look* like escapes and are in fact legal literal filenames
+# (URL-encoded dots, backslashes on POSIX, a leading tilde). Both classes must
+# stay inside the base directory — the first by being refused, the second by
+# resolving to a harmless name within it.
+TRAVERSAL_PAYLOADS = [
+    "../secret.txt",
+    "../../secret.txt",
+    "..",
+    "../",
+    "./../secret.txt",
+    "a/../../secret.txt",
+    "a/b/../../../secret.txt",
+    "sub/../../secret.txt",
+    "ok.txt/../../secret.txt",
+    "/etc/passwd",
+    "//etc/passwd",
+    "/",
+    "....//secret.txt",
+    "..%2fsecret.txt",
+    "%2e%2e%2fsecret.txt",
+    "..\\secret.txt",
+    "~/secret.txt",
+    " ../secret.txt",
+    "\x00../secret.txt",
+]
+
+
+@pytest.fixture
+def sandbox(tmp_path: Path, monkeypatch):
+    """A base dir with bait planted immediately outside it."""
+    base = tmp_path / "files"
+    base.mkdir()
+    (base / "ok.txt").write_text("fine", encoding="utf-8")
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET", encoding="utf-8")
+
+    outdir = tmp_path / "outdir"
+    outdir.mkdir()
+    victim = outdir / "victim.txt"
+    victim.write_text("victim", encoding="utf-8")
+
+    _set_base(monkeypatch, base)
+    return {"base": base, "secret": secret, "outdir": outdir, "victim": victim}
+
+
+class TestContainment:
+    """Every built-in file tool is confined to MCPPROXY_FILES_DIR."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    async def test_get_file_never_reads_outside(self, payload, sandbox):
+        from builtin_tools import get_file
+        result = await get_file(_ctx(), path=payload)
+        assert "TOPSECRET" not in str(result.get("content", ""))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    async def test_delete_file_never_removes_outside(self, payload, sandbox):
+        from builtin_tools import delete_file
+        await delete_file(_ctx(), path=payload)
+        assert sandbox["secret"].read_text(encoding="utf-8") == "TOPSECRET"
+        assert sandbox["victim"].read_text(encoding="utf-8") == "victim"
+        assert sandbox["outdir"].is_dir()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    async def test_list_files_never_lists_outside(self, payload, sandbox):
+        from builtin_tools import list_files
+        result = await list_files(_ctx(), path=payload)
+        base = sandbox["base"].resolve()
+        for entry in result.get("entries", []):
+            assert not entry["path"].startswith("..")
+            assert (base / entry["path"]).resolve().is_relative_to(base)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
+    async def test_resolved_paths_stay_inside_base(self, payload, sandbox):
+        """Whatever a payload resolves to, it is inside the base or refused."""
+        from builtin_tools import _safe_resolve, _safe_resolve_nofollow
+        base = sandbox["base"].resolve()
+        for resolver in (_safe_resolve, _safe_resolve_nofollow):
+            try:
+                resolved = resolver(payload)
+            except Exception:
+                # Refused outright: either the traversal guard ("outside the
+                # allowed directory") or the OS rejecting malformed input such
+                # as an embedded NUL. The handlers turn both into error dicts.
+                continue
+            # Anything that DOES resolve must land inside the base directory.
+            assert resolved.is_relative_to(base)
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_outside_base_refused(self, sandbox):
+        from builtin_tools import delete_file, get_file
+        target = str(sandbox["secret"])
+        assert (await get_file(_ctx(), path=target))["ok"] is False
+        assert (await delete_file(_ctx(), path=target))["ok"] is False
+        assert sandbox["secret"].exists()
+
+    @pytest.mark.asyncio
+    async def test_symlinked_parent_cannot_escape(self, sandbox):
+        """A symlinked *parent* is resolved, so it cannot be used to escape."""
+        try:
+            (sandbox["base"] / "escape").symlink_to(
+                sandbox["outdir"], target_is_directory=True
+            )
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        from builtin_tools import delete_file, get_file
+        assert (await get_file(_ctx(), path="escape/victim.txt"))["ok"] is False
+        assert (await delete_file(_ctx(), path="escape/victim.txt"))["ok"] is False
+        assert sandbox["victim"].read_text(encoding="utf-8") == "victim"
+
+    @pytest.mark.asyncio
+    async def test_symlink_delete_does_not_reach_target(self, sandbox):
+        """Deleting a link that points outside removes only the link."""
+        try:
+            (sandbox["base"] / "leak.txt").symlink_to(sandbox["secret"])
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        from builtin_tools import delete_file, get_file
+        # Reading through the link is refused outright.
+        assert (await get_file(_ctx(), path="leak.txt"))["ok"] is False
+        result = await delete_file(_ctx(), path="leak.txt")
+        assert result["ok"] is True
+        assert result["type"] == "symlink"
+        assert not (sandbox["base"] / "leak.txt").is_symlink()
+        assert sandbox["secret"].read_text(encoding="utf-8") == "TOPSECRET"
+
+
 # ---------------------------------------------------------------------------
 # Integration: tools registered in server.py
 # ---------------------------------------------------------------------------
@@ -645,10 +906,18 @@ class TestBuiltinToolsRegistered:
             list_files,
             _base_dir,
             _safe_resolve,
+            _safe_resolve_nofollow,
         )
         assert all(
             callable(f)
-            for f in (delete_file, get_file, list_files, _base_dir, _safe_resolve)
+            for f in (
+                delete_file,
+                get_file,
+                list_files,
+                _base_dir,
+                _safe_resolve,
+                _safe_resolve_nofollow,
+            )
         )
 
 

@@ -712,6 +712,8 @@ def register_builtin_tools() -> None:
                         "An empty directory can also be removed; a directory that "
                         "still has contents is refused, so delete its files one at "
                         "a time first. "
+                        "Deleting a symlink removes the link only and leaves what it "
+                        "points at untouched. "
                         "Use mcpproxy__listfiles to discover paths and pass an "
                         "entry's 'path' value verbatim; do not guess a path or use "
                         "just the 'name' (basename) of a nested entry."
@@ -722,8 +724,8 @@ def register_builtin_tools() -> None:
                             "path": {
                                 "type": "string",
                                 "description": (
-                                    "Path to the file or empty directory to delete, "
-                                    "relative to the base files directory."
+                                    "Path to the file, empty directory, or symlink "
+                                    "to delete, relative to the base files directory."
                                 ),
                             },
                         },

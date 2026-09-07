@@ -4,7 +4,7 @@ no YAML config file required.
 
   mcpproxy__listfiles   List files/directories inside the mcpproxy files dir.
   mcpproxy__getfile     Read a file from the mcpproxy files dir (text or base64).
-  mcpproxy__deletefile  Delete a file (or an empty directory) from the files dir.
+  mcpproxy__deletefile  Delete a file, empty directory, or symlink from the files dir.
 
 The *base directory* defaults to ``/app/files`` (mounted as a Docker volume so
 artefacts persist across container restarts) and can be overridden at runtime with
@@ -12,8 +12,9 @@ the ``MCPPROXY_FILES_DIR`` environment variable.  Only files **inside** the base
 directory are accessible — path-traversal attempts are rejected.
 
 ``mcpproxy__deletefile`` is the only tool here that mutates the filesystem.  It
-removes exactly one file, or one already-empty directory, permanently; it never
-deletes a directory tree recursively and never the base directory itself.  Set
+removes exactly one entry permanently: a file, an already-empty directory, or a
+symlink (the link itself, never what it points at).  It never deletes a directory
+tree recursively and never the base directory itself.  Set
 ``MCPPROXY_ENABLE_DELETEFILE=0`` to leave it unregistered and keep the built-in
 file surface read-only.
 """
@@ -46,6 +47,33 @@ def _safe_resolve(relative: str | None) -> Path:
             f"Path '{relative}' is outside the allowed directory '{base}'"
         )
     return target
+
+
+def _safe_resolve_nofollow(relative: str | None) -> Path:
+    """Resolve *relative* under the base dir **without** following a final symlink.
+
+    Identical to :func:`_safe_resolve` except that the last path component is
+    left unresolved, so a symlink argument names the link itself rather than
+    whatever it points at.  Every *parent* component is still fully resolved and
+    confined to the base directory, so this cannot be used to reach outside it:
+    a symlinked parent that escapes the base is rejected exactly as ``../`` is.
+
+    Paths with no meaningful final component (``""``, ``"."``, ``".."``,
+    ``"a/.."``) are handed to :func:`_safe_resolve`, which normalises them so the
+    caller's base-directory guard can recognise them.
+    """
+    base = _base_dir()
+    raw = base / (relative or "")
+    if raw == base or raw.name in (".", ".."):
+        return _safe_resolve(relative)
+    parent = raw.parent.resolve()
+    try:
+        parent.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            f"Path '{relative}' is outside the allowed directory '{base}'"
+        )
+    return parent / raw.name
 
 
 # ---------------------------------------------------------------------------
@@ -186,36 +214,53 @@ async def delete_file(
     context: dict[str, Any],
     path: str,
 ) -> dict[str, Any]:
-    """Delete a file, or an empty directory, from the files base directory.
+    """Delete a file, an empty directory, or a symlink from the files base directory.
 
-    The counterpart to :func:`get_file`, and resolved the same way: *path* is
-    interpreted relative to the base directory and path-traversal attempts are
-    rejected.  A regular file is unlinked.  A directory is removed only when it
-    is already **empty** — a directory that still has contents is refused rather
-    than deleted recursively, so no single call can destroy a subtree.  The base
-    directory itself is never a valid target.
+    The counterpart to :func:`get_file`: *path* is interpreted relative to the
+    base directory and path-traversal attempts are rejected.  A regular file is
+    unlinked.  A directory is removed only when it is already **empty** — a
+    directory that still has contents is refused rather than deleted
+    recursively, so no single call can destroy a subtree.  The base directory
+    itself is never a valid target.
 
-    Because the path is fully resolved first, a *symlink* argument acts on what
-    it points at rather than on the link, and only when that target is itself
-    inside the base directory — the same reach ``get_file`` has when reading.
+    A *symlink* is removed as a link: the link file inside the base directory
+    disappears and whatever it pointed at is left untouched, whether that target
+    is a file, a directory, outside the base, or missing entirely.  This is
+    deliberately narrower than ``get_file``, which reads *through* a link.  Only
+    the final path component is treated this way; a symlinked parent directory
+    is still resolved, so it cannot be used to escape the base.
 
     Returns a JSON object with ``path`` (echoed as passed), ``type``
-    (``"file"`` or ``"directory"``), ``size`` (bytes the file occupied before
-    removal; ``0`` for a directory), and ``deleted``.  Removal is permanent:
-    there is no trash and no undo.
+    (``"file"``, ``"directory"`` or ``"symlink"``), ``size`` (bytes the entry
+    occupied before removal; ``0`` for a directory), and ``deleted``.  Removal is
+    permanent: there is no trash and no undo.
     """
     try:
-        target = _safe_resolve(path)
+        target = _safe_resolve_nofollow(path)
         base = _base_dir()
         if target == base:
             return {
                 "ok": False,
                 "error": f"Refusing to delete the base directory itself: {base}",
             }
+
+        # Checked before exists(), which follows links and would report a broken
+        # symlink as missing while leaving the dangling link on disk.
+        if target.is_symlink():
+            size = target.lstat().st_size
+            target.unlink()
+            return {
+                "ok": True,
+                "path": path,
+                "type": "symlink",
+                "size": size,
+                "deleted": True,
+            }
+
         if not target.exists():
             return {"ok": False, "error": f"File not found: {path}"}
 
-        if target.is_dir() and not target.is_symlink():
+        if target.is_dir():
             if any(target.iterdir()):
                 return {
                     "ok": False,

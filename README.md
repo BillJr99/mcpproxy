@@ -34,7 +34,7 @@ Three **built-in tools** (`mcpproxy__listfiles`, `mcpproxy__getfile` and
 access to a configurable directory (default: `/app/files`, mountable as a Docker volume)
 — useful for retrieving screenshots and snapshots produced by package providers such as
 Playwright MCP, and for cleaning those artefacts up afterwards.  The first two are
-read-only; `mcpproxy__deletefile` removes one file (or one already-empty directory)
+read-only; `mcpproxy__deletefile` removes one file, empty directory, or symlink
 permanently and can be withheld entirely with `MCPPROXY_ENABLE_DELETEFILE=0`.
 
 ## Tool names advertised to the LLM
@@ -1148,6 +1148,12 @@ CI runs on every push via `.github/workflows/tests.yml`.
 - Do not commit `.env`.
 - Do not enable `debug: true` outside of local testing.
 - The web UI has no authentication — run it on a trusted network only.
+- All three built-in file tools are confined to `MCPPROXY_FILES_DIR` and cannot reach
+  any other directory. Injected traversal is refused: `../` sequences, absolute paths,
+  and symlinked parent directories that point outside the base are all rejected before
+  any read or delete happens. `tests/test_builtin_tools.py::TestContainment` runs a
+  battery of traversal payloads against every tool and asserts nothing outside the base
+  is ever read or removed.
 - The built-in `mcpproxy__deletefile` tool permanently deletes files under
   `MCPPROXY_FILES_DIR`, and both the MCP endpoint and the web UI that can invoke it
   are unauthenticated. Set `MCPPROXY_ENABLE_DELETEFILE=0` on any deployment whose
@@ -1732,7 +1738,7 @@ config file required:
 |---|---|
 | `mcpproxy__listfiles` | List files and subdirectories inside the files base directory |
 | `mcpproxy__getfile` | Read a file from the files base directory (UTF-8 text or base64) |
-| `mcpproxy__deletefile` | Permanently delete one file, or one already-empty directory, from the files base directory |
+| `mcpproxy__deletefile` | Permanently delete one file, one already-empty directory, or one symlink from the files base directory |
 
 **Default base directory:** `/app/files` inside Docker (mounted as the
 `mcpproxy-files` named volume, or `./files` in dev — see
@@ -1757,6 +1763,13 @@ Only files **inside** the base directory are accessible — path-traversal attem
 single file, or removes a directory only when that directory is already empty, and it
 refuses both non-empty directories and the base directory itself. There is no recursive
 delete, so no single call can destroy a subtree, and there is no trash or undo.
+
+A **symlink** is deleted as a link: the link inside the base directory disappears and
+whatever it pointed at is left untouched, even when the target sits outside the base or
+no longer exists. Only the final path component is treated this way — a symlinked
+*parent* directory is still resolved, so a link cannot be used to reach outside the base.
+`mcpproxy__getfile` differs here: it reads *through* a link, and therefore refuses one
+whose target lies outside the base.
 
 #### Built-in file tool environment variables
 
@@ -1810,13 +1823,13 @@ Returns an object with `ok`, `path`, `size`, `content`, and `encoding`.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `path` | string | **Yes** | — | Path to the file, relative to the base dir. A directory is accepted only when it is already empty. |
+| `path` | string | **Yes** | — | Path to the file, relative to the base dir. A directory is accepted only when it is already empty. A symlink removes the link, not its target. |
 
-Returns an object with `ok`, `path` (echoed as passed), `type` (`"file"` or
-`"directory"`), `size` (bytes the file occupied before removal, `0` for a directory), and
-`deleted`. Returns `ok: false` with an `error` for a missing path, a non-empty directory,
-a path outside the base directory, or the base directory itself. Registered only when
-`MCPPROXY_ENABLE_DELETEFILE` is not disabled.
+Returns an object with `ok`, `path` (echoed as passed), `type` (`"file"`, `"directory"`
+or `"symlink"`), `size` (bytes the entry occupied before removal, `0` for a directory),
+and `deleted`. Returns `ok: false` with an `error` for a missing path, a non-empty
+directory, a path outside the base directory, or the base directory itself. Registered
+only when `MCPPROXY_ENABLE_DELETEFILE` is not disabled.
 
 #### Changing the base directory
 

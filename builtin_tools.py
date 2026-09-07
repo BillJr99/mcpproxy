@@ -4,11 +4,18 @@ no YAML config file required.
 
   mcpproxy__listfiles   List files/directories inside the mcpproxy files dir.
   mcpproxy__getfile     Read a file from the mcpproxy files dir (text or base64).
+  mcpproxy__deletefile  Delete a file (or an empty directory) from the files dir.
 
 The *base directory* defaults to ``/app/files`` (mounted as a Docker volume so
 artefacts persist across container restarts) and can be overridden at runtime with
 the ``MCPPROXY_FILES_DIR`` environment variable.  Only files **inside** the base
 directory are accessible — path-traversal attempts are rejected.
+
+``mcpproxy__deletefile`` is the only tool here that mutates the filesystem.  It
+removes exactly one file, or one already-empty directory, permanently; it never
+deletes a directory tree recursively and never the base directory itself.  Set
+``MCPPROXY_ENABLE_DELETEFILE=0`` to leave it unregistered and keep the built-in
+file surface read-only.
 """
 
 import base64
@@ -171,5 +178,71 @@ async def get_file(
                 "content": base64.b64encode(raw).decode(),
                 "encoding": "base64",
             }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def delete_file(
+    context: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    """Delete a file, or an empty directory, from the files base directory.
+
+    The counterpart to :func:`get_file`, and resolved the same way: *path* is
+    interpreted relative to the base directory and path-traversal attempts are
+    rejected.  A regular file is unlinked.  A directory is removed only when it
+    is already **empty** — a directory that still has contents is refused rather
+    than deleted recursively, so no single call can destroy a subtree.  The base
+    directory itself is never a valid target.
+
+    Because the path is fully resolved first, a *symlink* argument acts on what
+    it points at rather than on the link, and only when that target is itself
+    inside the base directory — the same reach ``get_file`` has when reading.
+
+    Returns a JSON object with ``path`` (echoed as passed), ``type``
+    (``"file"`` or ``"directory"``), ``size`` (bytes the file occupied before
+    removal; ``0`` for a directory), and ``deleted``.  Removal is permanent:
+    there is no trash and no undo.
+    """
+    try:
+        target = _safe_resolve(path)
+        base = _base_dir()
+        if target == base:
+            return {
+                "ok": False,
+                "error": f"Refusing to delete the base directory itself: {base}",
+            }
+        if not target.exists():
+            return {"ok": False, "error": f"File not found: {path}"}
+
+        if target.is_dir() and not target.is_symlink():
+            if any(target.iterdir()):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Directory '{path}' is not empty. Delete its contents "
+                        "first — mcpproxy__deletefile never removes a directory "
+                        "tree recursively."
+                    ),
+                }
+            target.rmdir()
+            return {
+                "ok": True,
+                "path": path,
+                "type": "directory",
+                "size": 0,
+                "deleted": True,
+            }
+
+        size = target.stat().st_size
+        target.unlink()
+
+        return {
+            "ok": True,
+            "path": path,
+            "type": "file",
+            "size": size,
+            "deleted": True,
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}

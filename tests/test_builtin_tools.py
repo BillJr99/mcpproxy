@@ -1,4 +1,4 @@
-"""Tests for builtin_tools.py — mcpproxy__listfiles and mcpproxy__getfile.
+"""Tests for builtin_tools.py — mcpproxy__listfiles / getfile / deletefile.
 
 These tests monkeypatch MCPPROXY_FILES_DIR to a fresh temp directory so
 they never touch the real files directory (default /app/files in Docker).
@@ -393,6 +393,204 @@ class TestGetFile:
 
 
 # ---------------------------------------------------------------------------
+# delete_file
+# ---------------------------------------------------------------------------
+
+class TestDeleteFile:
+    @pytest.mark.asyncio
+    async def test_delete_text_file(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "data.json").write_text('{"a": 1}', encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="data.json")
+        assert result["ok"] is True
+        assert result["deleted"] is True
+        assert result["type"] == "file"
+        assert result["path"] == "data.json"
+        assert not (base / "data.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_size_reported(self, tmp_path: Path, monkeypatch):
+        """Size is captured before the unlink, so it survives the deletion."""
+        base = tmp_path / "files"
+        base.mkdir()
+        data = b"abc" * 100
+        (base / "large.bin").write_bytes(data)
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="large.bin")
+        assert result["ok"] is True
+        assert result["size"] == len(data)
+
+    @pytest.mark.asyncio
+    async def test_delete_binary_file(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "img.bin").write_bytes(bytes(range(256)))
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="img.bin")
+        assert result["ok"] is True
+        assert not (base / "img.bin").exists()
+
+    @pytest.mark.asyncio
+    async def test_file_not_found(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="missing.txt")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_delete_empty_directory(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        (base / "empty").mkdir(parents=True)
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="empty")
+        assert result["ok"] is True
+        assert result["type"] == "directory"
+        assert result["size"] == 0
+        assert not (base / "empty").exists()
+
+    @pytest.mark.asyncio
+    async def test_non_empty_directory_refused(self, tmp_path: Path, monkeypatch):
+        """A directory with contents is refused — and its contents survive."""
+        base = tmp_path / "files"
+        (base / "adir").mkdir(parents=True)
+        (base / "adir" / "keep.txt").write_text("keep me", encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="adir")
+        assert result["ok"] is False
+        assert "not empty" in result["error"].lower()
+        assert (base / "adir").is_dir()
+        assert (base / "adir" / "keep.txt").read_text(encoding="utf-8") == "keep me"
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_rejected(self, tmp_path: Path, monkeypatch):
+        """Traversal is refused AND the outside file is still on disk."""
+        base = tmp_path / "files"
+        base.mkdir()
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret", encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="../secret.txt")
+        assert result["ok"] is False
+        assert "outside" in result["error"].lower()
+        assert outside.exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_path_refuses_base_dir(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="")
+        assert result["ok"] is False
+        assert "base directory" in result["error"].lower()
+        assert base.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_dot_path_refuses_base_dir(self, tmp_path: Path, monkeypatch):
+        """'.' is the other spelling of the same resolved path."""
+        base = tmp_path / "files"
+        base.mkdir()
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path=".")
+        assert result["ok"] is False
+        assert "base directory" in result["error"].lower()
+        assert base.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_nested_path(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        (base / "a" / "b").mkdir(parents=True)
+        (base / "a" / "b" / "c.txt").write_text("deep", encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="a/b/c.txt")
+        assert result["ok"] is True
+        assert not (base / "a" / "b" / "c.txt").exists()
+        # The containing directories are left alone
+        assert (base / "a" / "b").is_dir()
+
+    @pytest.mark.asyncio
+    async def test_siblings_untouched(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        for name in ("one.txt", "two.txt", "three.txt"):
+            (base / name).write_text(name, encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="two.txt")
+        assert result["ok"] is True
+        assert not (base / "two.txt").exists()
+        assert (base / "one.txt").exists()
+        assert (base / "three.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_second_delete_reports_not_found(self, tmp_path: Path, monkeypatch):
+        base = tmp_path / "files"
+        base.mkdir()
+        (base / "once.txt").write_text("x", encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        first = await delete_file(_ctx(), path="once.txt")
+        second = await delete_file(_ctx(), path="once.txt")
+        assert first["ok"] is True
+        assert second["ok"] is False
+        assert "not found" in second["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_symlink_escape_rejected(self, tmp_path: Path, monkeypatch):
+        """A symlink pointing outside the base resolves out and is refused."""
+        base = tmp_path / "files"
+        base.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        try:
+            (base / "link.txt").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file
+        result = await delete_file(_ctx(), path="link.txt")
+        assert result["ok"] is False
+        assert "outside" in result["error"].lower()
+        assert outside.exists()
+
+    @pytest.mark.asyncio
+    async def test_list_get_delete_roundtrip(self, tmp_path: Path, monkeypatch):
+        """The 'path' from listfiles feeds getfile and deletefile unchanged."""
+        base = tmp_path / "files"
+        (base / "playwright").mkdir(parents=True)
+        (base / "playwright" / "shot.txt").write_text("pixels", encoding="utf-8")
+        _set_base(monkeypatch, base)
+        from builtin_tools import delete_file, get_file, list_files
+
+        listing = await list_files(_ctx())
+        entry = next(e for e in listing["entries"] if e["type"] == "file")
+        assert entry["path"] == "playwright/shot.txt"
+
+        read = await get_file(_ctx(), path=entry["path"])
+        assert read["ok"] is True
+        assert read["content"] == "pixels"
+
+        removed = await delete_file(_ctx(), path=entry["path"])
+        assert removed["ok"] is True
+
+        after = await list_files(_ctx())
+        assert entry["path"] not in [e["path"] for e in after["entries"]]
+
+
+# ---------------------------------------------------------------------------
 # _safe_resolve edge cases
 # ---------------------------------------------------------------------------
 
@@ -438,10 +636,20 @@ class TestBuiltinToolsRegistered:
         import builtin_tools
         assert callable(builtin_tools.list_files)
         assert callable(builtin_tools.get_file)
+        assert callable(builtin_tools.delete_file)
 
     def test_builtin_tools_exported(self):
-        from builtin_tools import get_file, list_files, _base_dir, _safe_resolve
-        assert all(callable(f) for f in (get_file, list_files, _base_dir, _safe_resolve))
+        from builtin_tools import (
+            delete_file,
+            get_file,
+            list_files,
+            _base_dir,
+            _safe_resolve,
+        )
+        assert all(
+            callable(f)
+            for f in (delete_file, get_file, list_files, _base_dir, _safe_resolve)
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,11 @@
 services:
   mcp-host:
     build: .
+    # The UI's "Restart MCP Server" button works by sending SIGTERM to the
+    # proxy's own PID, so without a restart policy the container simply stops
+    # and never comes back, while the UI still says "reconnect in a moment".
+    # Change to "no" if you want a stopped container to stay stopped.
+    restart: unless-stopped
     ports:
       - "${MCP_HOST_PORT:-8888}:8888"
       - "${UI_HOST_PORT:-8889}:8889"

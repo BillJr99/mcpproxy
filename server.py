@@ -62,6 +62,7 @@ from config import (
     SERVER_NAME,
     UI_HOST,
     UI_PORT,
+    refresh_env,
 )
 
 mcp = FastMCP(SERVER_NAME)
@@ -198,6 +199,10 @@ def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> d
         # Preserve meaningful falsey values while dropping only ``None``.
         resolved = {key: value for key, value in kwargs.items() if value is not None}
         env_map = (tool_spec.get("secrets") or {}).get("env", {})
+        if env_map:
+            # Pick up a credential rotated through the Secrets UI without
+            # waiting for a restart; a no-op stat() when nothing has changed.
+            refresh_env()
         for arg_name, env_name in env_map.items():
             secret_value = os.environ.get(env_name)
             if not secret_value:

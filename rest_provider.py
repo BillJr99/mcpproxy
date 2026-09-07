@@ -39,7 +39,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from config import OAUTH_REDIRECT_BASE, REST_AUTH_DIR
+from config import OAUTH_REDIRECT_BASE, REST_AUTH_DIR, refresh_env
 
 # Authorization URLs a REST provider is currently waiting on, keyed by provider
 # name.  The UI polls this (alongside ``process_runner.pending_auth_urls``) so an
@@ -84,6 +84,10 @@ class NeedsAuthorization(Exception):
 # ---------------------------------------------------------------------------
 
 def _require_env(env_name: str) -> str:
+    # Re-read the env file first when it has changed, so a credential rotated
+    # through the Secrets UI takes effect on this call rather than at the next
+    # restart.  Costs one stat() when nothing has changed.
+    refresh_env()
     value = os.environ.get(env_name)
     if not value:
         raise RuntimeError(f"Missing required secret environment variable: {env_name}")
@@ -504,6 +508,85 @@ def _cap_response(resp: httpx.Response, tool_name: str) -> Any:
         return {"ok": True, "status": resp.status_code, "text": text}
 
 
+def _credential_source(auth: dict[str, Any]) -> str:
+    """Name where a credential comes from, never what it is.
+
+    Only variable names and file paths live in ``auth``; a secret value never
+    does.  Naming the source is what lets an auth failure be actionable without
+    leaking anything, and mirrors how the Secrets UI describes a credential.
+    """
+    if auth.get("token_file"):
+        return f"token file {auth['token_file']}"
+    for key in ("token_env", "value_env", "client_id_env"):
+        if auth.get(key):
+            return f"environment variable {auth[key]}"
+    return "the configured credential"
+
+
+def _auth_failure(
+    resolver: "_AuthResolver",
+    provider_name: str,
+    tool_name: str,
+    resp: httpx.Response,
+) -> dict[str, Any]:
+    """Turn a 401/403 into something the model can act on.
+
+    A bare ``HTTP 401`` plus the upstream's prose tells a model nothing it can
+    use: it cannot see which variable holds the credential, whether a refresh
+    was already attempted, or whether retrying is worth anything.  The keys
+    below say all three.  ``status`` stays the HTTP integer and ``error`` keeps
+    its existing text, so callers that already read them are unaffected.
+
+    Never interpolates a secret: the credential is identified by source name.
+    """
+    source = _credential_source(resolver.auth)
+    forbidden = resp.status_code == 403
+
+    if resolver.supports_retry:
+        # The forced-refresh retry above already ran and still failed, so the
+        # grant itself is the problem rather than a merely stale access token.
+        kind = "reauthorization_required"
+        message = (
+            f"Provider '{provider_name}' rejected the OAuth token for "
+            f"'{tool_name}' (HTTP {resp.status_code}), and an automatic token "
+            f"refresh was already attempted and also rejected. The stored grant "
+            f"has most likely been revoked or its scopes changed. Ask the user "
+            f"to re-authorize this provider in the mcpproxy UI. Do not retry "
+            f"this tool until they confirm they have done so."
+        )
+    elif forbidden:
+        kind = "forbidden"
+        message = (
+            f"Provider '{provider_name}' accepted the credential but refused "
+            f"'{tool_name}' (HTTP 403). The credential is valid, so this is a "
+            f"permissions problem rather than an expired key: it most likely "
+            f"lacks the scope this operation needs. Ask the user to check the "
+            f"scopes granted to the credential in {source}. Retrying will not "
+            f"help, and neither will other tools needing the same scope."
+        )
+    else:
+        kind = "rejected"
+        message = (
+            f"Provider '{provider_name}' rejected the credential for "
+            f"'{tool_name}' (HTTP 401). It is set, so it has most likely "
+            f"expired, been revoked, or been rotated elsewhere. Ask the user to "
+            f"update {source} in the mcpproxy Secrets UI; the new value takes "
+            f"effect on the next call, with no restart needed. Do not retry "
+            f"this tool until they confirm they have updated it."
+        )
+
+    return {
+        "ok": False,
+        "tool": tool_name,
+        "status": resp.status_code,
+        "error": f"HTTP {resp.status_code}: {resp.text[:500]}",
+        "auth_error": kind,
+        "credential": source,
+        "retryable": False,
+        "message": message,
+    }
+
+
 def _make_rest_handler(
     endpoint_spec: dict[str, Any],
     rest_config: dict[str, Any],
@@ -543,6 +626,12 @@ def _make_rest_handler(
             resp = await _do(force_refresh=False)
             if resp.status_code == 401 and resolver.supports_retry:
                 resp = await _do(force_refresh=True)
+
+            # 403 deliberately does not trigger the refresh above: an ordinary
+            # permission denial would cause a pointless token round-trip. It
+            # still earns a directive, worded toward scope rather than expiry.
+            if resp.status_code in (401, 403) and resolver.type != "none":
+                return _auth_failure(resolver, provider_name, tool_name, resp)
 
             if resp.status_code >= 400:
                 return {

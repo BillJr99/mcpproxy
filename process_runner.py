@@ -25,7 +25,7 @@ import traceback
 from typing import Any
 from urllib.parse import urlparse
 
-from config import env_unquote
+from config import read_env_file
 
 # ---------------------------------------------------------------------------
 # OAuth-bridge (mcp-remote) support
@@ -566,19 +566,16 @@ class ProcessSession:
             return env
         env_file = os.environ.get("MCP_ENV_FILE", ".env")
         try:
-            from pathlib import Path
-            p = Path(env_file)
-            if p.exists():
-                for line in p.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, _, v = line.partition("=")
-                    k = k.strip()
-                    if k in self.env_keys:
-                        env[k] = env_unquote(v)
-        except Exception:
-            traceback.print_exc()
+            for key, value in read_env_file(env_file).items():
+                if key in self.env_keys:
+                    env[key] = value
+        except OSError as exc:
+            # Name the path only: a traceback from the parse would carry a
+            # line of the file, and that line is a secret.
+            print(
+                f"[mcpproxy] could not read env file {env_file}: {exc.strerror}",
+                flush=True,
+            )
         return env
 
     def _alive(self) -> bool:

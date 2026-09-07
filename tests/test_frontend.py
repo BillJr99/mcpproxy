@@ -442,6 +442,85 @@ class TestEnvEndpoints:
         c = TestClient(create_app(config_dir=tools_dir, env_file=env_path))
         assert c.get("/api/env").json()["vars"]["SECRET_TOKEN"] == "***"
 
+    def test_saving_a_secret_makes_it_live_without_a_restart(
+        self, tools_dir, env_path, monkeypatch
+    ):
+        """The whole point: a rotated credential used to need a container restart."""
+        import os
+
+        import config
+
+        monkeypatch.setenv("MCP_ENV_FILE", str(env_path))
+        monkeypatch.delenv("ROTATING_KEY", raising=False)
+        config.reset_env_cache()
+        try:
+            c = TestClient(create_app(config_dir=tools_dir, env_file=env_path))
+            c.post("/api/env", json={"vars": {"ROTATING_KEY": "first"}})
+            assert os.environ["ROTATING_KEY"] == "first"
+            c.post("/api/env", json={"vars": {"ROTATING_KEY": "second"}})
+            assert os.environ["ROTATING_KEY"] == "second"
+        finally:
+            config.reset_env_cache()
+
+    def test_post_env_reports_reloaded_names(self, tools_dir, env_path, monkeypatch):
+        import config
+
+        monkeypatch.setenv("MCP_ENV_FILE", str(env_path))
+        monkeypatch.delenv("SOME_KEY", raising=False)
+        config.reset_env_cache()
+        try:
+            c = TestClient(create_app(config_dir=tools_dir, env_file=env_path))
+            body = c.post("/api/env", json={"vars": {"SOME_KEY": "v"}}).json()
+            assert body["written"] == ["SOME_KEY"]
+            assert "SOME_KEY" in body["reloaded"]
+        finally:
+            config.reset_env_cache()
+
+    def test_reload_endpoint_returns_names_never_values(
+        self, tools_dir, env_path, monkeypatch
+    ):
+        """This response must stay as safe to paste into a bug report as GET /api/env."""
+        import config
+
+        monkeypatch.setenv("MCP_ENV_FILE", str(env_path))
+        monkeypatch.delenv("LEAKY", raising=False)
+        config.reset_env_cache()
+        try:
+            env_path.write_text("LEAKY=super-secret-value\n")
+            c = TestClient(create_app(config_dir=tools_dir, env_file=env_path))
+            resp = c.post("/api/env/reload")
+            body = resp.json()
+            assert body["ok"] is True
+            assert "LEAKY" in body["reloaded"]
+            assert body["count"] >= 1
+            assert "super-secret-value" not in resp.text
+        finally:
+            config.reset_env_cache()
+
+    def test_reload_is_quiet_when_nothing_changed(self, tools_dir, env_path, monkeypatch):
+        import config
+
+        monkeypatch.setenv("MCP_ENV_FILE", str(env_path))
+        config.reset_env_cache()
+        try:
+            env_path.write_text("STABLE=x\n")
+            c = TestClient(create_app(config_dir=tools_dir, env_file=env_path))
+            c.post("/api/env/reload")
+            assert c.post("/api/env/reload").json()["count"] == 0
+        finally:
+            config.reset_env_cache()
+
+    def test_env_write_is_atomic(self, tmp_path):
+        """A truncating write lets a concurrent reader see a partial file."""
+        from frontend.app import _write_env_file
+
+        f = tmp_path / ".env"
+        _write_env_file(f, {"A": "1", "B": "2"})
+        _write_env_file(f, {"A": "3"})
+        assert f.read_text().count("A=") == 1
+        # No temp file left behind.
+        assert [p.name for p in tmp_path.iterdir()] == [".env"]
+
     def test_invalid_key_400(self, client):
         assert client.post("/api/env", json={"vars": {"bad-key": "v"}}).status_code == 400
 

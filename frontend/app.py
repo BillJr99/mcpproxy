@@ -69,7 +69,8 @@ from config import (
     REPOS_DIR,
     REST_AUTH_DIR,
     env_quote,
-    env_unquote,
+    read_env_file,
+    refresh_env,
 )
 
 
@@ -95,16 +96,13 @@ def _web_terminal_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 def _read_env_file(path: Path) -> dict[str, str]:
-    result: dict[str, str] = {}
-    if not path.exists():
-        return result
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        result[key.strip()] = env_unquote(val)
-    return result
+    """Parse a .env file. Thin alias for the canonical parser in config.
+
+    Kept as a name because this module and its tests use it throughout; the
+    rules themselves live in one place so every reader of the file, and the
+    shell that sources it, stay in agreement.
+    """
+    return read_env_file(path)
 
 
 def _write_env_file(path: Path, updates: dict[str, str]) -> None:
@@ -160,7 +158,15 @@ def _write_env_file(path: Path, updates: dict[str, str]) -> None:
                 )
             ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Replace atomically.  A plain write truncates first, so a reader that
+    # arrives mid-write (the proxy re-reading secrets, docker-compose, a shell
+    # sourcing the file) can see a partial file and act on missing keys.
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
     keys: list[str] = []
@@ -1569,7 +1575,30 @@ def create_app(
             if not re.match(r'^[A-Z][A-Z0-9_]*$', k):
                 raise HTTPException(400, f"Invalid env var name: {k!r}")
         _write_env_file(_env_file, updates)
-        return {"ok": True, "written": list(updates.keys())}
+        # Force rather than trusting the stat stamp: this write may land inside
+        # the same filesystem timestamp tick as the previous read.
+        reloaded = refresh_env(force=True)
+        return {
+            "ok": True,
+            "written": list(updates.keys()),
+            "reloaded": reloaded,
+        }
+
+    @app.post("/api/env/reload")
+    async def reload_env() -> dict:
+        """Re-read the env file into the process environment, on demand.
+
+        Secrets are picked up automatically when the file changes, but an
+        editor that preserves timestamps can defeat that check, and after
+        editing the file outside the UI it is useful to get a straight answer
+        about what the proxy now holds.
+
+        Returns the names of the variables whose values changed.  Never the
+        values: this response is as safe to paste into a bug report as
+        ``GET /api/env``, which masks everything to ``***``.
+        """
+        changed = refresh_env(force=True)
+        return {"ok": True, "reloaded": changed, "count": len(changed)}
 
     # ── File manager ─────────────────────────────────────────────────────────
     #
@@ -2660,7 +2689,9 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
         </div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-outline-success me-auto" id="secrets-refresh-btn" style="display:none"
+        <button class="btn btn-outline-secondary me-auto" onclick="reloadSecrets()"
+          title="Re-read the .env file into the running proxy (names only are reported)">⟳ Reload secrets</button>
+        <button class="btn btn-outline-success" id="secrets-refresh-btn" style="display:none"
           onclick="refreshProviderAuth()">⟳ Refresh auth</button>
         <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
         <button class="btn btn-primary" onclick="saveSecrets()">Save</button>
@@ -4778,6 +4809,21 @@ function wzBootstrapRemote() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Secrets modal
 // ─────────────────────────────────────────────────────────────────────────────
+async function reloadSecrets() {
+  // Reports variable NAMES only. The endpoint never returns values, so this
+  // message is safe to read aloud or paste into a bug report.
+  try {
+    const r = await fetch('/api/env/reload', {method: 'POST'});
+    const d = await r.json();
+    if (!d.ok) { toast('Reload failed', false); return; }
+    toast(d.count
+      ? `Reloaded ${d.count} variable(s): ${d.reloaded.join(', ')}`
+      : 'Secrets already up to date');
+  } catch (e) {
+    toast('Reload failed: ' + e, false);
+  }
+}
+
 async function openSecretsModal() {
   if (!currentProvider) return;
   document.getElementById('secrets-provider-name').textContent = currentName;

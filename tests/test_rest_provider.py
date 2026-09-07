@@ -474,6 +474,101 @@ class TestMakeRestHandler:
         request_calls = [c for c in http_recorder["calls"] if c.get("url", "").endswith("/x")]
         assert request_calls[-1]["headers"]["Authorization"] == "Bearer t2"
 
+    def test_401_on_static_credential_returns_directive(self, http_recorder, monkeypatch):
+        """A bare "HTTP 401" tells a model nothing it can act on."""
+        monkeypatch.setenv("T", "sekrit")
+        http_recorder["responses"].append(
+            FakeResponse(status_code=401, json_data=None, text="token expired")
+        )
+        cfg = {**REST_CONFIG, "auth": {"type": "bearer", "token_env": "T"}}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert result["ok"] is False
+        assert result["status"] == 401          # still the HTTP int
+        assert result["auth_error"] == "rejected"
+        assert result["credential"] == "environment variable T"
+        assert result["retryable"] is False
+        assert "T" in result["message"] and "Secrets" in result["message"]
+
+    def test_directive_never_leaks_the_secret(self, http_recorder, monkeypatch):
+        """The value must appear nowhere in what the model receives."""
+        monkeypatch.setenv("T", "super-secret-value")
+        http_recorder["responses"].append(
+            FakeResponse(status_code=401, json_data=None, text="nope")
+        )
+        cfg = {**REST_CONFIG, "auth": {"type": "bearer", "token_env": "T"}}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert "super-secret-value" not in repr(result)
+
+    def test_403_is_worded_for_scope_not_expiry(self, http_recorder, monkeypatch):
+        """A 403 means the key works but lacks a scope; saying "expired" misleads."""
+        monkeypatch.setenv("K", "v")
+        http_recorder["responses"].append(
+            FakeResponse(status_code=403, json_data=None, text="forbidden")
+        )
+        cfg = {**REST_CONFIG, "auth": {"type": "api_key", "value_env": "K"}}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert result["auth_error"] == "forbidden"
+        assert result["status"] == 403
+        # It must point at scopes and explicitly rule expiry out, rather than
+        # sending the user off to replace a credential that works.
+        assert "scope" in result["message"]
+        assert "rather than an expired key" in result["message"]
+        assert "Secrets UI" not in result["message"]
+
+    def test_403_does_not_trigger_a_token_refresh(self, http_recorder, monkeypatch):
+        """Refreshing on an ordinary permission denial is a pointless round-trip."""
+        monkeypatch.setenv("CC_ID", "id")
+        monkeypatch.setenv("CC_SECRET", "secret")
+        http_recorder["responses"].append(FakeResponse(json_data={"access_token": "t1", "expires_in": 3600}))
+        http_recorder["responses"].append(FakeResponse(status_code=403, json_data=None, text="forbidden"))
+        cfg = {**REST_CONFIG, "auth": CC_AUTH}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert result["ok"] is False
+        # One token fetch and one API call: no second token round-trip.
+        token_calls = [c for c in http_recorder["calls"] if c.get("url", "").endswith("/token")]
+        assert len(token_calls) == 1
+
+    def test_oauth_401_surviving_the_retry_asks_for_reauthorization(
+        self, http_recorder, monkeypatch
+    ):
+        """The refresh already ran, so the grant itself is the problem."""
+        monkeypatch.setenv("CC_ID", "id")
+        monkeypatch.setenv("CC_SECRET", "secret")
+        http_recorder["responses"].append(FakeResponse(json_data={"access_token": "t1", "expires_in": 3600}))
+        http_recorder["responses"].append(FakeResponse(status_code=401, json_data=None, text="unauth"))
+        http_recorder["responses"].append(FakeResponse(json_data={"access_token": "t2", "expires_in": 3600}))
+        http_recorder["responses"].append(FakeResponse(status_code=401, json_data=None, text="still unauth"))
+        cfg = {**REST_CONFIG, "auth": CC_AUTH}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert result["auth_error"] == "reauthorization_required"
+        assert "re-authorize" in result["message"]
+
+    def test_no_auth_provider_keeps_the_plain_error(self, http_recorder):
+        """type: none has no credential to name, so no directive applies."""
+        http_recorder["responses"].append(
+            FakeResponse(status_code=401, json_data=None, text="nope")
+        )
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, REST_CONFIG, {})
+        assert result["ok"] is False and "auth_error" not in result
+
+    def test_token_file_named_without_reading_it(self, http_recorder, tmp_path):
+        tf = tmp_path / "tok"
+        tf.write_text("filesecret")
+        http_recorder["responses"].append(
+            FakeResponse(status_code=401, json_data=None, text="nope")
+        )
+        cfg = {**REST_CONFIG, "auth": {"type": "bearer", "token_file": str(tf)}}
+        ep = {"name": "g", "method": "GET", "path": "/x", "path_params": [], "query_params": [], "body_params": []}
+        result = self._call(ep, cfg, {})
+        assert result["credential"] == f"token file {tf}"
+        assert "filesecret" not in repr(result)
+
     def test_needs_authorization_surfaced_in_result(self, http_recorder, monkeypatch, rest_auth_dir):
         monkeypatch.setenv("AC_ID", "id")
         cfg = {**REST_CONFIG, "auth": AC_AUTH}

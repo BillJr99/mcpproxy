@@ -1141,6 +1141,11 @@ Tests cover `server.py` (pure helpers), `frontend/app.py` (all API endpoints), a
 `builtin_tools.py` (file listing, retrieval, and deletion).
 CI runs on every push via `.github/workflows/tests.yml`.
 
+`requirements-dev.txt` includes `google-auth` because one REST OAuth test reads a
+token file back with Google's real `Credentials.from_authorized_user_file` rather
+than a stub, to prove the file mcpproxy writes is one the library actually accepts.
+It is a test-only dependency; the proxy itself does not import it.
+
 ---
 
 ## Security notes

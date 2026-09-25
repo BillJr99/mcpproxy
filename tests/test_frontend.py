@@ -2601,6 +2601,46 @@ class TestOAuthReauthorize:
         assert body["auth_url"] is None
         assert "cached token" in body["message"]
 
+    def test_refuses_to_spawn_while_the_callback_port_is_held(self, client, tools_dir):
+        # A second bridge would die with EADDRINUSE; say what is in the way.
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        with patch("frontend.app.REAUTH_PORT_FREE_SECONDS", 0.0), patch(
+            "oauth_callback_relay.probe_loopback_port", return_value=True
+        ), patch("process_runner.kill_sessions_for", return_value=0), patch(
+            "process_runner.introspect", new_callable=AsyncMock
+        ) as spawn:
+            body = client.post("/api/oauth-reauthorize", json={"target": "asana"}).json()
+        spawn.assert_not_awaited()
+        assert body["ok"] is False
+        assert "8887" in body["error"]
+
+    def test_kills_the_live_bridge_holding_the_port_then_respawns(
+        self, client, tools_dir
+    ):
+        (tools_dir / "asana.yaml").write_text(
+            yaml.safe_dump({"package": {"command": ASANA_CMD}, "tools": []})
+        )
+        held = {"value": True}
+
+        def kill(command):
+            assert command == ASANA_CMD
+            held["value"] = False
+            return 1
+
+        with patch(
+            "oauth_callback_relay.probe_loopback_port",
+            side_effect=lambda port, *a, **k: held["value"],
+        ), patch("process_runner.kill_sessions_for", side_effect=kill) as killer, patch(
+            "process_runner.introspect", new_callable=AsyncMock
+        ) as spawn:
+            spawn.return_value = []
+            body = client.post("/api/oauth-reauthorize", json={"target": "asana"}).json()
+        killer.assert_called_once()
+        spawn.assert_awaited_once()
+        assert body["ok"] is True
+
 
 class TestOAuthCallbackStatus:
     def test_reports_listener_and_forwarder_state(
@@ -3160,6 +3200,40 @@ class TestEnvFileWriting:
         text = f.read_text()
         assert "# a comment" in text
         assert _read_env_file(f) == {"KEEP": "yes", "TARGET": "new"}
+
+    def test_falls_back_to_in_place_write_when_target_is_a_mount_point(
+        self, tmp_path, monkeypatch
+    ):
+        import errno
+        import os
+        from frontend.app import _read_env_file, _write_env_file
+
+        # docker-compose bind-mounts ./.env as a single file; renaming onto a
+        # mount point fails with EBUSY, which made every secret save a 500.
+        f = tmp_path / ".env"
+        f.write_text("KEEP=yes\n")
+        inode = f.stat().st_ino
+
+        def busy(src, dst):
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        monkeypatch.setattr("frontend.app.os.replace", busy)
+        _write_env_file(f, {"TOKEN": "abc"})
+        assert _read_env_file(f) == {"KEEP": "yes", "TOKEN": "abc"}
+        # Same inode: the host side of the bind mount sees the change.
+        assert f.stat().st_ino == inode
+        assert not list(tmp_path.glob(".env.tmp.*"))
+
+    def test_other_replace_errors_still_raise(self, tmp_path, monkeypatch):
+        import errno
+        from frontend.app import _write_env_file
+
+        def denied(src, dst):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr("frontend.app.os.replace", denied)
+        with pytest.raises(OSError):
+            _write_env_file(tmp_path / ".env", {"TOKEN": "abc"})
 
 
 class TestOutputEscaping:

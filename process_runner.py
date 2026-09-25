@@ -16,10 +16,12 @@ Two use-cases
 """
 
 import asyncio
+import atexit
 import json
 import os
 import re
 import shlex
+import signal
 import threading
 import traceback
 from typing import Any
@@ -272,6 +274,53 @@ def _auth_timeout_from_command(parts: list[str]) -> float | None:
     return None
 
 
+# Process-group ids of bridges this process started and has not yet reaped.
+# ``npx -y mcp-remote`` runs as npx -> sh -> node, and killing only the npx PID
+# orphaned the node grandchild, which kept its loopback OAuth callback port
+# bound: every later authorization attempt then died with EADDRINUSE.  Each
+# bridge therefore gets its own process group, and the whole group is killed.
+_live_groups: set[int] = set()
+_live_groups_lock = threading.Lock()
+
+
+def _kill_process_tree(proc: "asyncio.subprocess.Process | None", sig: int = signal.SIGKILL) -> None:
+    """Send *sig* to *proc* and every process it spawned (best-effort)."""
+    if proc is None:
+        return
+    if hasattr(os, "killpg"):
+        try:
+            # start_new_session=True makes the child a group leader: pgid == pid.
+            os.killpg(proc.pid, sig)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    if proc.returncode is None:
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _forget_group(proc: "asyncio.subprocess.Process | None") -> None:
+    if proc is not None:
+        with _live_groups_lock:
+            _live_groups.discard(proc.pid)
+
+
+@atexit.register
+def _kill_live_groups() -> None:
+    # A new session also detaches bridges from the terminal, so Ctrl+C on the
+    # proxy no longer reaches them; without this they would outlive it.
+    with _live_groups_lock:
+        groups = list(_live_groups)
+        _live_groups.clear()
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            pass
+
+
 class ProcessSession:
     """A long-lived connection to a single stdio MCP server process."""
 
@@ -497,11 +546,9 @@ class ProcessSession:
             # A process that outlived a failed handshake is not usable: _alive()
             # would be true, so the next tool call would skip _start entirely and
             # write to a subprocess that never completed initialize.
-            if self._proc is not None and self._proc.returncode is None:
-                try:
-                    self._proc.kill()
-                except OSError:
-                    pass
+            if self._proc is not None:
+                _kill_process_tree(self._proc)
+                _forget_group(self._proc)
             raise
 
     async def _start_inner(self) -> None:
@@ -526,7 +573,10 @@ class ProcessSession:
             cwd=self.cwd,
             env=env,
             limit=STREAM_LIMIT,
+            start_new_session=True,
         )
+        with _live_groups_lock:
+            _live_groups.add(self._proc.pid)
         # Begin scraping stderr immediately so an OAuth authorization URL is
         # captured even though the initialize response below blocks until the
         # user finishes authorizing.
@@ -634,9 +684,26 @@ class ProcessSession:
             try:
                 self._proc.stdin.close()  # type: ignore[union-attr]
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
+                # The direct child exiting says nothing about its children:
+                # clear out anything left in the group (a lingering node
+                # process still holding the OAuth callback port).
+                _kill_process_tree(self._proc, signal.SIGTERM)
             except Exception:
-                self._proc.kill()
+                _kill_process_tree(self._proc)
+            _forget_group(self._proc)
             self._proc = None
+
+    def kill(self) -> None:
+        """Kill the subprocess tree without awaiting it.
+
+        Signals work from any thread or event loop, unlike ``close()``, which
+        must run on the loop that spawned the process.  The owning loop's
+        stdout reader then sees EOF and fails whatever was waiting, and the
+        next call finds ``_alive()`` false and respawns.
+        """
+        if self._alive():
+            _kill_process_tree(self._proc)
+            _forget_group(self._proc)
 
 
 # Backward-compatible alias
@@ -665,6 +732,20 @@ def get_session(
     if key not in _sessions:
         _sessions[key] = ProcessSession(command, cwd=cwd, env_keys=env_keys)
     return _sessions[key]
+
+
+def kill_sessions_for(command: str) -> int:
+    """Kill every live persistent session spawned from *command*.
+
+    Returns how many were killed.  Used before re-authorizing: a live bridge
+    may still hold the loopback callback port the new one needs to bind.
+    """
+    killed = 0
+    for (cmd, _cwd, _keys), session in list(_sessions.items()):
+        if cmd == command and session._alive():
+            session.kill()
+            killed += 1
+    return killed
 
 
 class ConcurrentSpawnError(RuntimeError):

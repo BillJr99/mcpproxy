@@ -30,6 +30,7 @@ WS   /ws/terminal               — interactive PTY terminal (optional ?cmd=…)
 
 import ast
 import asyncio
+import errno
 import html
 import fcntl
 import json
@@ -161,10 +162,29 @@ def _write_env_file(path: Path, updates: dict[str, str]) -> None:
     # Replace atomically.  A plain write truncates first, so a reader that
     # arrives mid-write (the proxy re-reading secrets, docker-compose, a shell
     # sourcing the file) can see a partial file and act on missing keys.
+    content = "\n".join(lines) + "\n"
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
-        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        tmp.write_text(content, encoding="utf-8")
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Docker compose bind-mounts ./.env as a single file, which makes
+            # /app/.env a mount point, and rename(2) onto a mount point fails
+            # with EBUSY (EXDEV across devices).  Rewrite in place instead: it
+            # keeps the inode, so the change reaches the host's file.  This
+            # write is not atomic, but a mount point leaves no atomic option.
+            if exc.errno not in (errno.EBUSY, errno.EXDEV):
+                raise
+            print(
+                f"[frontend.app:_write_env_file] {path} cannot be replaced "
+                f"({exc.strerror}); rewriting it in place",
+                flush=True,
+            )
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -321,6 +341,8 @@ _reauth_tasks: dict[str, "asyncio.Task"] = {}
 
 # How long to wait for a re-spawned bridge to print its authorization URL.
 REAUTH_URL_WAIT_SECONDS = float(os.environ.get("MCPPROXY_REAUTH_URL_WAIT", "45"))
+# How long re-authorize waits for a killed bridge to release its callback port.
+REAUTH_PORT_FREE_SECONDS = 5.0
 
 
 def _swallow_reauth_result(task: "asyncio.Task") -> None:
@@ -1997,7 +2019,12 @@ def create_app(
         until the browser flow completes (or the command's own ``--auth-timeout``
         elapses), which is what makes the pasted callback have something to land on.
         """
-        from process_runner import introspect, is_spawning, pending_auth_urls
+        from process_runner import (
+            introspect,
+            is_spawning,
+            kill_sessions_for,
+            pending_auth_urls,
+        )
         import oauth_callback_relay as relay
 
         body = await request.json()
@@ -2037,6 +2064,25 @@ def create_app(
 
         task = _reauth_tasks.get(command)
         if task is None or task.done():
+            # mcp-remote crashes with EADDRINUSE if its callback port is taken,
+            # and the usual holder is this command's own live bridge.  Free
+            # the port first, or say plainly what is in the way.
+            port, _source = relay.resolve_callback_port(command)
+            if port is not None and relay.probe_loopback_port(port):
+                kill_sessions_for(command)
+                waited = 0.0
+                while relay.probe_loopback_port(port) and waited < REAUTH_PORT_FREE_SECONDS:
+                    await asyncio.sleep(0.25)
+                    waited += 0.25
+                if relay.probe_loopback_port(port):
+                    return {
+                        "ok": False,
+                        "error": f"The OAuth callback port {port} is already in use "
+                        "inside the container, so a new bridge could not listen for "
+                        "the authorization. A stale bridge or another provider "
+                        "configured with the same port is holding it; restarting "
+                        "the container clears it.",
+                    }
             task = asyncio.ensure_future(
                 introspect(command, env_keys=_spawn_env_keys_for(target))
             )

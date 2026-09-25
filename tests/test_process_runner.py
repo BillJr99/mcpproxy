@@ -954,3 +954,64 @@ class TestRejectedCredentialClassification:
             [self.DCR], "npx -y mcp-remote https://mcp.example.com/mcp"
         )
         assert "--static-oauth-client-info" in msg
+
+
+class TestProcessTreeKill:
+    """npx runs mcp-remote as a grandchild; killing only the direct child left
+    it holding the OAuth callback port, so re-authorizing hit EADDRINUSE."""
+
+    def test_killing_a_bridge_also_kills_its_grandchildren(self, tmp_path):
+        import os
+        import time
+
+        pidfile = tmp_path / "grandchild.pid"
+
+        async def run() -> int:
+            session = process_runner.ProcessSession(
+                f"sh -c 'sleep 60 & echo $! > {pidfile}; wait'"
+            )
+            session._proc = await asyncio.create_subprocess_exec(
+                *session._parts,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            for _ in range(100):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    break
+                await asyncio.sleep(0.05)
+            grandchild = int(pidfile.read_text())
+            session.kill()
+            await session._proc.wait()
+            return grandchild
+
+        grandchild = asyncio.run(run())
+        for _ in range(100):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return
+            # Reaped by init once orphaned; a zombie still answers kill(0).
+            try:
+                with open(f"/proc/{grandchild}/stat") as fh:
+                    if fh.read().split(")")[-1].split()[0] == "Z":
+                        return
+            except FileNotFoundError:
+                return
+            time.sleep(0.05)
+        pytest.fail("grandchild survived the process-tree kill")
+
+    def test_kill_sessions_for_only_touches_matching_commands(self):
+        process_runner._sessions.clear()
+        try:
+            a = process_runner.get_session("cmd-a")
+            b = process_runner.get_session("cmd-b")
+            killed = []
+            for s in (a, b):
+                s._alive = lambda: True  # type: ignore[method-assign]
+            a.kill = lambda: killed.append("a")  # type: ignore[method-assign]
+            b.kill = lambda: killed.append("b")  # type: ignore[method-assign]
+            assert process_runner.kill_sessions_for("cmd-a") == 1
+            assert killed == ["a"]
+        finally:
+            process_runner._sessions.clear()

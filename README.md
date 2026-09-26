@@ -749,24 +749,24 @@ Follow logs with `docker logs -f mcpproxy`; stop the container with `docker stop
 > **Note:** `tools/` is never baked into the image and must be supplied at runtime via a volume mount.
 > `handlers/` is part of the image — no mount required.
 
-**Run from a persistent home directory** — store tools and secrets in `~/.mcpproxy` so
+**Run from a persistent home directory** — store tools and secrets in `~/.config/mcpproxy` so
 you can run the image from any working directory and the web UI can read and write `.env`.
 This is the recommended day-to-day command — it combines the persistent home directory
 with the named cache volumes:
 
 ```bash
 # First time only — create the directory and an empty .env
-mkdir -p ~/.mcpproxy/tools
-touch ~/.mcpproxy/.env
+mkdir -p ~/.config/mcpproxy/tools
+touch ~/.config/mcpproxy/.env
 
 docker run -d \
   -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
-  --env-file "$HOME/.mcpproxy/.env" \
+  --env-file "$HOME/.config/mcpproxy/.env" \
   -e MCP_ENV_FILE=/app/.env \
   -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
   -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
-  -v "$HOME/.mcpproxy/tools:/app/tools" \
-  -v "$HOME/.mcpproxy/.env:/app/.env" \
+  -v "$HOME/.config/mcpproxy/tools:/app/tools" \
+  -v "$HOME/.config/mcpproxy/.env:/app/.env" \
   -v mcpproxy-files:/app/files \
   -v mcpproxy-repos:/app/repos \
   -v mcpproxy-cache:/root/.cache \
@@ -777,6 +777,19 @@ docker run -d \
   --name mcpproxy \
   ghcr.io/billjr99/mcpproxy:latest
 ```
+
+> **Migrating from `~/.mcpproxy`:** earlier versions of this README kept these files in
+> `~/.mcpproxy`. The layout inside the directory is unchanged, so moving it is enough:
+>
+> ```bash
+> docker stop mcpproxy && docker rm mcpproxy
+> mkdir -p ~/.config
+> mv ~/.mcpproxy ~/.config/mcpproxy
+> # then re-run the docker run command above
+> ```
+>
+> The named volumes (`mcpproxy-mcp-auth`, `mcpproxy-rest-auth`, caches, …) are not
+> affected, so saved OAuth tokens and caches carry over.
 
 The `mcpproxy-rest-auth` volume persists OAuth tokens for REST `authorization_code`
 providers (see [REST / OAuth providers](#rest--oauth-providers)) so you authorize once
@@ -789,8 +802,8 @@ both point at the **same local file** on your host:
 
 | Flag | Local path → target | What it does |
 | ---- | ------------------- | ------------ |
-| `--env-file "$HOME/.mcpproxy/.env"` | host file, parsed by Docker | Reads the file and injects each `KEY=value` line as an **environment variable** in the container at startup. |
-| `-v "$HOME/.mcpproxy/.env:/app/.env"` | host file → `/app/.env` | Bind-**mounts the file itself** into the container so the proxy can read it directly (via `MCP_ENV_FILE`, which the image defaults to `/app/.env`) and pass values to the MCP tool subprocesses it spawns. It also lets the web UI's **🔑 Secrets** panel read and write values live. |
+| `--env-file "$HOME/.config/mcpproxy/.env"` | host file, parsed by Docker | Reads the file and injects each `KEY=value` line as an **environment variable** in the container at startup. |
+| `-v "$HOME/.config/mcpproxy/.env:/app/.env"` | host file → `/app/.env` | Bind-**mounts the file itself** into the container so the proxy can read it directly (via `MCP_ENV_FILE`, which the image defaults to `/app/.env`) and pass values to the MCP tool subprocesses it spawns. It also lets the web UI's **🔑 Secrets** panel read and write values live. |
 
 Notes:
 - In **both** flags, the path is your **local** `.env` on the host — `--env-file` takes the
@@ -815,12 +828,12 @@ Notes:
 > docker run -d \
 >   --restart unless-stopped \
 >   -p 8888:8888 -p 8889:8889 -p 127.0.0.1:8887:8887 \
->   --env-file "$HOME/.mcpproxy/.env" \
+>   --env-file "$HOME/.config/mcpproxy/.env" \
 >   -e MCP_ENV_FILE=/run/secrets/mcpproxy.env \
 >   -e MCP_REMOTE_CONFIG_DIR=/app/.mcp-auth \
 >   -e MCPPROXY_CALLBACK_FORWARD_PORTS=8887 \
->   -v "$HOME/.mcpproxy/tools:/app/tools" \
->   -v "$HOME/.mcpproxy/.env:/run/secrets/mcpproxy.env:ro" \
+>   -v "$HOME/.config/mcpproxy/tools:/app/tools" \
+>   -v "$HOME/.config/mcpproxy/.env:/run/secrets/mcpproxy.env:ro" \
 >   -v mcpproxy-files:/app/files \
 >   -v mcpproxy-repos:/app/repos \
 >   -v mcpproxy-cache:/root/.cache \
@@ -833,8 +846,8 @@ Notes:
 > ```
 >
 > To mount the whole directory rather than the single file, replace the
-> `-v "$HOME/.mcpproxy/.env:/run/secrets/mcpproxy.env:ro"` line with
-> `-v "$HOME/.mcpproxy:/run/secrets:ro"` (the `.env` then appears at
+> `-v "$HOME/.config/mcpproxy/.env:/run/secrets/mcpproxy.env:ro"` line with
+> `-v "$HOME/.config/mcpproxy:/run/secrets:ro"` (the `.env` then appears at
 > `/run/secrets/.env`, so set `-e MCP_ENV_FILE=/run/secrets/.env`). Note that a read-only
 > (`:ro`) mount means the web UI's **🔑 Secrets** panel can't write changes back; drop `:ro`
 > if you want live edits to persist.

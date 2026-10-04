@@ -31,21 +31,21 @@ HEADER_SECRET = "hdr-caller-secret-value-1234"
 ENV_SECRET = "env-fallback-secret-value-5678"
 
 BOTH = {"secrets": {
-    "env": {"canvas_token": "CANVAS_API_KEY"},
-    "headers": {"canvas_token": "X-MCPProxy-Canvas-Key"},
+    "env": {"service_token": "SERVICE_API_KEY"},
+    "headers": {"service_token": "X-MCPProxy-Service-Key"},
 }}
-HEADER_ONLY = {"secrets": {"headers": {"canvas_token": "X-MCPProxy-Canvas-Key"}}}
-ENV_ONLY = {"secrets": {"env": {"canvas_token": "CANVAS_API_KEY"}}}
+HEADER_ONLY = {"secrets": {"headers": {"service_token": "X-MCPProxy-Service-Key"}}}
+ENV_ONLY = {"secrets": {"env": {"service_token": "SERVICE_API_KEY"}}}
 
 
 @pytest.fixture()
 def env_secret(monkeypatch):
-    monkeypatch.setenv("CANVAS_API_KEY", ENV_SECRET)
+    monkeypatch.setenv("SERVICE_API_KEY", ENV_SECRET)
 
 
 @pytest.fixture()
 def no_env_secret(monkeypatch):
-    monkeypatch.delenv("CANVAS_API_KEY", raising=False)
+    monkeypatch.delenv("SERVICE_API_KEY", raising=False)
 
 
 def _ctx(headers: dict[str, str] | None) -> Any:
@@ -60,86 +60,86 @@ def _ctx(headers: dict[str, str] | None) -> Any:
 
 class TestResolution:
     def test_env_only_still_works(self, env_secret):
-        assert resolve_secret_defaults(ENV_ONLY, {}) == {"canvas_token": ENV_SECRET}
+        assert resolve_secret_defaults(ENV_ONLY, {}) == {"service_token": ENV_SECRET}
 
     def test_env_only_ignores_unrelated_headers(self, env_secret):
-        out = resolve_secret_defaults(ENV_ONLY, {}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
-        assert out == {"canvas_token": ENV_SECRET}
+        out = resolve_secret_defaults(ENV_ONLY, {}, {"x-mcpproxy-service-key": HEADER_SECRET})
+        assert out == {"service_token": ENV_SECRET}
 
     def test_header_only_works(self, no_env_secret):
-        out = resolve_secret_defaults(HEADER_ONLY, {}, {"X-MCPProxy-Canvas-Key": HEADER_SECRET})
-        assert out == {"canvas_token": HEADER_SECRET}
+        out = resolve_secret_defaults(HEADER_ONLY, {}, {"X-MCPProxy-Service-Key": HEADER_SECRET})
+        assert out == {"service_token": HEADER_SECRET}
 
     def test_header_preferred_over_env(self, env_secret):
-        plan = plan_secret_injection(BOTH, {}, {"X-MCPProxy-Canvas-Key": HEADER_SECRET})
-        assert plan.primary_kwargs == {"canvas_token": HEADER_SECRET}
-        assert plan.fallback_kwargs == {"canvas_token": ENV_SECRET}
-        assert plan.sources["canvas_token"] == {
-            "primary": SecretSource("header", "X-MCPProxy-Canvas-Key"),
-            "fallback": SecretSource("env", "CANVAS_API_KEY"),
+        plan = plan_secret_injection(BOTH, {}, {"X-MCPProxy-Service-Key": HEADER_SECRET})
+        assert plan.primary_kwargs == {"service_token": HEADER_SECRET}
+        assert plan.fallback_kwargs == {"service_token": ENV_SECRET}
+        assert plan.sources["service_token"] == {
+            "primary": SecretSource("header", "X-MCPProxy-Service-Key"),
+            "fallback": SecretSource("env", "SERVICE_API_KEY"),
         }
 
     def test_missing_header_falls_back_to_env(self, env_secret):
         plan = plan_secret_injection(BOTH, {}, {})
-        assert plan.primary_kwargs == {"canvas_token": ENV_SECRET}
+        assert plan.primary_kwargs == {"service_token": ENV_SECRET}
         assert plan.fallback_kwargs is None  # nothing to fall back from
 
     def test_no_headers_argument_falls_back_to_env(self, env_secret):
-        assert resolve_secret_defaults(BOTH, {}) == {"canvas_token": ENV_SECRET}
+        assert resolve_secret_defaults(BOTH, {}) == {"service_token": ENV_SECRET}
 
     @pytest.mark.parametrize("blank", ["", "   ", "\t \n"])
     def test_blank_header_falls_back_to_env(self, env_secret, blank):
-        plan = plan_secret_injection(BOTH, {}, {"X-MCPProxy-Canvas-Key": blank})
-        assert plan.primary_kwargs == {"canvas_token": ENV_SECRET}
+        plan = plan_secret_injection(BOTH, {}, {"X-MCPProxy-Service-Key": blank})
+        assert plan.primary_kwargs == {"service_token": ENV_SECRET}
         assert plan.fallback_kwargs is None
 
     @pytest.mark.parametrize("name", [
-        "x-mcpproxy-canvas-key", "X-MCPPROXY-CANVAS-KEY", "x-MCPProxy-canvas-KEY",
+        "x-mcpproxy-service-key", "X-MCPPROXY-SERVICE-KEY", "x-MCPProxy-service-KEY",
     ])
     def test_header_lookup_case_insensitive(self, env_secret, name):
         out = resolve_secret_defaults(BOTH, {}, {name: HEADER_SECRET})
-        assert out == {"canvas_token": HEADER_SECRET}
+        assert out == {"service_token": HEADER_SECRET}
 
     def test_configured_header_name_case_insensitive(self, env_secret):
-        tool = {"secrets": {"headers": {"canvas_token": "x-mcpproxy-CANVAS-key"}}}
-        out = resolve_secret_defaults(tool, {}, {"X-MCPProxy-Canvas-Key": HEADER_SECRET})
-        assert out == {"canvas_token": HEADER_SECRET}
+        tool = {"secrets": {"headers": {"service_token": "x-mcpproxy-SERVICE-key"}}}
+        out = resolve_secret_defaults(tool, {}, {"X-MCPProxy-Service-Key": HEADER_SECRET})
+        assert out == {"service_token": HEADER_SECRET}
 
     def test_header_value_whitespace_trimmed(self, no_env_secret):
-        out = resolve_secret_defaults(HEADER_ONLY, {}, {"x-mcpproxy-canvas-key": f"  {HEADER_SECRET} "})
-        assert out == {"canvas_token": HEADER_SECRET}
+        out = resolve_secret_defaults(HEADER_ONLY, {}, {"x-mcpproxy-service-key": f"  {HEADER_SECRET} "})
+        assert out == {"service_token": HEADER_SECRET}
 
     def test_missing_both_raises_naming_sources_only(self, no_env_secret):
         with pytest.raises(RuntimeError) as err:
             resolve_secret_defaults(BOTH, {}, {"Other-Header": HEADER_SECRET})
-        assert "X-MCPProxy-Canvas-Key" in str(err.value)
-        assert "CANVAS_API_KEY" in str(err.value)
+        assert "X-MCPProxy-Service-Key" in str(err.value)
+        assert "SERVICE_API_KEY" in str(err.value)
         assert HEADER_SECRET not in str(err.value)
 
     def test_missing_header_only_raises(self, no_env_secret):
-        with pytest.raises(RuntimeError, match="X-MCPProxy-Canvas-Key"):
+        with pytest.raises(RuntimeError, match="X-MCPProxy-Service-Key"):
             resolve_secret_defaults(HEADER_ONLY, {}, {})
 
     def test_missing_env_only_message_unchanged(self, no_env_secret):
-        with pytest.raises(RuntimeError, match="^Missing required secret environment variable: CANVAS_API_KEY$"):
-            resolve_secret_defaults(ENV_ONLY, {}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
+        with pytest.raises(RuntimeError, match="^Missing required secret environment variable: SERVICE_API_KEY$"):
+            resolve_secret_defaults(ENV_ONLY, {}, {"x-mcpproxy-service-key": HEADER_SECRET})
 
     def test_empty_env_with_header_uses_header_without_fallback(self, monkeypatch):
-        monkeypatch.setenv("CANVAS_API_KEY", "")
-        plan = plan_secret_injection(BOTH, {}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
-        assert plan.primary_kwargs == {"canvas_token": HEADER_SECRET}
+        monkeypatch.setenv("SERVICE_API_KEY", "")
+        plan = plan_secret_injection(BOTH, {}, {"x-mcpproxy-service-key": HEADER_SECRET})
+        assert plan.primary_kwargs == {"service_token": HEADER_SECRET}
         assert plan.fallback_kwargs is None
 
     def test_non_secret_kwargs_untouched(self, env_secret):
-        kwargs = {"course_id": "CS357", "limit": 0, "flag": False, "text": ""}
-        out = resolve_secret_defaults(BOTH, kwargs, {"x-mcpproxy-canvas-key": HEADER_SECRET})
-        assert out == {**kwargs, "canvas_token": HEADER_SECRET}
-        assert "canvas_token" not in kwargs  # input not mutated
+        kwargs = {"resource_id": "R-1", "limit": 0, "flag": False, "text": ""}
+        out = resolve_secret_defaults(BOTH, kwargs, {"x-mcpproxy-service-key": HEADER_SECRET})
+        assert out == {**kwargs, "service_token": HEADER_SECRET}
+        assert "service_token" not in kwargs  # input not mutated
 
     def test_none_optionals_omitted(self, env_secret):
-        out = resolve_secret_defaults(BOTH, {"offset": None, "q": "x"}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
-        assert out == {"q": "x", "canvas_token": HEADER_SECRET}
-        plan = plan_secret_injection(BOTH, {"offset": None}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
+        out = resolve_secret_defaults(BOTH, {"offset": None, "q": "x"}, {"x-mcpproxy-service-key": HEADER_SECRET})
+        assert out == {"q": "x", "service_token": HEADER_SECRET}
+        plan = plan_secret_injection(BOTH, {"offset": None}, {"x-mcpproxy-service-key": HEADER_SECRET})
         assert "offset" not in plan.fallback_kwargs
 
     def test_headers_mapping_must_be_dict(self):
@@ -167,10 +167,10 @@ class TestResolution:
         assert plan.fallback_kwargs is None
 
     def test_plan_repr_hides_values(self, env_secret):
-        plan = plan_secret_injection(BOTH, {}, {"x-mcpproxy-canvas-key": HEADER_SECRET})
+        plan = plan_secret_injection(BOTH, {}, {"x-mcpproxy-service-key": HEADER_SECRET})
         text = repr(plan)
         assert HEADER_SECRET not in text and ENV_SECRET not in text
-        assert "X-MCPProxy-Canvas-Key" in text
+        assert "X-MCPProxy-Service-Key" in text
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +182,13 @@ class TestExtractRequestHeaders:
         assert extract_request_headers(None) == {}
 
     def test_names_lowercased(self):
-        out = extract_request_headers(_ctx({"X-MCPProxy-Canvas-Key": "v", "Accept": "a"}))
-        assert out == {"x-mcpproxy-canvas-key": "v", "accept": "a"}
+        out = extract_request_headers(_ctx({"X-MCPProxy-Service-Key": "v", "Accept": "a"}))
+        assert out == {"x-mcpproxy-service-key": "v", "accept": "a"}
 
     def test_starlette_headers(self):
         from starlette.datastructures import Headers
-        headers = Headers(raw=[(b"x-mcpproxy-canvas-key", b"v1")])
-        assert extract_request_headers(_ctx(headers)) == {"x-mcpproxy-canvas-key": "v1"}
+        headers = Headers(raw=[(b"x-mcpproxy-service-key", b"v1")])
+        assert extract_request_headers(_ctx(headers)) == {"x-mcpproxy-service-key": "v1"}
 
     def test_no_request_falls_back_to_fastmcp_helper(self):
         with patch("fastmcp.server.dependencies.get_http_headers", return_value={"X-K": "v"}) as helper:
@@ -228,7 +228,7 @@ class _StatusError(Exception):
 
 
 def _httpx_error(status: int) -> httpx.HTTPStatusError:
-    request = httpx.Request("GET", "https://canvas.example/api/v1/courses")
+    request = httpx.Request("GET", "https://service.example/api/v1/items")
     response = httpx.Response(status, request=request)
     return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
 
@@ -283,7 +283,7 @@ class _Recorder:
         self.tokens: list[str] = []
 
     async def __call__(self, context, **kwargs):
-        self.tokens.append(kwargs.get("canvas_token"))
+        self.tokens.append(kwargs.get("service_token"))
         outcome = self.outcomes.pop(0) if self.outcomes else {"ok": True}
         if isinstance(outcome, BaseException):
             raise outcome
@@ -295,7 +295,7 @@ async def _invoke(handler, headers, tool=BOTH):
     return await invoke_with_secret_fallback(handler, build_runtime_context({"name": "t"}, None), plan, "t")
 
 
-HDR = {"X-MCPProxy-Canvas-Key": HEADER_SECRET}
+HDR = {"X-MCPProxy-Service-Key": HEADER_SECRET}
 
 
 class TestInvocationFallback:
@@ -381,7 +381,7 @@ class TestInvocationFallback:
         h = _Recorder({"ok": False, "status": 401}, {"ok": True})
         await _invoke(h, HDR)
         out = capsys.readouterr().out
-        assert "X-MCPProxy-Canvas-Key" in out and "CANVAS_API_KEY" in out
+        assert "X-MCPProxy-Service-Key" in out and "SERVICE_API_KEY" in out
         assert HEADER_SECRET not in out and ENV_SECRET not in out
 
 
@@ -404,13 +404,13 @@ def _register(tool_spec, handler):
     return captured["fn"]
 
 
-CANVAS_TOOL = {
-    "name": "canvas_list_courses",
-    "description": "List courses.",
+SERVICE_TOOL = {
+    "name": "service_list_items",
+    "description": "List items.",
     "input_schema": {
         "type": "object",
-        "properties": {"course_id": {"type": "string"}},
-        "required": ["course_id"],
+        "properties": {"resource_id": {"type": "string"}},
+        "required": ["resource_id"],
     },
     **BOTH,
 }
@@ -418,9 +418,9 @@ CANVAS_TOOL = {
 
 class TestDynamicTool:
     def test_secret_absent_from_schema(self):
-        fn = _register(CANVAS_TOOL, _Recorder())
-        assert "canvas_token" not in fn.__signature__.parameters
-        assert "canvas_token" not in fn.__annotations__
+        fn = _register(SERVICE_TOOL, _Recorder())
+        assert "service_token" not in fn.__signature__.parameters
+        assert "service_token" not in fn.__annotations__
 
     @pytest.mark.asyncio
     async def test_header_used_and_ctx_preserved(self, env_secret):
@@ -430,10 +430,10 @@ class TestDynamicTool:
             seen.update(context=context, kwargs=kwargs)
             return {"ok": True}
 
-        fn = _register(CANVAS_TOOL, handler)
-        ctx = _ctx({"x-mcpproxy-canvas-key": HEADER_SECRET})
-        assert await fn(ctx, course_id="CS357") == {"ok": True}
-        assert seen["kwargs"] == {"course_id": "CS357", "canvas_token": HEADER_SECRET}
+        fn = _register(SERVICE_TOOL, handler)
+        ctx = _ctx({"x-mcpproxy-service-key": HEADER_SECRET})
+        assert await fn(ctx, resource_id="R-1") == {"ok": True}
+        assert seen["kwargs"] == {"resource_id": "R-1", "service_token": HEADER_SECRET}
         assert seen["context"]["mcp_context"] is ctx
 
     @pytest.mark.asyncio
@@ -443,46 +443,46 @@ class TestDynamicTool:
         both_started = asyncio.Event()
         started = 0
 
-        async def handler(context, course_id, canvas_token):
+        async def handler(context, resource_id, service_token):
             nonlocal started
             started += 1
             if started == 2:
                 both_started.set()
             await asyncio.wait_for(both_started.wait(), timeout=2)  # force interleaving
-            seen.setdefault(course_id, []).append(canvas_token)
-            return {"ok": True, "course": course_id}
+            seen.setdefault(resource_id, []).append(service_token)
+            return {"ok": True, "resource": resource_id}
 
-        fn = _register(CANVAS_TOOL, handler)
-        ctx_a = _ctx({"X-MCPProxy-Canvas-Key": HEADER_SECRET})
+        fn = _register(SERVICE_TOOL, handler)
+        ctx_a = _ctx({"X-MCPProxy-Service-Key": HEADER_SECRET})
         ctx_b = _ctx({"User-Agent": "client-b"})
-        await asyncio.gather(fn(ctx_a, course_id="A"), fn(ctx_b, course_id="B"))
+        await asyncio.gather(fn(ctx_a, resource_id="A"), fn(ctx_b, resource_id="B"))
         assert seen == {"A": [HEADER_SECRET], "B": [ENV_SECRET]}
         # A later call from B still cannot observe A's credential.
-        await fn(ctx_b, course_id="B")
+        await fn(ctx_b, resource_id="B")
         assert seen["B"] == [ENV_SECRET, ENV_SECRET]
 
     @pytest.mark.asyncio
     async def test_retry_through_dynamic_tool(self, env_secret):
         h = _Recorder({"ok": False, "status": 401}, {"ok": True})
-        fn = _register(CANVAS_TOOL, h)
-        assert await fn(_ctx(HDR), course_id="X") == {"ok": True}
+        fn = _register(SERVICE_TOOL, h)
+        assert await fn(_ctx(HDR), resource_id="X") == {"ok": True}
         assert h.tokens == [HEADER_SECRET, ENV_SECRET]
 
     @pytest.mark.asyncio
     async def test_missing_secret_error_names_sources_only(self, no_env_secret):
-        fn = _register(CANVAS_TOOL, _Recorder())
-        result = await fn(_ctx({}), course_id="X")
+        fn = _register(SERVICE_TOOL, _Recorder())
+        result = await fn(_ctx({}), resource_id="X")
         assert result["ok"] is False
-        assert "X-MCPProxy-Canvas-Key" in result["error"]
-        assert "CANVAS_API_KEY" in result["error"]
+        assert "X-MCPProxy-Service-Key" in result["error"]
+        assert "SERVICE_API_KEY" in result["error"]
 
     @pytest.mark.asyncio
     async def test_handler_error_echoing_secret_is_scrubbed(self, env_secret, capsys):
         async def leaky(context, **kwargs):
-            raise RuntimeError(f"request to https://canvas/?access_token={kwargs['canvas_token']} failed")
+            raise RuntimeError(f"request to https://service/?access_token={kwargs['service_token']} failed")
 
-        fn = _register(CANVAS_TOOL, leaky)
-        result = await fn(_ctx(HDR), course_id="X")
+        fn = _register(SERVICE_TOOL, leaky)
+        result = await fn(_ctx(HDR), resource_id="X")
         assert result["ok"] is False
         assert HEADER_SECRET not in result["error"]
         assert "[REDACTED]" in result["error"]
@@ -493,8 +493,8 @@ class TestDynamicTool:
     @pytest.mark.asyncio
     async def test_fallback_error_echoing_env_secret_is_scrubbed(self, env_secret, capsys):
         h = _Recorder(_StatusError(401), RuntimeError(f"bad token {ENV_SECRET}"))
-        fn = _register(CANVAS_TOOL, h)
-        result = await fn(_ctx(HDR), course_id="X")
+        fn = _register(SERVICE_TOOL, h)
+        result = await fn(_ctx(HDR), resource_id="X")
         assert ENV_SECRET not in result["error"] and HEADER_SECRET not in result["error"]
         captured = capsys.readouterr()
         assert ENV_SECRET not in captured.out + captured.err
@@ -502,6 +502,6 @@ class TestDynamicTool:
     @pytest.mark.asyncio
     async def test_rest_invoke_path_with_no_ctx_uses_env(self, env_secret):
         h = _Recorder()
-        fn = _register(CANVAS_TOOL, h)
-        assert await fn(None, course_id="X") == {"ok": True}
+        fn = _register(SERVICE_TOOL, h)
+        assert await fn(None, resource_id="X") == {"ok": True}
         assert h.tokens == [ENV_SECRET]

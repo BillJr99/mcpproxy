@@ -644,6 +644,10 @@ An MCP client can then optionally send, on its MCP HTTP requests:
 X-MCPProxy-Service-Key: <caller credential>
 ```
 
+This lets one MCP client send its own credential in the header while other clients
+keep using the same mcpproxy endpoint with the server's environment credential, without
+ever possessing the caller's credential.
+
 For each hidden argument, resolution works as follows:
 
 1. **Header first.** If the header is present with a non-empty value, that value is
@@ -690,22 +694,6 @@ numeric `status` in that error result.
   not restrict access to the endpoint.
 - The REST tool-tester endpoint (`POST /v1/tools/{name}/invoke`) is not an MCP request and
   always uses the environment fallback.
-
-**Example: Canvas.** The Canvas provider declares, on every tool that needs a token:
-
-```yaml
-secrets:
-  env:
-    api_url: CANVAS_API_URL
-    api_key: CANVAS_API_KEY
-  headers:
-    api_key: X-MCPProxy-Canvas-Key
-```
-
-One MCP client, such as OpenCode, can send its own Canvas token in
-`X-MCPProxy-Canvas-Key`, while other clients keep using the same mcpproxy endpoint with
-the server's `CANVAS_API_KEY`, without ever possessing the caller's credential. The Canvas
-base URL always comes from `CANVAS_API_URL`.
 
 In the provider editor, each secret row has an optional third field for the header name;
 editing and re-saving a provider preserves both mappings.

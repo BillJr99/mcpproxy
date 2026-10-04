@@ -3444,3 +3444,120 @@ class TestEnvValueQuoting:
         f = tmp_path / ".env"
         f.write_text("K='Bearer ghp_abc'\n")
         assert _read_env_file(f)["K"] == "Bearer ghp_abc"
+
+
+# ---------------------------------------------------------------------------
+# Missing-secrets banner: header alternatives (secrets.headers)
+# ---------------------------------------------------------------------------
+
+class TestSecretHeaderAlternatives:
+    def test_env_only_has_no_alternatives(self):
+        from frontend.app import _secret_header_alternatives
+        spec = {"tools": [{"secrets": {"env": {"key": "MY_KEY"}}}]}
+        assert _secret_header_alternatives(spec) == {}
+
+    def test_header_covers_every_use(self):
+        from frontend.app import _secret_header_alternatives
+        secrets = {"env": {"api_key": "SVC_KEY", "api_url": "SVC_URL"},
+                   "headers": {"api_key": "X-MCPProxy-Service-Key"}}
+        spec = {"tools": [{"secrets": secrets}, {"secrets": secrets}]}
+        assert _secret_header_alternatives(spec) == {
+            "SVC_KEY": {"headers": ["X-MCPProxy-Service-Key"], "covers_all": True},
+        }
+
+    def test_partial_coverage_across_tools(self):
+        from frontend.app import _secret_header_alternatives
+        spec = {"tools": [
+            {"secrets": {"env": {"k": "SVC_KEY"}, "headers": {"k": "X-Key"}}},
+            {"secrets": {"env": {"k": "SVC_KEY"}}},
+        ]}
+        assert _secret_header_alternatives(spec)["SVC_KEY"] == {
+            "headers": ["X-Key"], "covers_all": False,
+        }
+
+    def test_variable_also_used_outside_tools_is_not_fully_covered(self):
+        from frontend.app import _secret_header_alternatives
+        spec = {
+            "package": {"command": "x", "env_keys": ["SVC_KEY"]},
+            "tools": [{"secrets": {"env": {"k": "SVC_KEY"}, "headers": {"k": "X-Key"}}}],
+        }
+        assert _secret_header_alternatives(spec)["SVC_KEY"]["covers_all"] is False
+
+    def test_distinct_headers_listed_once(self):
+        from frontend.app import _secret_header_alternatives
+        spec = {"tools": [
+            {"secrets": {"env": {"k": "SVC_KEY"}, "headers": {"k": "X-A"}}},
+            {"secrets": {"env": {"k": "SVC_KEY"}, "headers": {"k": "X-B"}}},
+            {"secrets": {"env": {"k": "SVC_KEY"}, "headers": {"k": "X-A"}}},
+        ]}
+        assert _secret_header_alternatives(spec)["SVC_KEY"] == {
+            "headers": ["X-A", "X-B"], "covers_all": True,
+        }
+
+    def test_malformed_mappings_ignored(self):
+        from frontend.app import _secret_header_alternatives
+        spec = {"tools": [{"secrets": {"env": ["SVC_KEY"], "headers": {"k": "X-Key"}}},
+                          {"secrets": {"env": {"k": "SVC_KEY"}, "headers": ["X-Key"]}}]}
+        assert _secret_header_alternatives(spec) == {}
+
+    def test_api_tools_reports_alternatives_without_values(self, app, tools_dir, env_path):
+        env_path.write_text("SVC_URL=https://svc.example\n")
+        (tools_dir / "svc.yaml").write_text(yaml.dump({
+            "code": "async def t(context, **kw):\n    return {}\n",
+            "tools": [{
+                "name": "t", "function": "t", "description": "d",
+                "input_schema": {"type": "object", "properties": {}},
+                "secrets": {"env": {"api_key": "SVC_KEY", "api_url": "SVC_URL"},
+                            "headers": {"api_key": "X-MCPProxy-Service-Key"}},
+            }],
+        }))
+        entry = TestClient(app).get("/api/tools").json()[0]
+        assert entry["missing_secrets"] == ["SVC_KEY"]
+        assert entry["secret_header_alternatives"] == {
+            "SVC_KEY": {"headers": ["X-MCPProxy-Service-Key"], "covers_all": True},
+        }
+        assert "https://svc.example" not in json.dumps(entry)
+
+    def test_banner_wiring_present_in_page(self, client):
+        text = client.get("/").text
+        assert "function missingSecretHeaderNote(" in text
+        assert "missingSecretHeaderNote(missing, meta.secret_header_alternatives" in text
+        assert "missingSecretHeaderNote(missing, p.secret_header_alternatives" in text
+
+
+class TestMissingSecretHeaderNoteJs:
+    """Run the banner's note builder in Node, extracted verbatim from the page."""
+
+    def _run(self, missing, alternatives):
+        import re
+        import shutil
+        import subprocess as sp
+        from frontend.app import _HTML
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed")
+        match = re.search(r"function missingSecretHeaderNote\(.*?\n}\n", _HTML, re.S)
+        assert match, "missingSecretHeaderNote not found in the page"
+        script = (match.group(0)
+                  + "\nprocess.stdout.write(missingSecretHeaderNote("
+                  + json.dumps(missing) + ", " + json.dumps(alternatives) + "));\n")
+        return sp.run([node, "-e", script], capture_output=True, text=True, check=True).stdout
+
+    def test_full_coverage_note(self):
+        note = self._run(["SVC_KEY"], {"SVC_KEY": {"headers": ["X-Key"], "covers_all": True}})
+        assert note == ("SVC_KEY can instead be sent by MCP clients in the X-Key request "
+                        "header (the .env value is only the fallback)")
+
+    def test_partial_coverage_note(self):
+        note = self._run(["SVC_KEY"], {"SVC_KEY": {"headers": ["X-A", "X-B"], "covers_all": False}})
+        assert note == ("SVC_KEY can instead be sent in the X-A or X-B request header for "
+                        "some tools, but others still need it in .env")
+
+    def test_no_note_without_alternatives(self):
+        assert self._run(["SVC_URL"], {"SVC_KEY": {"headers": ["X-Key"], "covers_all": True}}) == ""
+
+    def test_multiple_notes_joined(self):
+        note = self._run(["A", "B"], {"A": {"headers": ["X-A"], "covers_all": True},
+                                      "B": {"headers": ["X-B"], "covers_all": False}})
+        assert note.count(";") == 1 and note.startswith("A can") and "B can" in note

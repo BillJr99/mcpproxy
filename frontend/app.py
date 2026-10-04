@@ -210,6 +210,47 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
     return keys
 
 
+def _secret_header_alternatives(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map each per-tool ``secrets.env`` variable to its ``secrets.headers`` alternatives.
+
+    A tool argument mapped to both ``secrets.env`` and ``secrets.headers`` can
+    be supplied per request by an MCP client, so an unset variable is only a
+    fallback gap rather than a hard failure.  Returns
+    ``{ENV_KEY: {"headers": [...], "covers_all": bool}}`` for every variable
+    with at least one header alternative.  ``covers_all`` is true only when
+    every tool argument using the variable has a header alternative and no
+    package, repository or REST auth setting also reads it; otherwise some
+    calls still need the variable.  Only names are returned, never values.
+    """
+    uses: dict[str, list[Any]] = {}
+    for tool in spec.get("tools") or []:
+        secrets_cfg = tool.get("secrets") or {}
+        env_map = secrets_cfg.get("env") or {}
+        header_map = secrets_cfg.get("headers") or {}
+        if not isinstance(env_map, dict) or not isinstance(header_map, dict):
+            continue
+        for arg, key in env_map.items():
+            if key:
+                uses.setdefault(key, []).append(header_map.get(arg))
+
+    other_uses = set(_rest_auth_env_keys(spec))
+    for block in ("repository", "package"):
+        other_uses.update(k for k in (spec.get(block) or {}).get("env_keys") or [] if k)
+
+    out: dict[str, dict[str, Any]] = {}
+    for key, headers in uses.items():
+        names: list[str] = []
+        for header in headers:
+            if header and header not in names:
+                names.append(header)
+        if names:
+            out[key] = {
+                "headers": names,
+                "covers_all": all(headers) and key not in other_uses,
+            }
+    return out
+
+
 def _rest_auth_env_keys(spec: dict[str, Any]) -> list[str]:
     """Return the env-var names referenced by a REST provider's auth block."""
     auth = (spec.get("rest") or {}).get("auth") or {}
@@ -955,6 +996,7 @@ def create_app(
                     "is_rest": is_rest,
                     "secret_keys": secret_keys,
                     "missing_secrets": missing_secrets,
+                    "secret_header_alternatives": _secret_header_alternatives(spec),
                     "validation_errors": validation["errors"],
                     "documentation": spec.get("documentation") or "",
                     "oauth": oauth_out,
@@ -3751,6 +3793,7 @@ async function loadList() {
     providers.forEach(p => {
       providersMeta[p.name] = {
         missing_secrets: p.missing_secrets || [],
+        secret_header_alternatives: p.secret_header_alternatives || {},
         validation_errors: p.validation_errors || [],
         secret_keys: p.secret_keys || [],
         auth_info: p.auth_info || null,
@@ -3760,8 +3803,9 @@ async function loadList() {
     el.innerHTML = providers.map(p => {
       const missing = p.missing_secrets || [];
       const errs = p.validation_errors || [];
+      const headerNote = missingSecretHeaderNote(missing, p.secret_header_alternatives || {});
       const warnBadge = missing.length
-        ? `<span class="badge-warn" title="Missing: ${esc(missing.join(', '))}">⚠ ${missing.length} secret${missing.length > 1 ? 's' : ''} missing</span>`
+        ? `<span class="badge-warn" title="Missing: ${esc(missing.join(', '))}${headerNote ? esc('. ' + headerNote) : ''}">⚠ ${missing.length} secret${missing.length > 1 ? 's' : ''} missing</span>`
         : '';
       const errBadge = errs.length
         ? `<span class="badge-err" title="${esc(errs.join(' · '))}">✗ ${errs.length} config error${errs.length > 1 ? 's' : ''}</span>`
@@ -3914,6 +3958,21 @@ function _fnPickOptionsHtml(currentValue) {
   return opts.join('');
 }
 
+// Explain which missing .env secrets MCP clients can instead send as a request
+// header (secrets.headers).  Names only; the server never sends values.
+function missingSecretHeaderNote(missing, alternatives) {
+  const notes = [];
+  for (const key of missing) {
+    const alt = alternatives[key];
+    if (!alt || !(alt.headers || []).length) continue;
+    const headers = alt.headers.join(' or ');
+    notes.push(alt.covers_all
+      ? `${key} can instead be sent by MCP clients in the ${headers} request header (the .env value is only the fallback)`
+      : `${key} can instead be sent in the ${headers} request header for some tools, but others still need it in .env`);
+  }
+  return notes.join('; ');
+}
+
 function _refreshEditorBars(name) {
   const meta = providersMeta[name] || {};
   const missing = meta.missing_secrets || [];
@@ -3922,7 +3981,9 @@ function _refreshEditorBars(name) {
   const sBar = document.getElementById('secrets-bar');
   const sMsg = document.getElementById('secrets-bar-msg');
   if (missing.length) {
-    sMsg.textContent = `${missing.length} secret${missing.length > 1 ? 's' : ''} not set in .env: ${missing.join(', ')}`;
+    const headerNote = missingSecretHeaderNote(missing, meta.secret_header_alternatives || {});
+    sMsg.textContent = `${missing.length} secret${missing.length > 1 ? 's' : ''} not set in .env: ${missing.join(', ')}`
+      + (headerNote ? `. ${headerNote}` : '');
     sBar.style.display = '';
   } else {
     sBar.style.display = 'none';

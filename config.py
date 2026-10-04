@@ -116,7 +116,7 @@ def env_unquote(raw: str) -> str:
 #
 # refresh_env() closes that gap.  It re-reads the file when it has changed and
 # updates os.environ, so every existing consumer -- rest_provider._require_env,
-# server.resolve_env_defaults, and each subprocess spawned with os.environ.copy()
+# server.plan_secret_injection, and each subprocess spawned with os.environ.copy()
 # -- sees the new value without a restart.
 #
 # Secret hygiene: values live only in os.environ and the returned mapping.

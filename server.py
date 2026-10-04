@@ -32,6 +32,10 @@ Provider YAML keys:
                      it without re-typing the schema)
     input_schema   — JSON Schema object
     secrets.env    — maps handler arg names to environment variable names
+    secrets.headers — maps handler arg names to MCP HTTP request header
+                     names; a non-empty caller header takes precedence over
+                     secrets.env, which becomes the fallback (one retry
+                     after an explicit 401/403 from the caller credential)
     auth           — arbitrary dict forwarded to context["auth"]
 
 No changes to this file are needed when adding new tools or providers.
@@ -47,6 +51,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -189,30 +194,276 @@ def exec_provider_code(spec: dict[str, Any]) -> dict[str, Any]:
     return namespace
 
 
-def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Omit absent optionals and inject secrets from environment variables."""
+@dataclass(frozen=True)
+class SecretSource:
+    """Where a hidden secret argument's value comes from: a name, never a value."""
+
+    kind: str  # "header" or "env"
+    name: str
+
+    def describe(self) -> str:
+        if self.kind == "header":
+            return f"request header {self.name}"
+        return f"environment variable {self.name}"
+
+
+@dataclass
+class SecretPlan:
+    """Handler kwargs for the primary attempt and the optional auth fallback.
+
+    ``fallback_kwargs`` is ``None`` unless a caller-header credential was used
+    and every header-sourced argument has a configured fallback value, in
+    which case it holds the same kwargs with those arguments replaced.
+    ``sources`` is diagnostic metadata naming each argument's sources; it
+    never contains values.  The value-bearing fields are excluded from
+    ``repr`` so an accidental print of the plan cannot disclose a secret.
+    """
+
+    primary_kwargs: dict[str, Any] = field(repr=False)
+    fallback_kwargs: dict[str, Any] | None = field(repr=False, default=None)
+    sources: dict[str, dict[str, SecretSource | None]] = field(default_factory=dict)
+    secret_values: tuple[str, ...] = field(repr=False, default=())
+
+
+def extract_request_headers(ctx: Context | None) -> dict[str, str]:
+    """Return the current MCP HTTP request's headers with lower-cased names.
+
+    The request is read from the per-call FastMCP ``Context`` (its
+    ``request_context.request`` is the Starlette request for HTTP
+    transports), falling back to FastMCP's ``get_http_headers()``, which is
+    backed by a request-scoped ContextVar.  No module-global state is used,
+    so concurrent calls from different MCP clients never see each other's
+    headers.  Any failure (stdio transport, no active request, the REST
+    ``/v1/tools`` path passing ``ctx=None``) yields ``{}`` so header-sourced
+    secrets are treated as absent and the configured fallback applies.
+
+    Error reporting below names only the exception type: header values are
+    credentials, and an exception raised while reading them could embed one.
+    """
+    if ctx is None:
+        return {}
+    request = None
     try:
-        # FastMCP invokes generated tool functions with ``None`` for omitted
-        # optional parameters.  Forwarding those nulls changes MCP semantics:
-        # upstream servers commonly validate an optional string as a string
-        # when present, so ``{"offset": null}`` fails where omission succeeds.
-        # Preserve meaningful falsey values while dropping only ``None``.
-        resolved = {key: value for key, value in kwargs.items() if value is not None}
-        env_map = (tool_spec.get("secrets") or {}).get("env", {})
-        if env_map:
-            # Pick up a credential rotated through the Secrets UI without
-            # waiting for a restart; a no-op stat() when nothing has changed.
-            refresh_env()
-        for arg_name, env_name in env_map.items():
-            secret_value = os.environ.get(env_name)
-            if not secret_value:
-                raise RuntimeError(f"Missing required secret environment variable: {env_name}")
-            resolved[arg_name] = secret_value
-        return resolved
+        request = getattr(ctx.request_context, "request", None)
+    except Exception as exc:  # older FastMCP raises outside a live request
+        print(f"[server:extract_request_headers] request context unavailable: {type(exc).__name__}")
+    headers = getattr(request, "headers", None) if request is not None else None
+    try:
+        if headers is None:
+            from fastmcp.server.dependencies import get_http_headers
+
+            headers = get_http_headers(include_all=True)
+        return {str(name).lower(): str(value) for name, value in headers.items()}
     except Exception as exc:
-        print(f"resolve_env_defaults error: {exc}")
+        print(f"[server:extract_request_headers] could not read request headers: {type(exc).__name__}")
+        return {}
+
+
+def _missing_secret_message(header_name: str | None, env_name: str | None) -> str:
+    """Name the configured sources of a missing secret, never any value."""
+    if header_name and env_name:
+        return (
+            f"Missing required secret: request header {header_name} was not provided "
+            f"and environment variable {env_name} is not set"
+        )
+    if header_name:
+        return f"Missing required secret request header: {header_name}"
+    return f"Missing required secret environment variable: {env_name}"
+
+
+def plan_secret_injection(
+    tool_spec: dict[str, Any],
+    kwargs: dict[str, Any],
+    request_headers: dict[str, str] | None = None,
+) -> SecretPlan:
+    """Omit absent optionals and resolve every hidden secret argument.
+
+    For each argument in ``secrets.headers`` / ``secrets.env``: a non-empty
+    (after stripping whitespace) caller header wins; otherwise the configured
+    environment variable is used; with neither, a ``RuntimeError`` naming the
+    configured sources is raised.  Header names match case-insensitively.
+    """
+    # FastMCP invokes generated tool functions with ``None`` for omitted
+    # optional parameters.  Forwarding those nulls changes MCP semantics:
+    # upstream servers commonly validate an optional string as a string
+    # when present, so ``{"offset": null}`` fails where omission succeeds.
+    # Preserve meaningful falsey values while dropping only ``None``.
+    resolved = {key: value for key, value in kwargs.items() if value is not None}
+    secrets_cfg = tool_spec.get("secrets") or {}
+    env_map = secrets_cfg.get("env") or {}
+    header_map = secrets_cfg.get("headers") or {}
+    if not isinstance(header_map, dict):
+        raise RuntimeError("secrets.headers must map handler argument names to header names")
+    if env_map:
+        # Pick up a credential rotated through the Secrets UI without
+        # waiting for a restart; a no-op stat() when nothing has changed.
+        refresh_env()
+
+    headers = {str(name).lower(): value for name, value in (request_headers or {}).items()}
+    primary = dict(resolved)
+    fallback = dict(resolved)
+    used_header = False
+    fallback_complete = True
+    sources: dict[str, dict[str, SecretSource | None]] = {}
+    values: list[str] = []
+
+    for arg_name in list(header_map) + [a for a in env_map if a not in header_map]:
+        header_name = header_map.get(arg_name)
+        env_name = env_map.get(arg_name)
+        header_value = None
+        if header_name:
+            raw = headers.get(str(header_name).lower())
+            if raw is not None and str(raw).strip():
+                header_value = str(raw).strip()
+        env_value = (os.environ.get(env_name) or None) if env_name else None
+
+        if header_value is not None:
+            used_header = True
+            primary[arg_name] = header_value
+            values.append(header_value)
+            env_source = SecretSource("env", env_name) if env_value else None
+            sources[arg_name] = {"primary": SecretSource("header", header_name), "fallback": env_source}
+            if env_value:
+                fallback[arg_name] = env_value
+                values.append(env_value)
+            else:
+                fallback_complete = False
+        elif env_value:
+            primary[arg_name] = env_value
+            fallback[arg_name] = env_value
+            values.append(env_value)
+            sources[arg_name] = {"primary": SecretSource("env", env_name), "fallback": None}
+        else:
+            raise RuntimeError(_missing_secret_message(header_name, env_name))
+
+    return SecretPlan(
+        primary_kwargs=primary,
+        fallback_kwargs=fallback if used_header and fallback_complete else None,
+        sources=sources,
+        secret_values=tuple(values),
+    )
+
+
+def resolve_secret_defaults(
+    tool_spec: dict[str, Any],
+    kwargs: dict[str, Any],
+    request_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Omit absent optionals and inject secrets from caller headers or the environment.
+
+    Returns the kwargs for the primary attempt; see ``plan_secret_injection``.
+    """
+    try:
+        return plan_secret_injection(tool_spec, kwargs, request_headers).primary_kwargs
+    except Exception as exc:
+        print(f"resolve_secret_defaults error: {exc}")
         traceback.print_exc()
         raise
+
+
+def resolve_env_defaults(tool_spec: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible alias: environment-only secret resolution."""
+    return resolve_secret_defaults(tool_spec, kwargs)
+
+
+_AUTH_FAILURE_STATUSES = frozenset({401, 403})
+
+
+def _explicit_status(value: Any) -> int | None:
+    """Return ``value`` if it is an integer HTTP status (bools excluded)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _auth_failure_status(outcome: Any) -> int | None:
+    """Return 401/403 when ``outcome`` explicitly reports one, else ``None``.
+
+    Recognises the conventions mcpproxy handlers use: an exception carrying
+    ``status_code`` / ``status`` / ``http_status`` or a ``response`` with a
+    ``status_code`` (``httpx.HTTPStatusError``), and a dict result with a
+    numeric ``status`` / ``status_code`` that is not marked ``ok: True``
+    (``rest_provider`` returns ``{"ok": False, "status": 401, ...}``).
+    Error text such as "unauthorized" is deliberately not inspected, and
+    ``ok: False`` alone is never an authentication failure.
+    """
+    candidates: list[Any] = []
+    if isinstance(outcome, BaseException):
+        for attr in ("status_code", "status", "http_status"):
+            candidates.append(getattr(outcome, attr, None))
+        response = getattr(outcome, "response", None)
+        if response is not None:
+            candidates.append(getattr(response, "status_code", None))
+    elif isinstance(outcome, dict):
+        if outcome.get("ok") is True:
+            return None
+        candidates.extend([outcome.get("status"), outcome.get("status_code")])
+    for candidate in candidates:
+        status = _explicit_status(candidate)
+        if status in _AUTH_FAILURE_STATUSES:
+            return status
+    return None
+
+
+def _is_auth_failure(outcome: Any) -> bool:
+    """True only for an explicit HTTP 401/403 exception or structured result."""
+    return _auth_failure_status(outcome) is not None
+
+
+async def invoke_with_secret_fallback(
+    handler: Callable[..., Any],
+    runtime_context: dict[str, Any],
+    plan: SecretPlan,
+    tool_label: str,
+) -> Any:
+    """Call ``handler`` with the primary kwargs, retrying at most once.
+
+    The single retry happens only when the plan carries fallback kwargs (a
+    caller-header credential was used and a configured fallback exists) and
+    the first attempt explicitly failed with HTTP 401/403, i.e. was rejected
+    before authorization, so repeating a mutating call is safe.  Any other
+    failure, and anything the retry itself produces, is returned or raised
+    unchanged.
+    """
+    try:
+        result = await handler(context=runtime_context, **plan.primary_kwargs)
+    except Exception as exc:
+        status = _auth_failure_status(exc)
+        if plan.fallback_kwargs is None or status is None:
+            raise
+        _log_secret_fallback(tool_label, status, plan)
+        return await handler(context=runtime_context, **plan.fallback_kwargs)
+    if plan.fallback_kwargs is not None:
+        status = _auth_failure_status(result)
+        if status is not None:
+            _log_secret_fallback(tool_label, status, plan)
+            return await handler(context=runtime_context, **plan.fallback_kwargs)
+    return result
+
+
+def _log_secret_fallback(tool_label: str, status: int, plan: SecretPlan) -> None:
+    """Log the one-time fallback by source names only."""
+    swaps = ", ".join(
+        f"{arg}: {src['primary'].describe()} -> {src['fallback'].describe()}"
+        for arg, src in plan.sources.items()
+        if src["primary"] and src["primary"].kind == "header" and src["fallback"]
+    )
+    print(
+        f"[server:invoke_with_secret_fallback] {tool_label}: caller credential rejected "
+        f"(HTTP {status}); retrying once with configured fallback ({swaps})"
+    )
+
+
+def _scrub_secret_values(text: str, values: tuple[str, ...]) -> str:
+    """Replace any injected secret value appearing in ``text`` with a marker.
+
+    Values shorter than four characters are skipped: replacing them would
+    mangle ordinary text and they are not meaningful credentials.
+    """
+    for value in sorted(set(values), key=len, reverse=True):
+        if len(value) >= 4:
+            text = text.replace(value, "[REDACTED]")
+    return text
 
 
 def build_runtime_context(tool_spec: dict[str, Any], ctx: Context | None) -> dict[str, Any]:
@@ -284,14 +535,20 @@ def register_tool(
         exposed_name = advertised_name or tool_spec["name"]
 
         async def dynamic_tool(ctx: Context, **kwargs: Any) -> Any:
+            secret_values: tuple[str, ...] = ()
             try:
-                resolved_kwargs = resolve_env_defaults(tool_spec, kwargs)
+                plan = plan_secret_injection(tool_spec, kwargs, extract_request_headers(ctx))
+                secret_values = plan.secret_values
                 runtime_context = build_runtime_context(tool_spec, ctx)
-                return await handler(context=runtime_context, **resolved_kwargs)
+                return await invoke_with_secret_fallback(handler, runtime_context, plan, exposed_name)
             except Exception as exc:
-                print(f"dynamic_tool error in {exposed_name}: {exc}")
-                traceback.print_exc()
-                return {"ok": False, "error": str(exc), "tool": exposed_name}
+                # A handler exception can echo an injected credential (e.g. a
+                # URL or header in an HTTP error), so scrub both the message
+                # returned to the caller and the logged traceback.
+                message = _scrub_secret_values(str(exc), secret_values)
+                print(f"dynamic_tool error in {exposed_name}: {message}")
+                print(_scrub_secret_values(traceback.format_exc(), secret_values), file=sys.stderr, end="")
+                return {"ok": False, "error": message, "tool": exposed_name}
 
         dynamic_tool.__name__ = exposed_name
         sig, annotations = _build_typed_signature(tool_spec)

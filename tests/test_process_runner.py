@@ -996,7 +996,9 @@ class TestProcessTreeKill:
                 with open(f"/proc/{grandchild}/stat") as fh:
                     if fh.read().split(")")[-1].split()[0] == "Z":
                         return
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
+                # Reaped between kill(0) and the read: open() can still
+                # succeed and read() then fails with ESRCH. Gone either way.
                 return
             time.sleep(0.05)
         pytest.fail("grandchild survived the process-tree kill")

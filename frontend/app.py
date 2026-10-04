@@ -421,9 +421,19 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
                 "required": pname in required,
                 "default": pdef.get("default"),
             })
+        # One row per hidden argument.  ``secrets.headers`` names an optional
+        # caller-supplied request header that takes precedence over the
+        # ``secrets.env`` fallback; both are carried so that editing and
+        # re-saving a provider never drops either mapping.
+        secrets_cfg = t.get("secrets") or {}
+        env_map = secrets_cfg.get("env", {}) or {}
+        header_map = secrets_cfg.get("headers", {}) or {}
         secrets = []
-        for arg, env in ((t.get("secrets") or {}).get("env", {}) or {}).items():
-            secrets.append({"arg": arg, "env": env})
+        for arg in list(env_map) + [a for a in header_map if a not in env_map]:
+            row = {"arg": arg, "env": env_map.get(arg, "")}
+            if arg in header_map:
+                row["header"] = header_map[arg]
+            secrets.append(row)
         tools_out.append({
             "name": t.get("name", ""),
             "function": t.get("function", ""),
@@ -628,7 +638,23 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
             tool_entry["documentation"] = tdoc
         secrets = t.get("secrets", [])
         if secrets:
-            tool_entry["secrets"] = {"env": {s["arg"]: s["env"] for s in secrets}}
+            env_map: dict[str, Any] = {}
+            header_map: dict[str, Any] = {}
+            for s in secrets:
+                header = (s.get("header") or "").strip()
+                # A row without a header keeps the historical env-only shape
+                # (even with an empty env name); a header row only writes an
+                # env fallback when one was given.
+                if s.get("env") or not header:
+                    env_map[s["arg"]] = s.get("env", "")
+                if header:
+                    header_map[s["arg"]] = header
+            secrets_out: dict[str, Any] = {}
+            if env_map:
+                secrets_out["env"] = env_map
+            if header_map:
+                secrets_out["headers"] = header_map
+            tool_entry["secrets"] = secrets_out
         tools_out.append(tool_entry)
 
     spec["tools"] = tools_out
@@ -2360,7 +2386,7 @@ body{background:var(--bg);color:#cdd6f4;min-height:100vh;font-size:14px}
 .tool-card-body{padding:12px;border-top:1px solid var(--border)}
 /* param rows */
 .param-row{display:grid;grid-template-columns:1fr 120px 2fr auto;gap:8px;align-items:start;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px}
-.secret-row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px}
+.secret-row{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:center;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px}
 .list-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-bottom:6px}
 /* CodeMirror */
 .CodeMirror{height:260px;font-size:13px;border-radius:0 0 6px 6px;font-family:'JetBrains Mono',Consolas,monospace;border:1px solid #45475a;border-top:none}
@@ -4532,6 +4558,9 @@ function renderToolCard(t, i, isPkg) {
         oninput="updateSecret(${i},${k},'arg',this.value)">
       <input class="form-control form-control-sm font-monospace" placeholder="ENV_VAR_NAME" value="${esc(s.env||'')}"
         oninput="updateSecret(${i},${k},'env',this.value)">
+      <input class="form-control form-control-sm font-monospace" placeholder="X-Header-Name (optional)" value="${esc(s.header||'')}"
+        title="Optional caller-supplied request header; tried first, ENV_VAR_NAME is the fallback"
+        oninput="updateSecret(${i},${k},'header',this.value)">
       <button class="btn-icon" onclick="removeSecret(${i},${k})" title="Remove">✕</button>
     </div>`).join('');
 
@@ -4608,7 +4637,7 @@ function renderToolCard(t, i, isPkg) {
       <div style="font-size:.75em;color:var(--muted);margin-bottom:6px">name &nbsp;·&nbsp; type &nbsp;·&nbsp; description &nbsp;·&nbsp; required</div>
       <div id="params-${i}">${params || '<div class="text-muted" style="font-size:.8em;padding:4px">No parameters.</div>'}</div>
       <div class="section-title mt-3">Secrets <button class="btn btn-sm btn-outline-secondary py-0" onclick="addSecret(${i})">+ Add</button></div>
-      <div style="font-size:.75em;color:var(--muted);margin-bottom:6px">handler arg &nbsp;→&nbsp; ENV_VAR_NAME (value injected server-side, never in LLM schema)</div>
+      <div style="font-size:.75em;color:var(--muted);margin-bottom:6px">handler arg &nbsp;→&nbsp; ENV_VAR_NAME &nbsp;·&nbsp; optional request header, tried first (value injected server-side, never in LLM schema)</div>
       <div id="secrets-${i}">${secrets || '<div class="text-muted" style="font-size:.8em;padding:4px">No secrets.</div>'}</div>
     </div>
   </div>`;
@@ -4740,7 +4769,7 @@ function removeParam(ti, pi) {
 
 function addSecret(ti) {
   ensureProvider();
-  currentProvider.tools[ti].secrets.push({arg:'',env:''});
+  currentProvider.tools[ti].secrets.push({arg:'',env:'',header:''});
   renderTools(currentProvider.tools, currentProvider.type === 'package' || currentProvider.type === 'repository' || currentProvider.type === 'rest');
 }
 

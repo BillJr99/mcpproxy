@@ -614,6 +614,90 @@ tools:
 The server injects the value of `MY_SERVICE_API_KEY` from the environment at call time.
 The LLM never sees the value — it is not in the tool schema.
 
+### Caller-provided secrets (`secrets.headers`)
+
+A tool may additionally name an HTTP request header as a source for the same hidden
+argument. This lets each MCP client supply its own credential over the MCP HTTP transport,
+while clients that do not send the header keep using the configured environment value:
+
+```yaml
+tools:
+  - name: my_tool
+    function: my_tool
+    description: Example tool using caller-specific credentials.
+    input_schema:
+      type: object
+      properties:
+        resource_id:
+          type: string
+      required: [resource_id]
+    secrets:
+      env:
+        api_key: MY_SERVICE_API_KEY
+      headers:
+        api_key: X-MCPProxy-Service-Key
+```
+
+An MCP client can then optionally send, on its MCP HTTP requests:
+
+```
+X-MCPProxy-Service-Key: <caller credential>
+```
+
+This lets one MCP client send its own credential in the header while other clients
+keep using the same mcpproxy endpoint with the server's environment credential, without
+ever possessing the caller's credential.
+
+For each hidden argument, resolution works as follows:
+
+1. **Header first.** If the header is present with a non-empty value, that value is
+   injected. Header names are matched case-insensitively (`x-mcpproxy-service-key` works),
+   and a missing, empty, or whitespace-only header counts as absent.
+2. **Environment fallback.** Otherwise `MY_SERVICE_API_KEY` is used, exactly as for an
+   `env`-only tool. Either mapping may also be used on its own; an `env`-only tool behaves
+   precisely as it always has.
+3. **Neither available.** The call fails with a missing-secret error that names the
+   configured header and variable, never their values.
+
+**One-time fallback after an explicit 401/403.** When the caller credential was used *and*
+the environment fallback is set, mcpproxy retries the call exactly once with the
+environment credential, but only if the first attempt was explicitly rejected with HTTP 401
+or 403. Explicit means a handler result carrying a numeric `status`/`status_code` of 401 or
+403 that is not marked `ok: true` (the shape REST providers return, e.g.
+`{"ok": false, "status": 401, ...}`), or an exception carrying such a status (for example
+`httpx.HTTPStatusError`). A request rejected at authentication never reached authorization,
+so repeating it is safe even for tools that modify data. If the fallback is also rejected,
+that final result is returned; there is never a third attempt. When several arguments came
+from headers, the retry swaps all of them to their fallbacks at once (and is skipped unless
+every one of them has a fallback); retries are never combinatorial.
+
+**Nothing else is retried:** not other 4xx responses (400, 404, 429, ...), not 5xx, not
+network failures or timeouts, not validation errors or other exceptions, and not a plain
+`{"ok": false}` result. Error text such as "unauthorized" is not interpreted. A handler that
+catches its own HTTP errors and returns only `{"ok": false, "error": "..."}` therefore gets
+header precedence and environment fallback, but no 401/403 retry; to opt in, include the
+numeric `status` in that error result.
+
+**Security implications.**
+
+- The secret argument stays out of the MCP tool schema and description, so neither the
+  value nor the parameter is ever LLM-visible. Headers are read per request from the
+  FastMCP request context, so concurrent clients never see each other's credentials.
+- Errors and logs name only header and variable names. Handler error messages and logged
+  tracebacks returned through the tool wrapper have any injected secret value replaced by
+  `[REDACTED]`, and incoming request headers are never logged.
+- **Credentials in transport headers are only as private as the transport.** Protect the
+  MCP endpoint with TLS (for example behind a TLS-terminating reverse proxy) whenever
+  traffic leaves a trusted local host or network.
+- Anyone who can reach the endpoint *without* the header is served with the environment
+  credential, exactly as before. The header lets a client use a different identity; it does
+  not restrict access to the endpoint.
+- The REST tool-tester endpoint (`POST /v1/tools/{name}/invoke`) is not an MCP request and
+  always uses the environment fallback.
+
+In the provider editor, each secret row has an optional third field for the header name;
+editing and re-saving a provider preserves both mappings.
+
 ### Rotating a secret
 
 `.env` is the source of truth, and the proxy re-reads it whenever the file changes. A key

@@ -722,6 +722,38 @@ class TestStructuredConversion:
         structured = _provider_to_structured("p", spec)
         assert structured["tools"][0]["enabled"] is False
 
+    def test_secret_headers_survive_edit_and_resave(self):
+        """Loading and re-saving a provider must not drop ``secrets.headers``."""
+        spec_in = yaml.safe_load(_structured_to_yaml(CODE_PROVIDER))
+        spec_in["tools"][0]["secrets"] = {
+            "env": {"service_token": "SERVICE_API_KEY", "env_only": "ENV_ONLY"},
+            "headers": {"service_token": "X-MCPProxy-Service-Key", "hdr_only": "X-Only"},
+        }
+        structured = _provider_to_structured("service", spec_in)
+        rows = {r["arg"]: r for r in structured["tools"][0]["secrets"]}
+        assert rows["service_token"] == {
+            "arg": "service_token", "env": "SERVICE_API_KEY", "header": "X-MCPProxy-Service-Key",
+        }
+        assert rows["env_only"] == {"arg": "env_only", "env": "ENV_ONLY"}
+        assert rows["hdr_only"] == {"arg": "hdr_only", "env": "", "header": "X-Only"}
+        structured["code"] = CODE_PROVIDER["code"]
+        spec_out = yaml.safe_load(_structured_to_yaml(structured))
+        assert spec_out["tools"][0]["secrets"] == spec_in["tools"][0]["secrets"]
+        # The hidden argument never becomes part of the LLM-visible schema.
+        assert "service_token" not in spec_out["tools"][0]["input_schema"]["properties"]
+
+    def test_env_only_secrets_serialize_unchanged(self):
+        provider = {
+            **CODE_PROVIDER,
+            "tools": [{**CODE_PROVIDER["tools"][0], "secrets": [{"arg": "k", "env": "MY_KEY"}]}],
+        }
+        spec = yaml.safe_load(_structured_to_yaml(provider))
+        assert spec["tools"][0]["secrets"] == {"env": {"k": "MY_KEY"}}
+
+    def test_header_only_secret_does_not_count_as_env_key(self):
+        spec = {"tools": [{"secrets": {"headers": {"k": "X-Key"}, "env": {"j": "J_KEY"}}}]}
+        assert _extract_secret_env_keys(spec) == ["J_KEY"]
+
     def test_missing_enabled_in_yaml_defaults_true(self):
         """A YAML that pre-dates the `enabled` field is read as enabled=True."""
         spec = {

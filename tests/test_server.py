@@ -38,6 +38,7 @@ from server import (
     register_tool,
     repository_workdir,
     resolve_env_defaults,
+    resolve_secret_defaults,
     run_provider_setup,
     tool_is_enabled,
     write_workdir_env_file,
@@ -154,16 +155,18 @@ class TestExecProviderCode:
 
 
 # ---------------------------------------------------------------------------
-# resolve_env_defaults
+# resolve_secret_defaults (environment-only behaviour, unchanged)
 # ---------------------------------------------------------------------------
 
 class TestResolveEnvDefaults:
+    """Pre-existing ``secrets.env`` semantics, now via resolve_secret_defaults."""
+
     def test_no_secrets_returns_original(self):
-        result = resolve_env_defaults({}, {"x": 1})
+        result = resolve_secret_defaults({}, {"x": 1})
         assert result == {"x": 1}
 
     def test_omits_none_for_optional_upstream_arguments(self):
-        result = resolve_env_defaults(
+        result = resolve_secret_defaults(
             {},
             {"offset": None, "text": "", "limit": 0, "completed": False},
         )
@@ -172,19 +175,19 @@ class TestResolveEnvDefaults:
     def test_secret_injected_from_env(self, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "abc123")
         tool = {"secrets": {"env": {"api_key": "MY_API_KEY"}}}
-        result = resolve_env_defaults(tool, {})
+        result = resolve_secret_defaults(tool, {})
         assert result["api_key"] == "abc123"
 
     def test_missing_env_var_raises(self, monkeypatch):
         monkeypatch.delenv("MISSING_VAR", raising=False)
         tool = {"secrets": {"env": {"token": "MISSING_VAR"}}}
         with pytest.raises(RuntimeError, match="MISSING_VAR"):
-            resolve_env_defaults(tool, {})
+            resolve_secret_defaults(tool, {})
 
     def test_existing_kwargs_preserved(self, monkeypatch):
         monkeypatch.setenv("MY_KEY", "secret")
         tool = {"secrets": {"env": {"key": "MY_KEY"}}}
-        result = resolve_env_defaults(tool, {"other": "value"})
+        result = resolve_secret_defaults(tool, {"other": "value"})
         assert result["other"] == "value"
         assert result["key"] == "secret"
 
@@ -192,7 +195,13 @@ class TestResolveEnvDefaults:
         monkeypatch.setenv("EMPTY_VAR", "")
         tool = {"secrets": {"env": {"x": "EMPTY_VAR"}}}
         with pytest.raises(RuntimeError):
-            resolve_env_defaults(tool, {})
+            resolve_secret_defaults(tool, {})
+
+    def test_legacy_alias_matches(self, monkeypatch):
+        monkeypatch.setenv("MY_API_KEY", "abc123")
+        tool = {"secrets": {"env": {"api_key": "MY_API_KEY"}}}
+        kwargs = {"x": 1, "skip": None}
+        assert resolve_env_defaults(tool, kwargs) == resolve_secret_defaults(tool, kwargs)
 
 
 # ---------------------------------------------------------------------------

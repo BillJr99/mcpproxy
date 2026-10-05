@@ -33,7 +33,9 @@ Refresh contract: when a handler's result is a dict with ``status`` (or
 refreshable types (client_credentials, authorization_code, device_code).
 ``auth.retry_on_401: false`` (provider) or ``retry_on_401: false`` (one tool)
 turns that off, for write tools that may fail with 401 after a partial write.
-Handlers can also drive auth themselves through ``context["mcpproxy_auth"]``.
+Handlers can also drive auth themselves through ``context["mcpproxy_auth"]``;
+a tool with ``auth_inject: false`` receives no credential and runs while signed
+out (for status / login / finish-login tools).
 
 Never logs or returns a token, code, client secret, or caller key.
 """
@@ -136,6 +138,10 @@ def validate_auth_config(auth: dict[str, Any], tools: list[dict[str, Any]]) -> l
     for key in ("retry_on_401", "warm_on_start"):
         if key in auth and not isinstance(auth[key], bool):
             errors.append(f"auth.{key} must be true or false")
+    for tool in tools or []:
+        for key in ("retry_on_401", "auth_inject"):
+            if key in tool and not isinstance(tool[key], bool):
+                errors.append(f"tools '{tool.get('name') or '?'}': {key} must be true or false")
 
     if atype == "bearer":
         if bool(str(auth.get("token_env") or "").strip()) == bool(str(auth.get("token_file") or "").strip()):
@@ -427,6 +433,42 @@ class AuthHandle:
     async def logout(self) -> dict[str, Any]:
         return await self._pa.logout()
 
+    async def complete_authorization(self, callback_url: str) -> dict[str, Any]:
+        """Finish this provider's authorization_code sign-in from a pasted callback URL.
+
+        For chat clients that cannot reach the UI's manual-callback dialog: the
+        address the browser landed on (with ``code=`` and ``state=``) completes
+        the flow, as the dialog would.  The state must belong to this
+        provider.  The code is never echoed, logged, or put in an error.
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        from rest_provider import AuthCodeTokenStore
+
+        if self._pa.type != "authorization_code":
+            return {"ok": False, "status": "unsupported",
+                    "error": f"'{self._pa.provider}' does not use authorization_code sign-in."}
+        parts = urlsplit(str(callback_url or "").strip())
+        query = parse_qs(parts.query or parts.fragment)
+        code = (query.get("code") or [""])[0]
+        state = (query.get("state") or [""])[0]
+        if not code or not state:
+            return {"ok": False, "status": "invalid_callback",
+                    "error": "Paste the full address the browser landed on; it must contain code= and state=."}
+        AuthCodeTokenStore._prune_flows()
+        flow = AuthCodeTokenStore._pending_flows.get(state)
+        if flow is None or flow.get("provider") != self._pa.provider:
+            return {"ok": False, "status": "unknown_state",
+                    "error": "No pending sign-in for this provider matches that address. Start the sign-in again."}
+        try:
+            await AuthCodeTokenStore.complete_authorization(state, code)
+        except Exception as exc:
+            # Fixed text: the underlying error can quote the request, and with it the code.
+            print(f"[code_auth] {self._pa.provider}: token exchange failed ({type(exc).__name__})", flush=True)
+            return {"ok": False, "status": "token_exchange_failed",
+                    "error": "Token exchange failed; the code may be used or expired. Start the sign-in again."}
+        return {"ok": True, "status": "authorized"}
+
 
 # ---------------------------------------------------------------------------
 # Wrapper
@@ -504,6 +546,11 @@ def wrap_handler(
         if isinstance(wanted, list):
             allowed = {str(r) for r in wanted}
             mapping = {res: arg for res, arg in mapping.items() if res in allowed}
+    if tool_spec.get("auth_inject") is False:
+        # Sign-in management tools (status / login / finish-login) must run
+        # while signed out: no credential is resolved or injected, but the
+        # context["mcpproxy_auth"] hook is still provided.
+        mapping = {}
     retry_on_401 = bool(tool_spec.get("retry_on_401", auth.get("retry_on_401", True)))
     secret_arg = str(auth.get("encrypt_with_secret") or "").strip()
     tool_name = str(tool_spec.get("name") or getattr(handler, "__name__", "tool"))

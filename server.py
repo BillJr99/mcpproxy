@@ -41,6 +41,8 @@ Provider YAML keys:
                      auth.retry_on_401 for this tool
     auth_resources — optional list (device_code auth): which resources'
                      tokens this tool receives
+    auth_inject    — optional bool; false runs the tool without resolving or
+                     injecting the managed credential (sign-in tools)
   auth:            Optional managed sign-in for code providers (see
                    code_auth.py): the credential is resolved by mcpproxy and
                    injected as the hidden argument named by auth.inject_as.

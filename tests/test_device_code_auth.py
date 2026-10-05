@@ -564,3 +564,23 @@ class TestWrapper:
         tools = _tools()
         tools[0]["auth_resources"] = ["nope"]
         assert any("auth_resources" in e for e in code_auth.validate_auth_config(_cfg(), tools))
+
+
+class TestAlternativeLoginScopes:
+    def test_a_login_only_resource_signs_in_with_narrower_consent(self, idp, inline, sleeps, auth_dir):
+        """A resource used only to sign in with a narrower scope set (e.g. when
+        admin consent for the full set is unavailable) creates the shared
+        sign-in; the real resources are then redeemed from it as usual."""
+        resources = {
+            "api": {"scopes": API_SCOPES, "login_scopes": "User.Read Files.Read.All offline_access"},
+            "api_reduced": {"scopes": API_SCOPES, "login_scopes": "User.Read offline_access"},
+            "notes": {"scopes": NOTES_SCOPES},
+        }
+        store = DeviceCodeStore("prov", _cfg(resources=resources))
+        store.start("api_reduced", None)
+        assert idp.calls[0]["data"]["scope"] == "User.Read offline_access"
+        state = json.loads(store.cache_path().read_text())["state"]
+        assert set(state["refresh_tokens"]) == {"primary"}
+        assert store.access_token("api", None).startswith("access-secret-")
+        assert idp.refreshes()[-1]["scope"] == API_SCOPES
+        assert store.access_token("notes", None).startswith("access-secret-")

@@ -704,8 +704,52 @@ is never followed by a repeat of the part already written.
 
 **The `context["mcpproxy_auth"]` hook** lets a handler drive auth itself. It offers
 `await get_token(resource=None, force_refresh=False)`, `await status()`,
-`await login(resource=None)` and `await logout()`. If `get_token` needs a sign-in, the call
-still ends with the structured `authorization_required` result above.
+`await login(resource=None)`, `await logout()`, and, for `authorization_code`,
+`await complete_authorization(callback_url)`, which finishes a sign-in from the address the
+browser landed on (for chat clients that cannot reach the UI's paste dialog; the state must
+belong to this provider and the code is never echoed). If `get_token` needs a sign-in, the
+call still ends with the structured `authorization_required` result above.
+
+**Sign-in tools.** Every tool of the provider receives the credential, so while signed out a
+tool returns `authorization_required` without running. A tool that manages the sign-in itself
+(status, login, finish-login, logout) sets `auth_inject: false`: it receives no credential,
+runs while signed out, and still gets `context["mcpproxy_auth"]`.
+
+```yaml
+documentation: Sign-in tools for a managed authorization_code provider.
+auth:
+  type: authorization_code
+  inject_as: access_token
+  authorize_url: https://account.example.com/oauth2/authorize
+  token_url: https://api.example.com/oauth2/token
+  client_id_env: EXAMPLE_CLIENT_ID
+  redirect_uri: https://app.example.com/
+code: |
+  async def auth_status(context, reauthorize: bool = False):
+      auth = context["mcpproxy_auth"]
+      return await (auth.login() if reauthorize else auth.status())
+
+  async def complete_login(context, redirect_url: str):
+      return await context["mcpproxy_auth"].complete_authorization(redirect_url)
+tools:
+  - name: auth_status
+    function: auth_status
+    description: Sign-in status; reauthorize=true starts a new sign-in.
+    auth_inject: false
+    input_schema:
+      type: object
+      properties:
+        reauthorize: {type: boolean}
+  - name: complete_login
+    function: complete_login
+    description: Finish the sign-in from the address the browser landed on.
+    auth_inject: false
+    input_schema:
+      type: object
+      properties:
+        redirect_url: {type: string}
+      required: [redirect_url]
+```
 
 **Name clashes are rejected.** An `inject_as` name may not equal any tool parameter or any
 `secrets.env` / `secrets.headers` argument. The editor's validator reports it, and a
@@ -807,6 +851,11 @@ How it behaves:
 - **Silent refresh with rotation.** Expired access tokens are refreshed from the cached
   refresh token, and a rotated refresh token replaces the old one at once. An `invalid_grant`
   starts a fresh sign-in.
+- **Alternative sign-in scopes.** To offer a narrower sign-in (for example when a tenant has
+  not granted consent for the full set), declare an extra resource whose `login_scopes` are
+  the narrower set and whose `scopes` match the main resource, and sign in with it
+  (`login(resource="api_reduced")`, or `resource` in `/api/device-auth/login`). It creates the
+  shared sign-in, and the real resources are redeemed from it as usual.
 - **Separate consent per resource.** If redeeming the shared refresh token for a resource fails
   with a consent error (`consent_required`, `interaction_required`, or anything listed in
   `consent_errors` / `consent_error_codes`), mcpproxy starts a sign-in for that resource alone
@@ -2358,6 +2407,8 @@ tools:
     retry_on_401: false            # optional (code providers with managed auth):
                                    # no refresh-and-retry after a 401 for this tool
     auth_resources: [name]         # optional (device_code): resources injected here
+    auth_inject: false             # optional (managed auth): run without the credential
+                                   # (sign-in status / login / finish-login tools)
 
 # ── Managed sign-in (code providers only; optional) ───────────────────────────
 # See "Managed sign-in for code providers".  Inert without both type and inject_as.

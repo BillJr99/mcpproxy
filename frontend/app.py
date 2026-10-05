@@ -520,7 +520,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         }
         # Managed-auth per-tool settings (code providers); carried only when
         # present so existing providers round-trip byte-for-byte as before.
-        for key in ("retry_on_401", "auth_resources"):
+        for key in ("retry_on_401", "auth_inject", "auth_resources"):
             if key in t:
                 tool_out[key] = t[key]
         tools_out.append(tool_out)
@@ -723,7 +723,7 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         tdoc = (t.get("documentation") or "").strip()
         if tdoc:
             tool_entry["documentation"] = tdoc
-        for key in ("retry_on_401", "auth_resources"):
+        for key in ("retry_on_401", "auth_inject", "auth_resources"):
             if key in t and t[key] is not None:
                 tool_entry[key] = t[key]
         secrets = t.get("secrets", [])
@@ -864,7 +864,7 @@ def _validate_code_auth(provider: dict[str, Any]) -> list[str]:
             "name": t.get("name", ""),
             "input_schema": {"properties": {p.get("name", ""): {} for p in t.get("parameters", []) or []}},
             "secrets": {"env": env_map, "headers": header_map},
-            **({"auth_resources": t["auth_resources"]} if "auth_resources" in t else {}),
+            **{k: t[k] for k in ("auth_resources", "retry_on_401", "auth_inject") if k in t},
         })
     return code_auth.validate_auth_config(auth, raw_tools)
 

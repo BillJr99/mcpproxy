@@ -521,3 +521,98 @@ class TestWarmOnStart:
         result = await _handlers(_spec(RECORDING_CODE, AUTH_CODE, [_tool("fetch")]))["fetch"](context={})
         assert result["status"] == "authorization_required"
         assert "demo" in pending_rest_auth
+
+
+# ---------------------------------------------------------------------------
+# Sign-in tools: auth_inject: false and complete_authorization
+# ---------------------------------------------------------------------------
+
+SIGN_IN_CODE = (
+    "async def auth_status(context, reauthorize: bool = False):\n"
+    "    auth = context['mcpproxy_auth']\n"
+    "    return await (auth.login() if reauthorize else auth.status())\n"
+    "async def complete_login(context, redirect_url: str):\n"
+    "    return await context['mcpproxy_auth'].complete_authorization(redirect_url)\n"
+)
+
+
+def _sign_in_tools():
+    return [
+        {**_tool("auth_status"), "auth_inject": False,
+         "input_schema": {"type": "object", "properties": {"reauthorize": {"type": "boolean"}}}},
+        {**_tool("complete_login"), "auth_inject": False,
+         "input_schema": {"type": "object", "properties": {"redirect_url": {"type": "string"}}}},
+    ]
+
+
+class TestSignInTools:
+    @pytest.mark.asyncio
+    async def test_auth_inject_false_runs_while_signed_out(self, client_env, auth_dir):
+        handlers = _handlers(_spec(SIGN_IN_CODE, AUTH_CODE, _sign_in_tools()))
+        status = await handlers["auth_status"](context={})
+        assert status["signed_in"] is False
+        assert pending_rest_auth == {}  # checking status starts nothing
+        started = await handlers["auth_status"](context={}, reauthorize=True)
+        assert started["status"] == "authorization_started"
+        assert pending_rest_auth["demo"] == started["authorize_url"]
+
+    @pytest.mark.asyncio
+    async def test_complete_login_from_a_pasted_address(self, client_env, http, auth_dir, capsys):
+        auth = {**AUTH_CODE, "redirect_uri": "https://app.example.test/"}
+        handlers = _handlers(_spec(SIGN_IN_CODE, auth, _sign_in_tools()))
+        url = (await handlers["auth_status"](context={}, reauthorize=True))["authorize_url"]
+        state = parse_qs(urlsplit(url).query)["state"][0]
+        http["responses"] = [FakeResponse(json_data={"access_token": ACCESS_2, "refresh_token": REFRESH_2})]
+        code = "pasted-one-time-code-7777"
+        result = await handlers["complete_login"](
+            context={}, redirect_url=f"https://app.example.test/?code={code}&state={state}")
+        assert result == {"ok": True, "status": "authorized"}
+        assert http["calls"][0]["data"]["redirect_uri"] == "https://app.example.test/"
+        assert json.loads((auth_dir / "demo.json").read_text())["access_token"] == ACCESS_2
+        assert code not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_complete_login_refuses_another_providers_state(self, client_env, auth_dir):
+        other = AuthCodeTokenStore("other", AUTH_CODE).begin_authorization()
+        state = parse_qs(urlsplit(other).query)["state"][0]
+        handlers = _handlers(_spec(SIGN_IN_CODE, AUTH_CODE, _sign_in_tools()))
+        result = await handlers["complete_login"](
+            context={}, redirect_url=f"https://x.test/?code=secret-code-8888&state={state}")
+        assert result["status"] == "unknown_state"
+        assert "secret-code-8888" not in json.dumps(result)
+        assert state in AuthCodeTokenStore._pending_flows
+
+    @pytest.mark.asyncio
+    async def test_complete_login_needs_code_and_state(self, client_env, auth_dir):
+        handlers = _handlers(_spec(SIGN_IN_CODE, AUTH_CODE, _sign_in_tools()))
+        result = await handlers["complete_login"](context={}, redirect_url="https://x.test/?code=only")
+        assert result["status"] == "invalid_callback"
+
+    @pytest.mark.asyncio
+    async def test_failed_exchange_never_echoes_the_code(self, client_env, auth_dir, monkeypatch):
+        handlers = _handlers(_spec(SIGN_IN_CODE, AUTH_CODE, _sign_in_tools()))
+        url = (await handlers["auth_status"](context={}, reauthorize=True))["authorize_url"]
+        state = parse_qs(urlsplit(url).query)["state"][0]
+
+        class Boom:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, data=None, **kw):
+                raise RuntimeError(f"POST {url} code={data['code']}")
+
+        monkeypatch.setattr(rest_provider.httpx, "AsyncClient", Boom)
+        result = await handlers["complete_login"](
+            context={}, redirect_url=f"https://x.test/?code=secret-code-9999&state={state}")
+        assert result["status"] == "token_exchange_failed"
+        assert "secret-code-9999" not in json.dumps(result)
+
+    def test_auth_inject_must_be_boolean(self):
+        tools = [{**_tool("a"), "auth_inject": "no"}]
+        assert any("auth_inject" in e for e in code_auth.validate_auth_config(AUTH_CODE, tools))

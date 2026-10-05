@@ -204,7 +204,7 @@ def _extract_secret_env_keys(spec: dict[str, Any]) -> list[str]:
                 keys.append(key)
     # REST providers reference auth secrets by env-var name (``*_env`` keys) in
     # the auth block, so surface those for the Secrets UI / missing-secrets badge.
-    for key in _rest_auth_env_keys(spec):
+    for key in _rest_auth_env_keys(spec) + _code_auth_env_keys(spec):
         if key and key not in keys:
             keys.append(key)
     return keys
@@ -233,7 +233,7 @@ def _secret_header_alternatives(spec: dict[str, Any]) -> dict[str, dict[str, Any
             if key:
                 uses.setdefault(key, []).append(header_map.get(arg))
 
-    other_uses = set(_rest_auth_env_keys(spec))
+    other_uses = set(_rest_auth_env_keys(spec)) | set(_code_auth_env_keys(spec))
     for block in ("repository", "package"):
         other_uses.update(k for k in (spec.get(block) or {}).get("env_keys") or [] if k)
 
@@ -256,6 +256,26 @@ def _rest_auth_env_keys(spec: dict[str, Any]) -> list[str]:
     auth = (spec.get("rest") or {}).get("auth") or {}
     candidates = ("token_env", "value_env", "client_id_env", "client_secret_env")
     return [auth[k] for k in candidates if auth.get(k)]
+
+
+def _code_auth_env_keys(spec: dict[str, Any]) -> list[str]:
+    """Return the env-var names referenced by a code provider's managed ``auth:`` block."""
+    import code_auth
+
+    auth = code_auth.get_code_auth(spec)
+    return code_auth.auth_env_keys(auth) if auth else []
+
+
+def _managed_auth(spec: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """``("rest", rest.auth)`` or ``("code", auth)`` for a provider with managed auth."""
+    import code_auth
+
+    rest = spec.get("rest")
+    if isinstance(rest, dict):
+        auth = rest.get("auth") or {}
+        return ("rest", auth) if (auth.get("type") or "none").strip() != "none" else None
+    auth = code_auth.get_code_auth(spec)
+    return ("code", auth) if auth else None
 
 
 # REST auth types whose token can be refreshed without user interaction.
@@ -292,6 +312,20 @@ def _provider_auth_info(spec: dict[str, Any]) -> dict[str, Any] | None:
             "token_file": "",          # structured record — not raw-writable
             "token_file_set": False,
             "refreshable": True,
+        }
+
+    managed = _managed_auth(spec)
+    if managed is not None and managed[0] == "code":
+        cauth = managed[1]
+        ctype = (cauth.get("type") or "").strip()
+        return {
+            "kind": "code",
+            "type": ctype,
+            "env_keys": _code_auth_env_keys(spec),
+            "token_file": "",          # code-provider bearer files are not raw-writable here
+            "token_file_set": False,
+            "refreshable": True,
+            "renewable": ctype in _REFRESHABLE_REST_TYPES or ctype == "device_code",
         }
 
     rest = spec.get("rest")
@@ -475,7 +509,7 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
             if arg in header_map:
                 row["header"] = header_map[arg]
             secrets.append(row)
-        tools_out.append({
+        tool_out = {
             "name": t.get("name", ""),
             "function": t.get("function", ""),
             "description": t.get("description", ""),
@@ -483,7 +517,13 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
             "enabled": False if t.get("enabled") is False else True,
             "parameters": params,
             "secrets": secrets,
-        })
+        }
+        # Managed-auth per-tool settings (code providers); carried only when
+        # present so existing providers round-trip byte-for-byte as before.
+        for key in ("retry_on_401", "auth_resources"):
+            if key in t:
+                tool_out[key] = t[key]
+        tools_out.append(tool_out)
 
     pkg_sub = _get_package_spec(spec)
     repo_sub = _get_repository_spec(spec)
@@ -550,6 +590,8 @@ def _provider_to_structured(name: str, spec: dict[str, Any]) -> dict[str, Any]:
         "workdir": workdir,
         "rest": rest_out,
         "oauth": dict(spec.get("oauth") or {}),
+        # Top-level managed ``auth:`` of a code provider, carried verbatim.
+        "auth": dict(spec.get("auth") or {}) if isinstance(spec.get("auth"), dict) else {},
         "tools": tools_out,
     }
 
@@ -643,6 +685,10 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
                 oauth_block[key] = oauth[key]
         spec["oauth"] = oauth_block
 
+    code_auth_block = provider.get("auth") or {}
+    if ptype == "code" and isinstance(code_auth_block, dict) and code_auth_block:
+        spec["auth"] = dict(code_auth_block)
+
     requirements = [r for r in (provider.get("requirements") or []) if r]
     if requirements:
         spec["requirements"] = requirements
@@ -677,6 +723,9 @@ def _structured_to_yaml(provider: dict[str, Any]) -> str:
         tdoc = (t.get("documentation") or "").strip()
         if tdoc:
             tool_entry["documentation"] = tdoc
+        for key in ("retry_on_401", "auth_resources"):
+            if key in t and t[key] is not None:
+                tool_entry[key] = t[key]
         secrets = t.get("secrets", [])
         if secrets:
             env_map: dict[str, Any] = {}
@@ -742,6 +791,11 @@ def _validate_rest(provider: dict[str, Any]) -> list[str]:
         for key in ("authorize_url", "token_url", "client_id_env"):
             if not (auth.get(key) or "").strip():
                 errors.append(f"auth.{key} is required for authorization_code auth")
+        import code_auth
+
+        errors.extend(code_auth.validate_redirect(auth))
+    if "warm_on_start" in auth and not isinstance(auth["warm_on_start"], bool):
+        errors.append("auth.warm_on_start must be true or false")
 
     openapi = (rest.get("openapi") or "").strip()
     endpoints = rest.get("endpoints") or []
@@ -784,10 +838,42 @@ def _validate_oauth(provider: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_code_auth(provider: dict[str, Any]) -> list[str]:
+    """Return validation errors for a code provider's managed ``auth:`` block.
+
+    The structured tools are converted back to raw YAML tool entries so the
+    same rules apply here and when ``server`` wraps the handlers.
+    """
+    import code_auth
+
+    auth = provider.get("auth") or {}
+    if provider.get("type", "code") != "code" or not isinstance(auth, dict) or not auth:
+        return []
+    if not (auth.get("type") and auth.get("inject_as")):
+        return ["auth: a managed auth block needs both auth.type and auth.inject_as"]
+    raw_tools = []
+    for t in provider.get("tools", []):
+        env_map: dict[str, Any] = {}
+        header_map: dict[str, Any] = {}
+        for row in t.get("secrets", []) or []:
+            if row.get("env") or not row.get("header"):
+                env_map[row.get("arg", "")] = row.get("env", "")
+            if row.get("header"):
+                header_map[row.get("arg", "")] = row["header"]
+        raw_tools.append({
+            "name": t.get("name", ""),
+            "input_schema": {"properties": {p.get("name", ""): {} for p in t.get("parameters", []) or []}},
+            "secrets": {"env": env_map, "headers": header_map},
+            **({"auth_resources": t["auth_resources"]} if "auth_resources" in t else {}),
+        })
+    return code_auth.validate_auth_config(auth, raw_tools)
+
+
 def _validate_provider(provider: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     ptype = provider.get("type", "code")
     errors.extend(_validate_oauth(provider))
+    errors.extend(_validate_code_auth(provider))
 
     if ptype == "rest":
         errors.extend(_validate_rest(provider))
@@ -1151,8 +1237,15 @@ def create_app(
         from rest_provider import pending_rest_auth
         if command:
             return {"ok": True, "auth_url": pending_auth_urls.get(command.strip())}
+        from device_code_auth import public_pending
         merged = {**pending_auth_urls, **pending_rest_auth}
-        return {"ok": True, "pending": merged, "rest_pending": dict(pending_rest_auth)}
+        return {
+            "ok": True,
+            "pending": merged,
+            "rest_pending": dict(pending_rest_auth),
+            # Device-code sign-ins: verification_uri + user_code (never a token).
+            "device_pending": public_pending(),
+        }
 
     def _remote_command(target: str) -> str | None:
         """Resolve *target* to an mcp-remote spawn command, pending or not.
@@ -1212,6 +1305,14 @@ def create_app(
 
         state = params.get("state", "")
 
+        from device_code_auth import pending_device_auth
+        if target and target in pending_device_auth:
+            raise HTTPException(
+                400,
+                "This provider signs in with a device code: open the sign-in page and "
+                "enter the code shown in the banner. There is no callback to paste.",
+            )
+
         # ── in-process flows (REST authorization_code, oauth: blocks) ────────
         # An unnamed target is accepted only when the state matches a flow we
         # are holding: that value is unguessable, so it identifies itself.
@@ -1224,6 +1325,15 @@ def create_app(
                     400,
                     "This provider's flow requires a state parameter — paste the "
                     "whole callback URL, not just the code.",
+                )
+            flow = AuthCodeTokenStore._pending_flows.get(state)
+            if target and flow is not None and flow.get("provider") not in (None, target):
+                # The state is held for a different provider: refuse rather than
+                # spend another provider's flow (and its one-time code) here.
+                raise HTTPException(
+                    409,
+                    "This callback belongs to a different provider's authorization. "
+                    "Choose the matching provider, or leave the provider unselected.",
                 )
             try:
                 await AuthCodeTokenStore.complete_authorization(state, params["code"])
@@ -1367,14 +1477,22 @@ def create_app(
         if not path.exists():
             raise HTTPException(404, f"Provider '{name}' not found")
         spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        auth = (spec.get("rest") or {}).get("auth") or {}
+        # REST providers (rest.auth) and code providers with managed auth
+        # (top-level auth:) share the same authorization_code machinery.
+        managed = _managed_auth(spec)
+        auth = managed[1] if managed else {}
         if (auth.get("type") or "").strip() != "authorization_code":
             raise HTTPException(400, "Provider does not use authorization_code auth")
         try:
-            from rest_provider import AuthCodeTokenStore, oauth_redirect_uri
+            from rest_provider import AuthCodeTokenStore, auth_redirect_uri, oauth_redirect_uri
             store = AuthCodeTokenStore(name, auth)
             auth_url = store.begin_authorization()
-            return {"ok": True, "auth_url": auth_url, "redirect_uri": oauth_redirect_uri()}
+            redirect_uri = auth_redirect_uri(auth)
+            out = {"ok": True, "auth_url": auth_url, "redirect_uri": redirect_uri}
+            if redirect_uri != oauth_redirect_uri():
+                # Not served by this UI: finish by pasting the landing address.
+                out["manual_callback_required"] = True
+            return out
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc)}
@@ -1433,6 +1551,12 @@ def create_app(
             return {"ok": False, "error": f"Provider '{name}' declares no authentication."}
 
         try:
+            if info["kind"] == "code" and info["type"] == "device_code":
+                return {
+                    "ok": False,
+                    "error": "Device-code sign-ins refresh automatically on use; use the "
+                    "Status / Sign in buttons in the Managed sign-in box.",
+                }
             if info["kind"] == "oauth":
                 import oauth_bootstrap
                 result = await oauth_bootstrap.refresh_provider(name, spec.get("oauth") or {})
@@ -1443,7 +1567,11 @@ def create_app(
                 }
 
             from rest_provider import NeedsAuthorization, resolve_rest_auth
-            resolver = resolve_rest_auth(name, spec.get("rest") or {})
+            if info["kind"] == "code":
+                import code_auth
+                resolver = resolve_rest_auth(name, {"auth": code_auth.get_code_auth(spec) or {}})
+            else:
+                resolver = resolve_rest_auth(name, spec.get("rest") or {})
             try:
                 probe: dict[str, str] = {}
                 await resolver.apply(probe, force_refresh=True)
@@ -1466,6 +1594,84 @@ def create_app(
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "error": str(exc)}
+
+    # ── Device-code sign-in (code providers with auth: type: device_code) ────
+    #
+    # The optional ``key`` in these request bodies is the caller secret that
+    # encrypts the provider's token cache.  It is used for that one request
+    # only: never stored, logged, or included in any reply (a background
+    # poller receives derived key material, not the key).  Because these
+    # endpoints accept a secret, the UI must stay on loopback or behind
+    # authentication.
+
+    def _device_store(name: str):
+        _guard_name(name)
+        path = _config_dir / f"{name}.yaml"
+        if not path.exists():
+            raise HTTPException(404, f"Provider '{name}' not found")
+        spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        import code_auth
+        auth = code_auth.get_code_auth(spec)
+        if not auth or (auth.get("type") or "").strip() != "device_code":
+            raise HTTPException(400, f"Provider '{name}' does not use device_code auth")
+        from device_code_auth import DeviceAuthError, DeviceCodeStore
+        try:
+            return DeviceCodeStore(name, auth), auth, spec
+        except DeviceAuthError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    def _device_key(body: dict[str, Any], auth: dict[str, Any], spec: dict[str, Any]) -> str | None:
+        """The caller key from the body, else the env fallback of its secrets mapping."""
+        key = str(body.get("key") or "").strip()
+        if key:
+            return key
+        arg = str(auth.get("encrypt_with_secret") or "").strip()
+        if not arg:
+            return None
+        refresh_env()
+        for tool in spec.get("tools") or []:
+            env_name = ((tool.get("secrets") or {}).get("env") or {}).get(arg)
+            if env_name and os.environ.get(env_name):
+                return os.environ[env_name]
+        return None
+
+    @app.post("/api/device-auth/status")
+    async def device_auth_status(request: Request) -> dict:
+        body = await request.json()
+        store, auth, spec = _device_store((body.get("name") or "").strip())
+        status = await asyncio.to_thread(store.status, _device_key(body, auth, spec))
+        return {"ok": True, "status": status}
+
+    @app.get("/api/device-auth/status")
+    async def device_auth_status_get(name: str = "") -> dict:
+        store, auth, spec = _device_store(name.strip())
+        status = await asyncio.to_thread(store.status, _device_key({}, auth, spec))
+        return {"ok": True, "status": status}
+
+    @app.post("/api/device-auth/login")
+    async def device_auth_login(request: Request) -> dict:
+        body = await request.json()
+        store, auth, spec = _device_store((body.get("name") or "").strip())
+        resource = (body.get("resource") or "").strip() or None
+        from device_code_auth import DeviceAuthError
+        try:
+            flow = await asyncio.to_thread(store.start, resource, _device_key(body, auth, spec))
+        except DeviceAuthError as exc:
+            return {"ok": False, "status": exc.status, "error": str(exc)}
+        return {
+            "ok": True,
+            "verification_uri": flow["verification_uri"],
+            "verification_uri_complete": flow["verification_uri_complete"],
+            "user_code": flow["user_code"],
+            "expires_in": flow["expires_in"],
+            "resource": flow["resource"],
+        }
+
+    @app.post("/api/device-auth/logout")
+    async def device_auth_logout(request: Request) -> dict:
+        body = await request.json()
+        store, _auth, _spec = _device_store((body.get("name") or "").strip())
+        return await asyncio.to_thread(store.logout)
 
     @app.post("/api/oauth-bootstrap")
     async def oauth_bootstrap_endpoint(request: Request) -> dict:
@@ -2708,6 +2914,31 @@ code{color:var(--teal);background:#252535;padding:1px 4px;border-radius:3px;font
           <div id="rest-auth-status" class="mt-2 fn-status"></div>
         </div>
 
+        <!-- Managed sign-in box (code providers with a top-level auth: block) -->
+        <div class="section-box" id="code-auth-box" style="display:none">
+          <div class="section-title">
+            🔐 Managed sign-in
+            <button class="btn btn-sm btn-outline-warning py-0" id="code-auth-authorize-btn" style="display:none"
+              onclick="authorizeRestProvider()"
+              title="Run the OAuth authorization_code flow to obtain / refresh a token">🔐 Authorize</button>
+            <span id="code-auth-device-btns" style="display:none">
+              <button class="btn btn-sm btn-outline-warning py-0" onclick="deviceAuthAction('login')">Sign in</button>
+              <button class="btn btn-sm btn-outline-secondary py-0" onclick="deviceAuthAction('status')">Status</button>
+              <button class="btn btn-sm btn-outline-danger py-0" onclick="deviceAuthAction('logout')">Sign out</button>
+            </span>
+          </div>
+          <div id="code-auth-summary" style="font-size:.875em"></div>
+          <div class="mt-2" style="font-size:.8em">
+            <input type="password" class="form-control form-control-sm" id="code-auth-key" autocomplete="off"
+              placeholder="Caller key (only for an encrypted sign-in; used for this request only)">
+          </div>
+          <div class="text-muted mt-2" style="font-size:.8em">
+            Declared by the <code>auth:</code> block in this provider's YAML. mcpproxy resolves the credential
+            and passes it to each tool as the argument named by <code>inject_as</code>.
+          </div>
+          <div id="code-auth-status" class="mt-2 fn-status"></div>
+        </div>
+
         <!-- OAuth bootstrap box (providers with a top-level oauth: block) -->
         <div class="section-box" id="oauth-box" style="display:none">
           <div class="section-title">
@@ -3420,17 +3651,25 @@ async function loadConfig() {
 
 async function pollPendingAuth() {
   let pending = {};
+  let device = {};
   try {
     const r = await api('GET', '/api/pending-auth');
     pending = (r && r.pending) || {};
+    device = (r && r.device_pending) || {};
   } catch { return; }
   const cmds = Object.keys(pending);
   const banner = document.getElementById('auth-banner');
   if (!cmds.length) { banner.style.display = 'none'; return; }
-  const links = cmds.map(cmd =>
-    `<a href="${esc(pending[cmd])}" target="_blank" rel="noopener">authorize ${esc(cmd.replace(/^.*mcp-remote\s+/, '') || cmd)}</a>`
-    + ` (${mcbLink(cmd, 'paste callback URL')} · ${mcbLink(cmd, 'restart', {restart: true})})`
-  ).join(' · ');
+  const links = cmds.map(cmd => {
+    const d = device[cmd];
+    if (d) {
+      // Device-code sign-in: no callback to paste; the user enters the code.
+      return `<a href="${esc(d.verification_uri || pending[cmd])}" target="_blank" rel="noopener">sign in to ${esc(cmd)}</a>`
+        + ` and enter code <code>${esc(d.user_code || '')}</code>`;
+    }
+    return `<a href="${esc(pending[cmd])}" target="_blank" rel="noopener">authorize ${esc(cmd.replace(/^.*mcp-remote\s+/, '') || cmd)}</a>`
+      + ` (${mcbLink(cmd, 'paste callback URL')} · ${mcbLink(cmd, 'restart', {restart: true})})`;
+  }).join(' · ');
   document.getElementById('auth-banner-msg').innerHTML =
     `Authorization required for ${cmds.length} remote provider(s): ${links} — complete the browser flow; the token refreshes automatically afterwards.`;
   banner.style.display = '';
@@ -4075,10 +4314,81 @@ function renderProvider(p) {
   }
 
   renderOauthSummary(p);
+  renderCodeAuthSummary(p);
 
   renderRequirements(p.requirements || []);
   renderSetupCommands(p.setup_commands || []);
   renderTools(p.tools || [], nameDriven);
+}
+
+// ── Managed sign-in for code providers (top-level auth: block) ───────────────
+
+function renderCodeAuthSummary(p) {
+  const box = document.getElementById('code-auth-box');
+  const cfg = (p && p.type === 'code' && p.auth) || {};
+  if (!cfg.type || !cfg.inject_as) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const isDevice = cfg.type === 'device_code';
+  document.getElementById('code-auth-authorize-btn').style.display = cfg.type === 'authorization_code' ? '' : 'none';
+  document.getElementById('code-auth-device-btns').style.display = isDevice ? '' : 'none';
+  document.getElementById('code-auth-status').textContent = '';
+  const inject = typeof cfg.inject_as === 'object' ? Object.entries(cfg.inject_as).map(([r, a]) => `${r} → ${a}`).join(', ') : cfg.inject_as;
+  const rows = [['Type', esc(cfg.type)], ['Injected as', `<code>${esc(inject)}</code>`]];
+  if (cfg.redirect_uri || cfg.redirect_uri_env) {
+    rows.push(['Redirect URI', `<code>${esc(cfg.redirect_uri || ('$' + cfg.redirect_uri_env))}</code> (complete via “paste callback URL”)`]);
+  }
+  if (isDevice) {
+    rows.push(['Resources', Object.keys(cfg.resources || {}).map(r => `<code>${esc(r)}</code>`).join(' ')]);
+    if (cfg.encrypt_with_secret) rows.push(['Encrypted', `with caller secret <code>${esc(cfg.encrypt_with_secret)}</code>`]);
+  }
+  document.getElementById('code-auth-summary').innerHTML = rows.map(([k, v]) =>
+    `<div class="d-flex gap-2 mb-1"><span class="text-muted" style="flex:0 0 110px">${k}</span><span style="min-width:0;word-break:break-all">${v}</span></div>`
+  ).join('');
+}
+
+function codeAuthKey() {
+  // Optional caller key for an encrypted device-code cache.  Sent for this one
+  // request only; the server never stores, logs or echoes it.
+  const el = document.getElementById('code-auth-key');
+  const v = el ? el.value : '';
+  return v ? {key: v} : {};
+}
+
+async function deviceAuthAction(action) {
+  if (!currentName) return;
+  const status = document.getElementById('code-auth-status');
+  status.className = 'fn-status busy';
+  status.textContent = action === 'login' ? 'Starting sign-in…' : (action === 'logout' ? 'Signing out…' : 'Checking…');
+  try {
+    let r;
+    if (action === 'status') {
+      r = await api('POST', '/api/device-auth/status', {name: currentName, ...codeAuthKey()});
+    } else if (action === 'login') {
+      r = await api('POST', '/api/device-auth/login', {name: currentName, ...codeAuthKey()});
+    } else {
+      if (!confirm(`Sign out of ${currentName}? The cached sign-in is deleted.`)) { status.textContent = ''; return; }
+      r = await api('POST', '/api/device-auth/logout', {name: currentName});
+    }
+    if (!r.ok) throw new Error(r.error || 'request failed');
+    status.className = 'fn-status ok';
+    if (action === 'login') {
+      status.innerHTML = `Open <a href="${esc(r.verification_uri)}" target="_blank" rel="noopener">${esc(r.verification_uri)}</a>`
+        + ` and enter code <code>${esc(r.user_code)}</code> (expires in ${esc(String(r.expires_in))}s). mcpproxy finishes the sign-in in the background.`;
+    } else if (action === 'status') {
+      const st = r.status || {};
+      const res = Object.entries(st.resources || {}).map(([k, v]) => `${k}: ${v.has_access_token ? 'token, ' + v.expires_in + 's left' : 'no token yet'}`).join('; ');
+      status.textContent = (st.signed_in === true ? 'Signed in. ' : st.signed_in === false ? 'Not signed in. ' : '')
+        + (res ? res + '. ' : '') + (st.pending && st.pending.length ? 'A sign-in is pending. ' : '') + (st.error || st.note || '');
+    } else {
+      status.textContent = 'Signed out.';
+    }
+  } catch(e) {
+    status.className = 'fn-status error';
+    status.textContent = e.message || 'request failed';
+  } finally {
+    const el = document.getElementById('code-auth-key');
+    if (el) el.value = '';
+  }
 }
 
 // ── OAuth bootstrap (top-level oauth: block) ─────────────────────────────────
@@ -4356,7 +4666,8 @@ function syncRestEndpointToTool(i) {
 
 async function authorizeRestProvider() {
   if (!currentName) return;
-  const status = document.getElementById('rest-auth-status');
+  const isCode = currentProvider && currentProvider.type === 'code';
+  const status = document.getElementById(isCode ? 'code-auth-status' : 'rest-auth-status');
   status.className = 'fn-status busy';
   status.textContent = 'Starting authorization…';
   try {
@@ -4364,6 +4675,14 @@ async function authorizeRestProvider() {
     if (!r.ok) throw new Error(r.error || 'authorization failed');
     window.open(r.auth_url, '_blank', 'noopener');
     status.className = 'fn-status ok';
+    if (r.manual_callback_required) {
+      // The provider redirects to its own page, not to this UI: the user must
+      // paste the address they land on (code= and state=) to finish.
+      status.innerHTML = `Opened the authorization page. After approving you land on <code>${esc(r.redirect_uri)}</code>; ` +
+        `copy that full address and ${mcbLink(currentName, 'paste it here')} promptly (codes expire quickly). ` +
+        `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>`;
+      return;
+    }
     status.innerHTML = `Opened the authorization page. After approving, tokens are cached automatically. ` +
       `<a href="${esc(r.auth_url)}" target="_blank" rel="noopener">Re-open</a>` +
       ` · approved elsewhere? ${mcbLink(currentName, 'paste the callback URL')}`;

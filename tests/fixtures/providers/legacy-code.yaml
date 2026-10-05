@@ -1,0 +1,21 @@
+# Fixture: a code provider with no managed auth (must behave exactly as before).
+documentation: Legacy code provider fixture.
+code: |
+  async def echo(context, message: str = "hi", api_key: str = ""):
+      return {"ok": True, "echo": message, "has_key": bool(api_key)}
+tools:
+  - name: echo
+    function: echo
+    description: Echo a message.
+    input_schema:
+      type: object
+      properties:
+        message: {type: string}
+      required: []
+    secrets:
+      env:
+        api_key: LEGACY_FIXTURE_KEY
+      headers:
+        api_key: X-Legacy-Fixture-Key
+    auth:
+      note: per-tool auth dicts are still forwarded to context["auth"]

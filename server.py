@@ -37,6 +37,13 @@ Provider YAML keys:
                      secrets.env, which becomes the fallback (one retry
                      after an explicit 401/403 from the caller credential)
     auth           — arbitrary dict forwarded to context["auth"]
+    retry_on_401   — optional bool overriding the provider's managed-auth
+                     auth.retry_on_401 for this tool
+    auth_resources — optional list (device_code auth): which resources'
+                     tokens this tool receives
+  auth:            Optional managed sign-in for code providers (see
+                   code_auth.py): the credential is resolved by mcpproxy and
+                   injected as the hidden argument named by auth.inject_as.
 
 No changes to this file are needed when adding new tools or providers.
 The HTTP frontend (UI) runs on port 8889 alongside the MCP server on 8888.
@@ -781,8 +788,11 @@ def build_tool_handlers(
 
     else:
         # ── code provider ─────────────────────────────────────────────────
+        import code_auth
+
         namespace = exec_provider_code(spec)
         tools = spec.get("tools", [])
+        managed_auth = code_auth.get_code_auth(spec)
         if not tools:
             print(f"Warning: no tools declared in {source_path}")
             return handlers
@@ -802,6 +812,12 @@ def build_tool_handlers(
                 raise RuntimeError(
                     f"Function '{function_name}' (tool '{tool_name}') not found "
                     f"in the code block of {source_path}"
+                )
+            if managed_auth is not None:
+                # Opt-in managed sign-in: resolve the credential before each
+                # call and inject it as auth.inject_as (see code_auth.py).
+                handler = code_auth.wrap_handler(
+                    provider_name, managed_auth, handler, tool_spec, tools
                 )
             handlers[advertised_tool_name(provider_name, tool_name)] = (tool_spec, handler)
 
@@ -1369,6 +1385,18 @@ def _rest_oauth_providers() -> list[tuple[str, dict[str, Any]]]:
     return out
 
 
+def _code_auth_warm_providers() -> list[tuple[str, dict[str, Any]]]:
+    """Return (provider_name, auth) for every code provider with managed auth."""
+    import code_auth
+
+    out: list[tuple[str, dict[str, Any]]] = []
+    for spec in load_provider_specs(CONFIG_DIR):
+        auth = code_auth.get_code_auth(spec)
+        if auth is not None:
+            out.append((Path(spec.get("_config_path", "")).stem or "code", auth))
+    return out
+
+
 def _warm_rest_providers() -> None:
     """Warm OAuth tokens for REST providers once at startup.
 
@@ -1377,25 +1405,48 @@ def _warm_rest_providers() -> None:
     cache and, when no usable token exists, surfaces the authorization URL via
     ``pending_rest_auth`` (so the UI banner shows it before the first failed tool
     call) instead of raising.  Disable with MCPPROXY_WARM_REMOTE=0.
+
+    ``auth.warm_on_start: false`` keeps the silent refresh of an existing token
+    but never starts a sign-in at boot, so restarts do not fill the banner; the
+    sign-in starts on first use instead.  REST providers default to ``true``
+    (unchanged behavior) and code providers with managed ``auth:`` to ``false``.
+    Device-code sign-ins are never started at boot (their codes expire).
     """
-    providers = _rest_oauth_providers()
-    if not providers:
+    targets: list[tuple[str, dict[str, Any], bool]] = []
+    for name, rest_config in _rest_oauth_providers():
+        auth = rest_config.get("auth") or {}
+        targets.append((name, rest_config, auth.get("warm_on_start", True) is not False))
+    try:
+        code_providers = _code_auth_warm_providers()
+    except Exception as exc:  # noqa: BLE001 — never block REST warm-up
+        print(f"_warm_rest_providers: code provider discovery failed: {exc}")
+        code_providers = []
+    for name, auth in code_providers:
+        if (auth.get("type") or "").strip() in ("client_credentials", "authorization_code"):
+            targets.append((name, {"auth": auth}, auth.get("warm_on_start", False) is True))
+        elif (auth.get("type") or "").strip() == "device_code":
+            print(f"[mcpproxy] device-code provider '{name}': sign-in starts on first use or from the UI")
+    if not targets:
         return
     import asyncio
 
     from rest_provider import NeedsAuthorization, resolve_rest_auth
 
     async def _warm_all() -> None:
-        for name, rest_config in providers:
-            print(f"[mcpproxy] warming REST OAuth provider: {name}")
+        for name, rest_config, begin in targets:
+            print(f"[mcpproxy] warming OAuth provider: {name}")
             try:
                 resolver = resolve_rest_auth(name, rest_config)
-                await resolver.apply({})  # fetch/refresh the token (or publish auth URL)
-                print(f"[mcpproxy] token ready for REST provider: {name}")
+                # fetch/refresh the token (or publish auth URL when ``begin``)
+                await resolver.apply({}, begin_if_needed=begin)
+                print(f"[mcpproxy] token ready for provider: {name}")
             except NeedsAuthorization as exc:
-                print(f"[mcpproxy] REST provider '{name}' needs authorization: {exc.auth_url}")
+                if exc.auth_url:
+                    print(f"[mcpproxy] provider '{name}' needs authorization: {exc.auth_url}")
+                else:
+                    print(f"[mcpproxy] provider '{name}' is not signed in; sign-in starts on first use")
             except Exception as exc:  # noqa: BLE001 — best-effort warm-up
-                print(f"[mcpproxy] warm-up for REST provider '{name}' did not complete: {exc}")
+                print(f"[mcpproxy] warm-up for provider '{name}' did not complete: {exc}")
 
     try:
         asyncio.run(_warm_all())

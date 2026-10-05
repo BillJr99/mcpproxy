@@ -1,0 +1,15 @@
+# Fixture: a code provider with a managed static bearer token.
+auth:
+  type: bearer
+  inject_as: token
+  token_env: FIXTURE_BEARER_TOKEN
+code: |
+  async def ping(context, token):
+      return {"ok": True}
+tools:
+  - name: ping
+    function: ping
+    description: Ping.
+    input_schema:
+      type: object
+      properties: {}

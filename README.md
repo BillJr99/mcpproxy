@@ -148,6 +148,9 @@ persisted via Docker volumes — see [Volumes & caching](#volumes--caching).
 ├── config.py                       ← shared env-var config (imported by all modules)
 ├── process_runner.py               ← spawns & proxies any stdio MCP subprocess
 ├── builtin_tools.py                ← built-in mcpproxy__listfiles / getfile / deletefile tools
+├── rest_provider.py                ← REST providers + OAuth token stores (shared by code providers)
+├── code_auth.py                    ← managed sign-in (auth: block) for code providers
+├── device_code_auth.py             ← device-code sign-in, refresh, encrypted token cache
 ├── frontend/
 │   └── app.py                      ← FastAPI UI server (port 8889)
 ├── .env.example
@@ -444,6 +447,12 @@ For `authorization_code`, register the redirect URI **`<MCPPROXY_OAUTH_REDIRECT_
 (default `http://localhost:8889/oauth/callback`) with your OAuth provider. Tokens are cached
 under `MCPPROXY_REST_AUTH_DIR` (default `/app/.rest-auth`, gitignored).
 
+To use a different redirect for one provider only (for example one that cannot register a
+localhost URL), set `redirect_uri` (a full URL) or `redirect_uri_env` (a variable holding one)
+in its `auth` block. A redirect that this UI does not serve is completed by pasting the
+address the browser lands on into **paste callback URL**; see
+[Per-provider redirect](#managed-sign-in-for-code-providers-auth-block).
+
 #### When a credential is rejected
 
 The two OAuth types self-heal: an expiry check runs before every request, and a `401` triggers
@@ -550,7 +559,9 @@ Each tool's `name` maps 1:1 to an endpoint's `name`. REST providers depend on `h
 At startup, OAuth-backed REST providers are **warmed**: `client_credentials` tokens are
 fetched and cached, and `authorization_code` providers that have no usable token surface
 their **🔐 Authorize** link in the banner immediately, rather than only after the first
-failed tool call. (Disable with `MCPPROXY_WARM_REMOTE=0`.)
+failed tool call. (Disable with `MCPPROXY_WARM_REMOTE=0`.) Set `warm_on_start: false` in a
+provider's `auth` block to keep the silent refresh of an existing token but never start a
+sign-in at boot.
 
 Config knobs: `MCPPROXY_REST_AUTH_DIR`, `MCPPROXY_OAUTH_REDIRECT_BASE`,
 `MCPPROXY_REST_TIMEOUT` (per-request HTTP timeout), `MCPPROXY_REST_MAX_BYTES` (max
@@ -597,6 +608,252 @@ without registration (browse the UI via localhost when authorizing). "Web" clien
 have the exact URI registered — set `MCPPROXY_OAUTH_REDIRECT_BASE` if the UI is served
 from a different origin. Note `prompt=consent` is the default because Google only issues
 a refresh_token on a full consent screen, not on silent re-approval.
+
+### Managed sign-in for code providers (`auth:` block)
+
+A **code provider** can let mcpproxy handle its sign-in instead of carrying its own OAuth
+code. Declare a top-level `auth:` block. It uses the same schema as a REST provider's
+`rest.auth`, plus a built-in `device_code` type. mcpproxy then resolves the credential
+before every call and passes it to the handler as the hidden argument you name in
+`inject_as`. Providers without the block, or with an `auth:` block lacking `type` or
+`inject_as`, behave exactly as before.
+
+| `auth.type` | What the handler receives |
+|---|---|
+| `bearer` | The token from `token_env` or `token_file` |
+| `api_key` | The value of `value_env` |
+| `client_credentials` | An access token, fetched and refreshed automatically |
+| `authorization_code` | An access token from the browser sign-in (PKCE), refreshed automatically with refresh-token rotation |
+| `device_code` | Access tokens from a device-code sign-in, one or more resources (see below) |
+
+```yaml
+documentation: Files in an example service (managed authorization_code sign-in).
+auth:
+  type: authorization_code
+  inject_as: access_token            # required: the handler argument that receives the token
+  authorize_url: https://account.example.com/oauth2/authorize
+  token_url: https://api.example.com/oauth2/token
+  client_id_env: EXAMPLE_CLIENT_ID
+  client_secret_env: EXAMPLE_CLIENT_SECRET
+  scopes: []
+  redirect_uri: https://app.example.com/   # optional: overrides MCPPROXY_OAUTH_REDIRECT_BASE for this provider
+  # redirect_uri_env: EXAMPLE_REDIRECT_URI # optional: the same, read from an environment variable
+  # retry_on_401: true                     # default: refresh once and retry once after a 401
+  # warm_on_start: false                   # default for code providers: sign in on first use
+requirements:
+  - httpx
+code: |
+  import httpx
+
+  async def whoami(context, access_token):
+      async with httpx.AsyncClient(timeout=30) as client:
+          resp = await client.get("https://api.example.com/2.0/users/me",
+                                  headers={"Authorization": "Bearer " + access_token})
+      if resp.status_code >= 400:
+          return {"ok": False, "status": resp.status_code, "error": resp.text[:300]}
+      return {"ok": True, "user": resp.json()}
+
+  async def create_folder(context, access_token, name: str, parent_id: str = "0"):
+      # A write tool that makes more than one upstream call checks its token first,
+      # so a 401 cannot arrive after part of the change was written.
+      await context["mcpproxy_auth"].get_token()
+      return {"ok": True, "created": name, "parent": parent_id}
+tools:
+  - name: whoami
+    function: whoami
+    description: The signed-in user.
+    input_schema:
+      type: object
+      properties: {}
+  - name: create_folder
+    function: create_folder
+    description: WRITE. Create a folder.
+    retry_on_401: false                # opt this tool out of the automatic retry
+    input_schema:
+      type: object
+      properties:
+        name: {type: string}
+        parent_id: {type: string}
+      required: [name]
+```
+
+**When sign-in is needed**, the tool call returns a result instead of raising, and the link is
+published to the UI's pending-authorization banner:
+
+```json
+{"ok": false, "status": "authorization_required", "tool": "whoami",
+ "authorize_url": "https://account.example.com/oauth2/authorize?...",
+ "redirect_uri": "https://app.example.com/", "manual_callback_required": true,
+ "message": "Sign-in required for 'files'. Open authorize_url and approve ..."}
+```
+
+The editor's **🔐 Authorize** button (`POST /api/rest-authorize`) works for these providers
+as it does for REST providers, and so does **⟳ Refresh auth**. Tokens are cached in
+`MCPPROXY_REST_AUTH_DIR/<provider>.json`, the same file and format a REST provider uses.
+
+**Refresh contract.** If a handler returns a dict with an integer `status` (or `status_code`)
+of `401` and `ok` not true, or raises an exception carrying 401 (such as
+`httpx.HTTPStatusError`), mcpproxy forces one token refresh and calls the handler exactly
+once more. This applies to `client_credentials`, `authorization_code` and `device_code`;
+static credentials are never retried. `auth.retry_on_401: false` turns the retry off for a
+whole provider, and `retry_on_401: false` on a tool turns it off for that tool. A retry is
+safe only when a 401 means nothing happened. A write tool that makes several upstream
+calls should either check its credential first (one cheap authenticated read, or
+`await context["mcpproxy_auth"].get_token()`) or opt out, so a 401 partway through a change
+is never followed by a repeat of the part already written.
+
+**The `context["mcpproxy_auth"]` hook** lets a handler drive auth itself. It offers
+`await get_token(resource=None, force_refresh=False)`, `await status()`,
+`await login(resource=None)` and `await logout()`. If `get_token` needs a sign-in, the call
+still ends with the structured `authorization_required` result above.
+
+**Name clashes are rejected.** An `inject_as` name may not equal any tool parameter or any
+`secrets.env` / `secrets.headers` argument. The editor's validator reports it, and a
+hand-edited file with a clash fails that provider's setup with a clear error. A credential
+can never silently overwrite an argument, or be overwritten by one.
+
+**Per-provider redirect.** `redirect_uri` (or `redirect_uri_env`) is also accepted in a REST
+provider's `rest.auth`. The value is stored with the in-flight flow, so the token exchange
+uses exactly the URI the authorize request used. Use it when the provider cannot register a
+localhost redirect. A redirect that mcpproxy does not serve (any host other than this UI)
+**can only be completed through the manual-callback paste path**. After approving, the browser
+lands on the provider's page with `code=` and `state=` in the address. Copy that full address
+into **paste callback URL** in the banner or editor promptly, because such codes often expire
+within a minute. The paste is matched to its flow by `state`. A paste naming a different
+provider than the flow belongs to is refused, and the code is never echoed or logged.
+
+**Startup.** `warm_on_start: false` is the default for code providers. A restart refreshes an
+existing token silently but never starts a sign-in, so the banner is not filled with links for
+providers nobody is using; the sign-in starts on first use or from the editor. Set
+`warm_on_start: true` to surface the link at boot. REST providers keep their existing
+default of `true`, and accept `warm_on_start: false` too.
+
+#### Device-code sign-in (`type: device_code`)
+
+The OAuth 2.0 device authorization grant suits identity providers that issue public client
+ids and when no redirect can reach mcpproxy. The user opens a page and types a short code.
+One sign-in can serve several **resources** (APIs): mcpproxy redeems the shared refresh token
+once per resource scope set, caches one access token per resource, and always persists the
+newest refresh token.
+
+```yaml
+documentation: Mail and notes (managed device-code sign-in, encrypted per caller).
+auth:
+  type: device_code
+  inject_as:                          # resource -> handler argument (or one name for default_resource)
+    api: api_token
+    notes: notes_token
+  device_authorization_url: https://login.example.com/{tenant}/oauth2/v2.0/devicecode
+  token_url: https://login.example.com/{tenant}/oauth2/v2.0/token
+  tenant: organizations               # fills {tenant}; or tenant_env: EXAMPLE_TENANT
+  client_id: 00000000-0000-0000-0000-000000000001   # a public client id
+  # client_id_env: EXAMPLE_CLIENT_ID  # tried first when set
+  fallback_client_ids:                # tried in order when a client cannot start a sign-in
+    - 00000000-0000-0000-0000-000000000002
+  default_resource: api
+  resources:
+    api:
+      scopes: https://api.example.com/.default offline_access      # requested when redeeming
+      login_scopes: User.Read Mail.ReadWrite offline_access        # requested at sign-in (default: scopes)
+    notes:
+      scopes: https://notes.example.com/Notes.ReadWrite offline_access
+  extra_token_params: {}              # optional extra form fields for token requests
+  consent_errors: [AADSTS65001]       # optional: error / error_description text meaning "needs consent"
+  consent_error_codes: [65001, 65004, 65005]   # optional: numeric error_codes meaning the same
+  encrypt_with_secret: caller_key     # optional: encrypt the cache with this secrets argument
+code: |
+  async def me(context, caller_key, api_token=None):
+      return {"ok": True, "signed_in": bool(api_token)}
+
+  async def list_notebooks(context, caller_key, notes_token=None):
+      return {"ok": True, "signed_in": bool(notes_token)}
+tools:
+  - name: me
+    function: me
+    description: The signed-in user.
+    auth_resources: [api]             # optional: inject only these resources' tokens
+    input_schema:
+      type: object
+      properties: {}
+    secrets:
+      env:
+        caller_key: EXAMPLE_CALLER_KEY
+      headers:
+        caller_key: X-Example-Key
+  - name: list_notebooks
+    function: list_notebooks
+    description: List notebooks.
+    auth_resources: [notes]
+    input_schema:
+      type: object
+      properties: {}
+    secrets:
+      env:
+        caller_key: EXAMPLE_CALLER_KEY
+      headers:
+        caller_key: X-Example-Key
+```
+
+How it behaves:
+
+- **First use** (or **Sign in** in the editor's *Managed sign-in* box) requests a device code,
+  trying `client_id_env`, `client_id`, then each `fallback_client_ids` entry. It returns
+  `{ok: false, status: "authorization_required", verification_uri, user_code, expires_in,
+  resource, retry_after_seconds, message}`, and shows the page and code in the UI banner.
+  Calling again while a sign-in is pending returns the same code.
+- **A background poller** waits out `authorization_pending`, adds 5 seconds per
+  `slow_down`, and stops on `expired_token` or `access_denied`/`authorization_declined`.
+  Once the user approves, it saves the token, so the next call simply works.
+- **Silent refresh with rotation.** Expired access tokens are refreshed from the cached
+  refresh token, and a rotated refresh token replaces the old one at once. An `invalid_grant`
+  starts a fresh sign-in.
+- **Separate consent per resource.** If redeeming the shared refresh token for a resource fails
+  with a consent error (`consent_required`, `interaction_required`, or anything listed in
+  `consent_errors` / `consent_error_codes`), mcpproxy starts a sign-in for that resource alone
+  and keeps its refresh token in its own slot. The shared sign-in is untouched.
+- **Cache.** `MCPPROXY_REST_AUTH_DIR/<provider>.device.json` (or `cache_file:`), written
+  atomically with mode `0600`.
+- **Encryption at rest** (`encrypt_with_secret`, optional) names a hidden argument that
+  every tool declares under `secrets.env` and/or `secrets.headers`. Its value (a per-caller
+  header, or the environment fallback) is the key. The cache is AES-256-GCM encrypted under a
+  key derived with HKDF-SHA256 from that value and a random per-file salt, with a fresh nonce
+  on every write. A verifier makes a wrong key fail cleanly with
+  `status: "key_mismatch"` rather than a decryption error, and a missing key gives
+  `status: "no_credential"`. A different key cannot replace an existing sign-in; sign out
+  first. This needs the `cryptography` package (in `requirements.txt`), imported only when a
+  provider encrypts.
+- **UI endpoints:** `POST /api/device-auth/login {name, resource?, key?}`,
+  `POST /api/device-auth/status {name, key?}` (also `GET ?name=`), and
+  `POST /api/device-auth/logout {name}`. **Sign out works without the key, or with a wrong
+  one**: it deletes the cache and cancels pending sign-ins. `GET /api/pending-auth` adds
+  `device_pending` with each provider's `verification_uri` and `user_code`.
+
+**The caller key and the UI.** `key` in those request bodies is used for that one request
+only: it is never stored, logged, or included in a reply. When a sign-in started with a key
+completes in the background, the poller holds only the derived encryption material for that
+cache file, never the key, and drops it when the flow ends. Without a `key`, the environment
+fallback of the `encrypt_with_secret` mapping is used. Because these endpoints accept a
+secret, **keep the mcpproxy UI on loopback (or behind authentication)**; never expose it on an
+untrusted network.
+
+#### Migrating a hand-rolled provider
+
+A code provider that imports `rest_provider.AuthCodeTokenStore` itself, or carries its own
+device-code, refresh and cache code, can usually drop all of it:
+
+1. Move the endpoint URLs, client id variables and scopes into a top-level `auth:` block, and
+   add `inject_as` naming a new handler argument. Add that argument to each handler. Make
+   sure the name is not already a tool parameter or secrets argument.
+2. Replace the provider's own token helper with the injected argument. Replace its "please
+   sign in" result with nothing: mcpproxy returns `authorization_required` itself.
+3. For a redirect the provider cannot point at localhost, set `redirect_uri` instead of
+   rewriting in-flight flows. For several APIs behind one sign-in, list them under
+   `resources` and map them in `inject_as`.
+4. Keep any `auth_status` / `login` / `logout` tools as thin wrappers over
+   `context["mcpproxy_auth"]`, or drop them in favour of the editor's buttons.
+5. An `authorization_code` provider keeps its cached sign-in, because the cache file
+   (`<provider>.json`) and format are the same. A device-code provider uses a new cache file
+   (`<provider>.device.json`), so its users sign in once more after migrating.
 
 ## Secrets
 
@@ -1315,6 +1572,10 @@ It is a test-only dependency; the proxy itself does not import it.
 - Do not commit `.env`.
 - Do not enable `debug: true` outside of local testing.
 - The web UI has no authentication — run it on a trusted network only.
+- The device-code sign-in endpoints (`/api/device-auth/*`) accept a caller encryption key in
+  the request body. It is used for that request only and never stored, logged, or returned,
+  but it still crosses the UI's HTTP connection: keep the UI on loopback or behind
+  authentication.
 - All three built-in file tools are confined to `MCPPROXY_FILES_DIR` and cannot reach
   any other directory. Injected traversal is refused: `../` sequences, absolute paths,
   and symlinked parent directories that point outside the base are all rejected before
@@ -2090,7 +2351,22 @@ tools:
     secrets:
       env:                         # optional
         handler_arg: ENV_VAR_NAME
+      headers:                     # optional — caller header wins over env
+        handler_arg: X-Header-Name
     auth:                          # optional — forwarded to context["auth"]
       any_key: any_value
+    retry_on_401: false            # optional (code providers with managed auth):
+                                   # no refresh-and-retry after a 401 for this tool
+    auth_resources: [name]         # optional (device_code): resources injected here
+
+# ── Managed sign-in (code providers only; optional) ───────────────────────────
+# See "Managed sign-in for code providers".  Inert without both type and inject_as.
+
+auth:
+  type: authorization_code         # bearer | api_key | client_credentials |
+                                   # authorization_code | device_code
+  inject_as: access_token          # handler argument (device_code: or {resource: arg})
+  # ...the fields of that type (same as rest.auth), plus optional
+  # redirect_uri / redirect_uri_env, retry_on_401, warm_on_start
 ```
 

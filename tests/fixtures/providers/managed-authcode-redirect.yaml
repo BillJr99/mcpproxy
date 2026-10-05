@@ -1,0 +1,35 @@
+# Fixture: a code provider with managed authorization_code auth and a
+# per-provider redirect URI that is not served by mcpproxy.
+documentation: Managed authorization_code fixture.
+auth:
+  type: authorization_code
+  inject_as: access_token
+  authorize_url: https://account.example.test/oauth2/authorize
+  token_url: https://api.example.test/oauth2/token
+  client_id_env: FIXTURE_CLIENT_ID
+  client_secret_env: FIXTURE_CLIENT_SECRET
+  redirect_uri: https://app.example.test/
+requirements:
+  - httpx
+code: |
+  async def whoami(context, access_token):
+      return {"ok": True, "has_token": bool(access_token)}
+
+  async def create_folder(context, access_token, name: str):
+      return {"ok": True, "created": name}
+tools:
+  - name: whoami
+    function: whoami
+    description: The signed-in user.
+    input_schema:
+      type: object
+      properties: {}
+  - name: create_folder
+    function: create_folder
+    description: WRITE. Create a folder.
+    retry_on_401: false
+    input_schema:
+      type: object
+      properties:
+        name: {type: string}
+      required: [name]

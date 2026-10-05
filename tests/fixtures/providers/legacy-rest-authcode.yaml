@@ -1,0 +1,19 @@
+# Fixture: a REST provider with authorization_code auth (unchanged behavior).
+rest:
+  base_url: https://api.example.test/v1
+  auth:
+    type: authorization_code
+    authorize_url: https://auth.example.test/authorize
+    token_url: https://auth.example.test/token
+    client_id_env: FIXTURE_REST_CLIENT_ID
+    scopes: [read]
+  endpoints:
+    - name: get_me
+      method: GET
+      path: /me
+tools:
+  - name: get_me
+    description: The signed-in user.
+    input_schema:
+      type: object
+      properties: {}

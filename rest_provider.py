@@ -73,10 +73,16 @@ class NeedsAuthorization(Exception):
     def __init__(self, provider: str, auth_url: str) -> None:
         self.provider = provider
         self.auth_url = auth_url
-        super().__init__(
-            f"Authorization required for REST provider '{provider}'. "
-            f"Visit: {auth_url}"
-        )
+        if auth_url:
+            message = (
+                f"Authorization required for REST provider '{provider}'. "
+                f"Visit: {auth_url}"
+            )
+        else:
+            # Raised by ``get_token(begin_if_needed=False)``: no flow was
+            # started, so there is no URL to visit yet.
+            message = f"Authorization required for provider '{provider}' (not signed in yet)."
+        super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +240,28 @@ def oauth_redirect_uri() -> str:
     return f"{OAUTH_REDIRECT_BASE}/oauth/callback"
 
 
+def auth_redirect_uri(auth: dict[str, Any]) -> str:
+    """The redirect URI for one authorization_code auth block.
+
+    ``redirect_uri`` (a full URL) or ``redirect_uri_env`` (the name of an
+    environment variable holding one) overrides the global
+    ``MCPPROXY_OAUTH_REDIRECT_BASE`` for that provider only.  With neither set
+    this is exactly ``oauth_redirect_uri()``.  A redirect that is not served by
+    this UI (e.g. a page on the provider's own site) can only be completed by
+    pasting the resulting address into the manual-callback dialog.
+    """
+    explicit = str(auth.get("redirect_uri") or "").strip()
+    if explicit:
+        return explicit
+    env_name = str(auth.get("redirect_uri_env") or "").strip()
+    if env_name:
+        refresh_env()
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    return oauth_redirect_uri()
+
+
 class AuthCodeTokenStore:
     """On-disk cache + interactive flow for an authorization_code provider.
 
@@ -273,7 +301,16 @@ class AuthCodeTokenStore:
 
     # ── token access ────────────────────────────────────────────────────────
 
-    async def get_token(self, *, force_refresh: bool = False) -> str:
+    async def get_token(
+        self, *, force_refresh: bool = False, begin_if_needed: bool = True
+    ) -> str:
+        """Return a usable access token, refreshing it when needed.
+
+        With no usable token, raises ``NeedsAuthorization``.  By default that
+        first starts a flow (publishing the authorize URL to the UI banner);
+        ``begin_if_needed=False`` raises without starting one, which startup
+        warm-up uses for providers that should only sign in on first use.
+        """
         async with _loop_lock(self):
             data = self._load()
             access = data.get("access_token")
@@ -288,6 +325,8 @@ class AuthCodeTokenStore:
                 except Exception:
                     traceback.print_exc()
             # No token, or refresh failed → user must (re)authorize.
+            if not begin_if_needed:
+                raise NeedsAuthorization(self.provider, "")
             auth_url = self.begin_authorization()
             raise NeedsAuthorization(self.provider, auth_url)
 
@@ -330,7 +369,7 @@ class AuthCodeTokenStore:
         code_verifier = _b64url(_secrets.token_bytes(48))
         code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
         state = _b64url(_secrets.token_bytes(24))
-        redirect_uri = oauth_redirect_uri()
+        redirect_uri = auth_redirect_uri(self.auth)
         params = {
             "response_type": "code",
             "client_id": _require_env(self.auth["client_id_env"]),
@@ -422,7 +461,35 @@ class _AuthResolver:
             name = self.auth.get("name") or self.auth.get("header") or "api_key"
             params[name] = _require_env(self.auth["value_env"])
 
-    async def apply(self, headers: dict[str, str], *, force_refresh: bool = False) -> None:
+    async def resolve_credential(
+        self, *, force_refresh: bool = False, begin_if_needed: bool = True
+    ) -> str:
+        """Return the raw credential (token or key) this auth block resolves to.
+
+        Used to inject the credential into a code provider's handler rather
+        than into a request header.  Shares the token managers and on-disk
+        stores ``apply`` uses, so caches and their formats are the same.
+        """
+        if self.type == "bearer":
+            return _require_bearer_token(self.auth)
+        if self.type == "api_key":
+            return _require_env(self.auth["value_env"])
+        if self.type == "client_credentials":
+            return await get_token_manager(self.auth).get_token(force_refresh=force_refresh)
+        if self.type == "authorization_code":
+            assert self._auth_code_store is not None
+            return await self._auth_code_store.get_token(
+                force_refresh=force_refresh, begin_if_needed=begin_if_needed
+            )
+        raise RuntimeError(f"Unsupported auth type: {self.type!r}")
+
+    async def apply(
+        self,
+        headers: dict[str, str],
+        *,
+        force_refresh: bool = False,
+        begin_if_needed: bool = True,
+    ) -> None:
         if self.type == "none":
             return
         if self.type == "bearer":
@@ -439,7 +506,9 @@ class _AuthResolver:
             headers["Authorization"] = f"Bearer {token}"
         elif self.type == "authorization_code":
             assert self._auth_code_store is not None
-            token = await self._auth_code_store.get_token(force_refresh=force_refresh)
+            token = await self._auth_code_store.get_token(
+                force_refresh=force_refresh, begin_if_needed=begin_if_needed
+            )
             headers["Authorization"] = f"Bearer {token}"
         else:
             raise RuntimeError(f"Unsupported auth type: {self.type!r}")

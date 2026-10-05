@@ -1,0 +1,54 @@
+# Fixture: a code provider with device-code sign-in across two resources,
+# encrypted at rest with a caller-supplied key.
+documentation: Managed device_code fixture.
+auth:
+  type: device_code
+  inject_as:
+    api: api_token
+    notes: notes_token
+  device_authorization_url: https://login.example.test/{tenant}/oauth2/devicecode
+  token_url: https://login.example.test/{tenant}/oauth2/token
+  tenant: organizations
+  client_id: 00000000-0000-0000-0000-000000000001
+  fallback_client_ids:
+    - 00000000-0000-0000-0000-000000000002
+  default_resource: api
+  resources:
+    api:
+      scopes: https://api.example.test/.default offline_access
+      login_scopes: User.Read Files.Read offline_access
+    notes:
+      scopes: https://notes.example.test/Notes.ReadWrite offline_access
+  consent_error_codes: [65001]
+  encrypt_with_secret: caller_key
+code: |
+  async def me(context, caller_key, api_token=None):
+      return {"ok": True, "has_api": bool(api_token)}
+
+  async def list_notebooks(context, caller_key, notes_token=None):
+      return {"ok": True, "has_notes": bool(notes_token)}
+tools:
+  - name: me
+    function: me
+    description: The signed-in user.
+    auth_resources: [api]
+    input_schema:
+      type: object
+      properties: {}
+    secrets:
+      env:
+        caller_key: FIXTURE_CALLER_KEY
+      headers:
+        caller_key: X-Fixture-Key
+  - name: list_notebooks
+    function: list_notebooks
+    description: List notebooks.
+    auth_resources: [notes]
+    input_schema:
+      type: object
+      properties: {}
+    secrets:
+      env:
+        caller_key: FIXTURE_CALLER_KEY
+      headers:
+        caller_key: X-Fixture-Key

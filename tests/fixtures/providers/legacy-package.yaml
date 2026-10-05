@@ -1,0 +1,13 @@
+# Fixture: a package provider (unchanged behavior).
+package:
+  command: npx -y example-mcp-server@1.0.0
+tools:
+  - name: list_items
+    description: List items.
+    input_schema:
+      type: object
+      properties:
+        limit: {type: integer}
+    secrets:
+      env:
+        api_key: FIXTURE_PACKAGE_KEY
